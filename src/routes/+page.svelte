@@ -54,8 +54,12 @@
 	<title>Fragment Launcher</title>
 </svelte:head>
 
+<div class="window-stage fixed inset-0 overflow-hidden">
+	<div class="window-shadow shadow-cast"></div>
+	<div class="window-shadow shadow-contact"></div>
+
 <main
-	class="app-shell fixed inset-3 grid grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground shadow-[0_26px_80px_rgba(0,0,0,0.55)]"
+	class="app-shell absolute inset-6 grid grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground"
 >
 	<button
 		class="resize-edge resize-n"
@@ -226,8 +230,44 @@
 		</div>
 	</section>
 </main>
+</div>
 
 <style>
+	.window-stage {
+		pointer-events: none;
+	}
+
+	.app-shell {
+		pointer-events: auto;
+		filter: drop-shadow(8px 11px 18px rgba(0, 0, 0, 0.34))
+			drop-shadow(-3px -4px 10px rgba(103, 128, 158, 0.08));
+	}
+
+	.window-shadow {
+		position: absolute;
+		pointer-events: none;
+		border-radius: 22px;
+	}
+
+	.shadow-cast {
+		inset: 42px 18px 16px 52px;
+		background:
+			radial-gradient(ellipse at 72% 78%, rgba(0, 0, 0, 0.36), transparent 62%),
+			linear-gradient(132deg, transparent 18%, rgba(0, 0, 0, 0.22) 58%, rgba(0, 0, 0, 0.34));
+		filter: blur(14px);
+		opacity: 0.78;
+		transform: translate(9px, 10px) skewX(-4deg);
+	}
+
+	.shadow-contact {
+		inset: 30px 24px 24px 30px;
+		box-shadow:
+			10px 13px 24px rgba(0, 0, 0, 0.28),
+			-5px -5px 16px rgba(89, 116, 149, 0.05);
+		opacity: 0.9;
+		transform: translate(3px, 5px);
+	}
+
 	.window-control {
 		display: grid;
 		width: 34px;
