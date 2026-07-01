@@ -238,56 +238,53 @@
 	}
 
 	.app-shell {
-		inset: 26px 42px 38px 26px;
+		inset: 24px 38px 38px 24px;
 		pointer-events: auto;
-		filter: drop-shadow(2px 3px 7px rgba(0, 0, 0, 0.22))
-			drop-shadow(-2px -2px 7px rgba(104, 128, 160, 0.06));
+		filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.24));
 	}
 
 	.window-shadow {
 		position: absolute;
 		pointer-events: none;
-		background: #000;
+		border-radius: 20px;
 	}
 
 	.shadow-cast {
-		inset: 36px 46px 38px 34px;
-		border-radius: 30px;
-		filter: blur(28px);
-		opacity: 0.34;
-		transform: translate(18px, 18px) skewX(-3deg);
-		mask-image: radial-gradient(
-			ellipse at 58% 62%,
-			#000 0%,
-			rgba(0, 0, 0, 0.86) 36%,
-			rgba(0, 0, 0, 0.42) 60%,
-			transparent 82%
+		inset: 24px 38px 38px 24px;
+		background: rgba(0, 0, 0, 0.42);
+		filter: blur(24px);
+		opacity: 0.55;
+		transform: translate(12px, 14px);
+		mask-image: linear-gradient(
+			135deg,
+			rgba(0, 0, 0, 0.18) 0%,
+			rgba(0, 0, 0, 0.62) 44%,
+			#000 100%
 		);
-		-webkit-mask-image: radial-gradient(
-			ellipse at 58% 62%,
-			#000 0%,
-			rgba(0, 0, 0, 0.86) 36%,
-			rgba(0, 0, 0, 0.42) 60%,
-			transparent 82%
+		-webkit-mask-image: linear-gradient(
+			135deg,
+			rgba(0, 0, 0, 0.18) 0%,
+			rgba(0, 0, 0, 0.62) 44%,
+			#000 100%
 		);
 	}
 
 	.shadow-contact {
-		right: 58px;
-		bottom: 26px;
+		right: 62px;
+		bottom: 31px;
 		left: 44px;
-		height: 42px;
+		height: 30px;
 		border-radius: 999px;
 		background: radial-gradient(
-			ellipse at 54% 45%,
-			rgba(0, 0, 0, 0.34) 0%,
-			rgba(0, 0, 0, 0.22) 38%,
-			rgba(0, 0, 0, 0.08) 64%,
-			transparent 84%
+			ellipse at 56% 50%,
+			rgba(0, 0, 0, 0.28) 0%,
+			rgba(0, 0, 0, 0.18) 42%,
+			rgba(0, 0, 0, 0.06) 68%,
+			transparent 86%
 		);
-		filter: blur(13px);
-		opacity: 0.78;
-		transform: translate(10px, 6px) skewX(-8deg);
+		filter: blur(12px);
+		opacity: 0.72;
+		transform: translate(10px, 2px);
 	}
 
 	.window-control {
