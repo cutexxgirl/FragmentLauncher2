@@ -59,7 +59,7 @@
 	<div class="window-shadow shadow-contact"></div>
 
 <main
-	class="app-shell absolute inset-6 grid grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground"
+	class="app-shell absolute grid grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground"
 >
 	<button
 		class="resize-edge resize-n"
@@ -238,34 +238,56 @@
 	}
 
 	.app-shell {
+		inset: 26px 42px 38px 26px;
 		pointer-events: auto;
-		filter: drop-shadow(8px 11px 18px rgba(0, 0, 0, 0.34))
-			drop-shadow(-3px -4px 10px rgba(103, 128, 158, 0.08));
+		filter: drop-shadow(2px 3px 7px rgba(0, 0, 0, 0.22))
+			drop-shadow(-2px -2px 7px rgba(104, 128, 160, 0.06));
 	}
 
 	.window-shadow {
 		position: absolute;
 		pointer-events: none;
-		border-radius: 22px;
+		background: #000;
 	}
 
 	.shadow-cast {
-		inset: 42px 18px 16px 52px;
-		background:
-			radial-gradient(ellipse at 72% 78%, rgba(0, 0, 0, 0.36), transparent 62%),
-			linear-gradient(132deg, transparent 18%, rgba(0, 0, 0, 0.22) 58%, rgba(0, 0, 0, 0.34));
-		filter: blur(14px);
-		opacity: 0.78;
-		transform: translate(9px, 10px) skewX(-4deg);
+		inset: 36px 46px 38px 34px;
+		border-radius: 30px;
+		filter: blur(28px);
+		opacity: 0.34;
+		transform: translate(18px, 18px) skewX(-3deg);
+		mask-image: radial-gradient(
+			ellipse at 58% 62%,
+			#000 0%,
+			rgba(0, 0, 0, 0.86) 36%,
+			rgba(0, 0, 0, 0.42) 60%,
+			transparent 82%
+		);
+		-webkit-mask-image: radial-gradient(
+			ellipse at 58% 62%,
+			#000 0%,
+			rgba(0, 0, 0, 0.86) 36%,
+			rgba(0, 0, 0, 0.42) 60%,
+			transparent 82%
+		);
 	}
 
 	.shadow-contact {
-		inset: 30px 24px 24px 30px;
-		box-shadow:
-			10px 13px 24px rgba(0, 0, 0, 0.28),
-			-5px -5px 16px rgba(89, 116, 149, 0.05);
-		opacity: 0.9;
-		transform: translate(3px, 5px);
+		right: 58px;
+		bottom: 26px;
+		left: 44px;
+		height: 42px;
+		border-radius: 999px;
+		background: radial-gradient(
+			ellipse at 54% 45%,
+			rgba(0, 0, 0, 0.34) 0%,
+			rgba(0, 0, 0, 0.22) 38%,
+			rgba(0, 0, 0, 0.08) 64%,
+			transparent 84%
+		);
+		filter: blur(13px);
+		opacity: 0.78;
+		transform: translate(10px, 6px) skewX(-8deg);
 	}
 
 	.window-control {
