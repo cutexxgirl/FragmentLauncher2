@@ -13,14 +13,14 @@
     "windows": [
       {
         "title": "Fragment Launcher",
-        "width": 1080,
-        "height": 680,
-        "minWidth": 960,
-        "minHeight": 600,
+        "width": 1320,
+        "height": 800,
+        "minWidth": 1100,
+        "minHeight": 680,
         "resizable": true,
         "decorations": false,
         "transparent": true,
-        "shadow": true,
+        "shadow": false,
         "fullscreen": false
       }
     ],

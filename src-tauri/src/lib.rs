@@ -2,20 +2,38 @@ use serde::Serialize;
 use tauri::Manager;
 
 #[cfg(target_os = "windows")]
-fn remove_windows_accent_border(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+fn configure_windows_frame(window: &tauri::WebviewWindow) -> tauri::Result<()> {
   use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
   };
 
   let hwnd = window.hwnd()?;
-  let border_color = DWMWA_COLOR_NONE;
+  let transparent_system_color = DWMWA_COLOR_NONE;
+  let corner_preference = DWMWCP_DONOTROUND;
 
   unsafe {
     DwmSetWindowAttribute(
       hwnd,
       DWMWA_BORDER_COLOR,
-      &border_color as *const _ as _,
-      std::mem::size_of_val(&border_color) as u32,
+      &transparent_system_color as *const _ as _,
+      std::mem::size_of_val(&transparent_system_color) as u32,
+    )
+    .ok();
+
+    DwmSetWindowAttribute(
+      hwnd,
+      DWMWA_CAPTION_COLOR,
+      &transparent_system_color as *const _ as _,
+      std::mem::size_of_val(&transparent_system_color) as u32,
+    )
+    .ok();
+
+    DwmSetWindowAttribute(
+      hwnd,
+      DWMWA_WINDOW_CORNER_PREFERENCE,
+      &corner_preference as *const _ as _,
+      std::mem::size_of_val(&corner_preference) as u32,
     )
     .ok();
   }
@@ -24,7 +42,7 @@ fn remove_windows_accent_border(window: &tauri::WebviewWindow) -> tauri::Result<
 }
 
 #[cfg(not(target_os = "windows"))]
-fn remove_windows_accent_border(_window: &tauri::WebviewWindow) -> tauri::Result<()> {
+fn configure_windows_frame(_window: &tauri::WebviewWindow) -> tauri::Result<()> {
   Ok(())
 }
 
@@ -55,7 +73,7 @@ pub fn run() {
     .plugin(tauri_plugin_updater::Builder::new().build())
     .setup(|app| {
       if let Some(window) = app.get_webview_window("main") {
-        remove_windows_accent_border(&window)?;
+        configure_windows_frame(&window)?;
       }
 
       if cfg!(debug_assertions) {

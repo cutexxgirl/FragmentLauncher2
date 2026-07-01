@@ -55,7 +55,7 @@
 </svelte:head>
 
 <main
-	class="app-shell relative grid h-screen grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground shadow-2xl"
+	class="app-shell fixed inset-3 grid grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground shadow-[0_26px_80px_rgba(0,0,0,0.55)]"
 >
 	<button
 		class="resize-edge resize-n"

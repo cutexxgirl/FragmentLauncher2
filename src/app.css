@@ -15,6 +15,15 @@
 }
 
 @layer base {
+	* {
+		user-select: none;
+		-webkit-user-select: none;
+	}
+
+	::selection {
+		background: transparent;
+	}
+
 	:root {
 		color: var(--color-foreground);
 		background: transparent;
