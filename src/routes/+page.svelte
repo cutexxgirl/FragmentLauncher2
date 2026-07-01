@@ -1,7 +1,19 @@
 <script lang="ts">
-	import { Download, Play, Settings, Sparkles } from '@lucide/svelte';
+	import { Download, Minus, Play, Settings, Sparkles, Square, X } from '@lucide/svelte';
+	import { browser } from '$app/environment';
 	import { onMount } from 'svelte';
+	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
+
+	type ResizeDirection =
+		| 'East'
+		| 'North'
+		| 'NorthEast'
+		| 'NorthWest'
+		| 'South'
+		| 'SouthEast'
+		| 'SouthWest'
+		| 'West';
 
 	let status = $state<LauncherStatus>({
 		appName: 'Fragment Launcher',
@@ -11,12 +23,81 @@
 		updaterReady: true
 	});
 
+	const appWindow = browser ? getCurrentWindow() : null;
+
 	onMount(async () => {
 		status = await getLauncherStatus();
 	});
+
+	async function minimize() {
+		await appWindow?.minimize();
+	}
+
+	async function toggleMaximize() {
+		await appWindow?.toggleMaximize();
+	}
+
+	async function closeWindow() {
+		await appWindow?.close();
+	}
+
+	async function startDrag() {
+		await appWindow?.startDragging();
+	}
+
+	async function startResize(direction: ResizeDirection) {
+		await appWindow?.startResizeDragging(direction);
+	}
 </script>
 
-<main class="grid h-screen grid-cols-[320px_1fr] bg-background text-foreground">
+<svelte:head>
+	<title>Fragment Launcher</title>
+</svelte:head>
+
+<main
+	class="app-shell relative grid h-screen grid-cols-[320px_1fr] overflow-hidden rounded-[18px] border border-border bg-background text-foreground shadow-2xl"
+>
+	<button
+		class="resize-edge resize-n"
+		aria-label="Resize north"
+		onmousedown={() => startResize('North')}
+	></button>
+	<button
+		class="resize-edge resize-e"
+		aria-label="Resize east"
+		onmousedown={() => startResize('East')}
+	></button>
+	<button
+		class="resize-edge resize-s"
+		aria-label="Resize south"
+		onmousedown={() => startResize('South')}
+	></button>
+	<button
+		class="resize-edge resize-w"
+		aria-label="Resize west"
+		onmousedown={() => startResize('West')}
+	></button>
+	<button
+		class="resize-corner resize-ne"
+		aria-label="Resize northeast"
+		onmousedown={() => startResize('NorthEast')}
+	></button>
+	<button
+		class="resize-corner resize-nw"
+		aria-label="Resize northwest"
+		onmousedown={() => startResize('NorthWest')}
+	></button>
+	<button
+		class="resize-corner resize-se"
+		aria-label="Resize southeast"
+		onmousedown={() => startResize('SouthEast')}
+	></button>
+	<button
+		class="resize-corner resize-sw"
+		aria-label="Resize southwest"
+		onmousedown={() => startResize('SouthWest')}
+	></button>
+
 	<aside class="flex min-h-0 flex-col border-r border-border bg-panel px-6 py-5">
 		<div class="flex items-center gap-3">
 			<div class="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
@@ -54,14 +135,50 @@
 	</aside>
 
 	<section class="flex min-w-0 flex-col bg-[radial-gradient(circle_at_68%_18%,#263243_0,#0c0f14_42%)]">
-		<header class="flex h-16 items-center justify-between border-b border-border px-8">
-			<div>
-				<p class="text-sm text-muted">Профиль</p>
-				<p class="font-medium">Одиночная сборка</p>
-			</div>
-			<div class="flex items-center gap-2 rounded-md border border-border bg-panel px-3 py-2 text-sm">
+		<header
+			class="flex h-14 select-none items-center justify-between border-b border-border px-5"
+			role="toolbar"
+			aria-label="Window title bar"
+			tabindex="-1"
+			onmousedown={startDrag}
+			ondblclick={toggleMaximize}
+		>
+			<div class="flex items-center gap-3">
 				<span class="size-2 rounded-full bg-success"></span>
-				Локально
+				<div>
+					<p class="text-xs text-muted">Профиль</p>
+					<p class="text-sm font-medium">Одиночная сборка</p>
+				</div>
+			</div>
+
+			<div class="flex items-center gap-1">
+				<button
+					class="window-control"
+					aria-label="Minimize window"
+					title="Свернуть"
+					onmousedown={(event) => event.stopPropagation()}
+					onclick={minimize}
+				>
+					<Minus size={15} />
+				</button>
+				<button
+					class="window-control"
+					aria-label="Maximize window"
+					title="Развернуть"
+					onmousedown={(event) => event.stopPropagation()}
+					onclick={toggleMaximize}
+				>
+					<Square size={13} />
+				</button>
+				<button
+					class="window-control close"
+					aria-label="Close window"
+					title="Закрыть"
+					onmousedown={(event) => event.stopPropagation()}
+					onclick={closeWindow}
+				>
+					<X size={16} />
+				</button>
 			</div>
 		</header>
 
@@ -109,3 +226,99 @@
 		</div>
 	</section>
 </main>
+
+<style>
+	.window-control {
+		display: grid;
+		width: 34px;
+		height: 30px;
+		place-items: center;
+		border-radius: 6px;
+		color: var(--color-muted);
+		transition:
+			background-color 140ms ease,
+			color 140ms ease;
+	}
+
+	.window-control:hover {
+		background: var(--color-panel-strong);
+		color: var(--color-foreground);
+	}
+
+	.window-control.close:hover {
+		background: #c94d4d;
+		color: white;
+	}
+
+	.resize-edge,
+	.resize-corner {
+		position: absolute;
+		z-index: 30;
+		border: 0;
+		background: transparent;
+		padding: 0;
+	}
+
+	.resize-n,
+	.resize-s {
+		left: 10px;
+		right: 10px;
+		height: 6px;
+	}
+
+	.resize-n {
+		top: 0;
+		cursor: ns-resize;
+	}
+
+	.resize-s {
+		bottom: 0;
+		cursor: ns-resize;
+	}
+
+	.resize-e,
+	.resize-w {
+		top: 10px;
+		bottom: 10px;
+		width: 6px;
+	}
+
+	.resize-e {
+		right: 0;
+		cursor: ew-resize;
+	}
+
+	.resize-w {
+		left: 0;
+		cursor: ew-resize;
+	}
+
+	.resize-corner {
+		width: 12px;
+		height: 12px;
+	}
+
+	.resize-ne {
+		top: 0;
+		right: 0;
+		cursor: nesw-resize;
+	}
+
+	.resize-nw {
+		top: 0;
+		left: 0;
+		cursor: nwse-resize;
+	}
+
+	.resize-se {
+		right: 0;
+		bottom: 0;
+		cursor: nwse-resize;
+	}
+
+	.resize-sw {
+		bottom: 0;
+		left: 0;
+		cursor: nesw-resize;
+	}
+</style>
