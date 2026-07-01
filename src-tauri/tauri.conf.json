@@ -5,7 +5,7 @@
   "identifier": "com.cutexxgirl.fragmentlauncher",
   "build": {
     "frontendDist": "../build",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:1420",
     "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 1420",
     "beforeBuildCommand": "npm run build"
   },
@@ -37,6 +37,12 @@
     ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [],
+      "pubkey": ""
     }
   }
 }
