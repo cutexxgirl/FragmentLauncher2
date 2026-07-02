@@ -23,7 +23,6 @@
 <aside class:collapsed class="sidebar-surface flex min-h-0 flex-col border-r border-border">
 	<div class="sidebar-brand" title="Fragment Launcher">
 		<span class="brand-mark">F</span>
-		<span class="brand-name">Fragment</span>
 	</div>
 
 	<nav class="sidebar-nav">

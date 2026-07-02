@@ -146,7 +146,7 @@
 
 	.sidebar-brand {
 		display: grid;
-		grid-template-columns: 40px minmax(0, 1fr);
+		grid-template-columns: 40px;
 		align-items: center;
 		min-height: 40px;
 		overflow: hidden;
@@ -166,7 +166,6 @@
 		box-shadow: none;
 	}
 
-	.brand-name,
 	.nav-label,
 	.sidebar-collapse-button span {
 		overflow: hidden;
@@ -178,13 +177,6 @@
 			transform 150ms ease;
 	}
 
-	.brand-name {
-		max-width: 96px;
-		font-size: 0.88rem;
-		font-weight: 800;
-	}
-
-	.sidebar-surface.collapsed .brand-name,
 	.sidebar-surface.collapsed .nav-label,
 	.sidebar-surface.collapsed .sidebar-collapse-button span {
 		max-width: 0;
