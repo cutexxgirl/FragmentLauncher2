@@ -3,7 +3,7 @@
 	import { browser } from '$app/environment';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { LogicalSize } from '@tauri-apps/api/dpi';
+	import { LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi';
 	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
 
 	type ResizeDirection =
@@ -38,33 +38,40 @@
 		bootLabel = label;
 	}
 
-	function easeOutCubic(value: number) {
-		return 1 - Math.pow(1 - value, 3);
+	function smootherStep(value: number) {
+		return value * value * value * (value * (value * 6 - 15) + 10);
 	}
 
 	function delay(ms: number) {
 		return new Promise((resolve) => window.setTimeout(resolve, ms));
 	}
 
-	async function animateWindowSize(width: number, height: number, duration = 460) {
+	async function animateWindowSize(width: number, height: number, duration = 520) {
 		if (!appWindow) {
 			return;
 		}
 
-		const start = await appWindow.outerSize();
-		const startWidth = start.width;
-		const startHeight = start.height;
+		const scaleFactor = await appWindow.scaleFactor();
+		const startSize = await appWindow.outerSize();
+		const startPosition = await appWindow.outerPosition();
+		const targetSize = new LogicalSize(width, height).toPhysical(scaleFactor);
+		const centerX = startPosition.x + startSize.width / 2;
+		const centerY = startPosition.y + startSize.height / 2;
 		const startedAt = performance.now();
 
 		await new Promise<void>((resolve) => {
 			const frame = async (now: number) => {
 				const t = Math.min(1, (now - startedAt) / duration);
-				const eased = easeOutCubic(t);
-				const nextWidth = Math.round(startWidth + (width - startWidth) * eased);
-				const nextHeight = Math.round(startHeight + (height - startHeight) * eased);
+				const eased = smootherStep(t);
+				const nextWidth = Math.round(startSize.width + (targetSize.width - startSize.width) * eased);
+				const nextHeight = Math.round(startSize.height + (targetSize.height - startSize.height) * eased);
+				const nextX = Math.round(centerX - nextWidth / 2);
+				const nextY = Math.round(centerY - nextHeight / 2);
 
-				await appWindow.setSize(new LogicalSize(nextWidth, nextHeight));
-				await appWindow.center();
+				await Promise.all([
+					appWindow.setSize(new PhysicalSize(nextWidth, nextHeight)),
+					appWindow.setPosition(new PhysicalPosition(nextX, nextY))
+				]);
 
 				if (t < 1) {
 					requestAnimationFrame(frame);

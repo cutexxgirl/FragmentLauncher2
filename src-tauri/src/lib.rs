@@ -74,6 +74,7 @@ pub fn run() {
     .setup(|app| {
       if let Some(window) = app.get_webview_window("main") {
         configure_windows_frame(&window)?;
+        window.center()?;
       }
 
       if cfg!(debug_assertions) {
