@@ -4,7 +4,7 @@
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
-	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
+	import { getLauncherStatus } from '$lib/launcher';
 	import {
 		createBuildProfiles,
 		feedImages,
@@ -21,27 +21,13 @@
 	import ProfileSection from '$lib/components/launcher/ProfileSection.svelte';
 	import SettingsWindow from '$lib/components/launcher/SettingsWindow.svelte';
 	import Sidebar from '$lib/components/launcher/Sidebar.svelte';
-	import SupportSection from '$lib/components/launcher/SupportSection.svelte';
+	import SupportWindow from '$lib/components/launcher/SupportWindow.svelte';
 	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
 
-	type ResizeDirection =
-		| 'East'
-		| 'North'
-		| 'NorthEast'
-		| 'NorthWest'
-		| 'South'
-		| 'SouthEast'
-		| 'SouthWest'
-		| 'West';
 	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
 
-	let status = $state<LauncherStatus>({
-		appName: 'Fragment Launcher',
-		version: '1.0.0',
-		profile: 'singleplayer',
-		servicesConnected: false,
-		updaterReady: true
-	});
+	const FIXED_WINDOW_SIZE = new LogicalSize(1224, 764);
+
 	let bootProgress = $state(0.08);
 	let bootLabel = $state('Поднимаем оболочку');
 	let bootPhase = $state<BootPhase>('boot');
@@ -55,8 +41,8 @@
 	let attachLastLog = $state(true);
 	let attachLastScreenshot = $state(false);
 	let sendDiagnostics = $state(true);
-	let sidebarCollapsed = $state(false);
 	let settingsVisible = $state(false);
+	let supportVisible = $state(false);
 	let diagnosticsNoticeDismissed = $state(false);
 	let showDiagnosticsNotice = $state(false);
 	let supportSent = $state(false);
@@ -68,7 +54,6 @@
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
 	let activePreset = $derived(presets.find((preset) => preset.id === activeBuild.preset) ?? presets[1]);
-	let enabledModsCount = $derived(activeBuild.mods.filter((mod) => mod.enabled).length);
 	let availableBuildsCount = $derived(builds.filter((build) => build.access === 'available').length);
 	let supportReady = $derived(supportTopic.trim().length > 2 && supportDescription.trim().length > 12);
 
@@ -81,6 +66,12 @@
 	onMount(async () => {
 		if ('__TAURI_INTERNALS__' in window) {
 			appWindow = getCurrentWindow();
+			await appWindow.setSize(FIXED_WINDOW_SIZE);
+			await appWindow.setMinSize(FIXED_WINDOW_SIZE);
+			await appWindow.setMaxSize(FIXED_WINDOW_SIZE);
+			await appWindow.setResizable(false);
+			await appWindow.setMaximizable(false);
+			await appWindow.center();
 		}
 
 		await runBootSequence();
@@ -100,17 +91,17 @@
 		await delay(80);
 
 		setBootStep(0.46, 'Подключаем локальный бэкенд');
-		status = await getLauncherStatus();
+		await getLauncherStatus();
 		await delay(80);
 
 		setBootStep(0.68, 'Проверяем профиль сборки');
-		await appWindow?.setMinSize(new LogicalSize(760, 520));
+		await appWindow?.setMinSize(FIXED_WINDOW_SIZE);
 		await delay(80);
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
 		bootPhase = 'expanding';
 		await delay(620);
-		await appWindow?.setMinSize(new LogicalSize(760, 520));
+		await appWindow?.setMaxSize(FIXED_WINDOW_SIZE);
 
 		setBootStep(1, 'Готово');
 		await delay(80);
@@ -121,6 +112,15 @@
 
 	function selectBuild(buildId: string) {
 		selectedBuildId = buildId;
+	}
+
+	function openSection(section: SectionId) {
+		if (section === 'support') {
+			supportVisible = true;
+			return;
+		}
+
+		activeSection = section;
 	}
 
 	function setPreset(presetId: PresetId) {
@@ -206,20 +206,12 @@
 		await appWindow?.minimize();
 	}
 
-	async function toggleMaximize() {
-		await appWindow?.toggleMaximize();
-	}
-
 	async function closeWindow() {
 		await appWindow?.close();
 	}
 
 	async function startDrag() {
 		await appWindow?.startDragging();
-	}
-
-	async function startResize(direction: ResizeDirection) {
-		await appWindow?.startResizeDragging(direction);
 	}
 </script>
 
@@ -234,68 +226,19 @@
 	<main
 		class="app-shell absolute overflow-hidden rounded-[30px] border border-border bg-background text-foreground"
 	>
-		<button
-			class="resize-edge resize-n"
-			aria-label="Resize north"
-			onmousedown={() => startResize('North')}
-		></button>
-		<button
-			class="resize-edge resize-e"
-			aria-label="Resize east"
-			onmousedown={() => startResize('East')}
-		></button>
-		<button
-			class="resize-edge resize-s"
-			aria-label="Resize south"
-			onmousedown={() => startResize('South')}
-		></button>
-		<button
-			class="resize-edge resize-w"
-			aria-label="Resize west"
-			onmousedown={() => startResize('West')}
-		></button>
-		<button
-			class="resize-corner resize-ne"
-			aria-label="Resize northeast"
-			onmousedown={() => startResize('NorthEast')}
-		></button>
-		<button
-			class="resize-corner resize-nw"
-			aria-label="Resize northwest"
-			onmousedown={() => startResize('NorthWest')}
-		></button>
-		<button
-			class="resize-corner resize-se"
-			aria-label="Resize southeast"
-			onmousedown={() => startResize('SouthEast')}
-		></button>
-		<button
-			class="resize-corner resize-sw"
-			aria-label="Resize southwest"
-			onmousedown={() => startResize('SouthWest')}
-		></button>
-
 		{#if bootVisible}
 			<BootScreen {bootPhase} {bootProgress} {bootLabel} {startDrag} />
 		{/if}
 
 		<div
-			class:sidebar-collapsed={sidebarCollapsed}
 			class:visible={launcherVisible}
 			class="launcher-layout"
 		>
-			<Sidebar
-				{navigation}
-				{activeSection}
-				collapsed={sidebarCollapsed}
-				setActiveSection={(section) => (activeSection = section)}
-				toggleCollapsed={() => (sidebarCollapsed = !sidebarCollapsed)}
-			/>
+			<Sidebar {navigation} setActiveSection={openSection} />
 
 			<section class="main-surface flex min-w-0 flex-col">
 				<TitleBar
 					{startDrag}
-					{toggleMaximize}
 					{minimize}
 					{closeWindow}
 				/>
@@ -303,7 +246,7 @@
 				<MobileNav
 					{navigation}
 					{activeSection}
-					setActiveSection={(section) => (activeSection = section)}
+					setActiveSection={openSection}
 				/>
 
 				<div class="workspace min-h-0 flex-1 overflow-y-auto px-6 py-6">
@@ -316,21 +259,6 @@
 							{feedImages}
 							{selectBuild}
 							openSettings={() => (settingsVisible = true)}
-						/>
-					{:else if activeSection === 'support'}
-						<SupportSection
-							{activeBuild}
-							{activePreset}
-							bind:supportTopic
-							bind:supportDescription
-							bind:attachCrashReport
-							bind:attachLastLog
-							bind:attachLastScreenshot
-							{sendDiagnostics}
-							{supportReady}
-							{supportSent}
-							{setDiagnosticsEnabled}
-							{submitSupportRequest}
 						/>
 					{:else if activeSection === 'profile'}
 						<ProfileSection
@@ -361,6 +289,24 @@
 				{addResourcePackFiles}
 				{removeShader}
 				{removeResourcePack}
+			/>
+		{/if}
+
+		{#if supportVisible}
+			<SupportWindow
+				{activeBuild}
+				{activePreset}
+				bind:supportTopic
+				bind:supportDescription
+				bind:attachCrashReport
+				bind:attachLastLog
+				bind:attachLastScreenshot
+				{sendDiagnostics}
+				{supportReady}
+				{supportSent}
+				closeSupport={() => (supportVisible = false)}
+				{setDiagnosticsEnabled}
+				{submitSupportRequest}
 			/>
 		{/if}
 

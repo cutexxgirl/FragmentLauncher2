@@ -41,7 +41,7 @@
 </script>
 
 <div class="settings-backdrop">
-	<dialog class="settings-window" open aria-label="Настройки сборки">
+	<div class="settings-window" role="dialog" aria-modal="true" aria-label="Настройки сборки" tabindex="-1">
 		<header class="settings-window-head">
 			<div>
 				<p class="section-kicker">Настройки</p>
@@ -70,5 +70,5 @@
 				{removeResourcePack}
 			/>
 		</div>
-	</dialog>
+	</div>
 </div>

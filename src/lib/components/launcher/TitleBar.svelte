@@ -1,14 +1,13 @@
 <script lang="ts">
-	import { Minus, Square, X } from '@lucide/svelte';
+	import { Minus, X } from '@lucide/svelte';
 
 	type Props = {
 		startDrag: () => void | Promise<void>;
-		toggleMaximize: () => void | Promise<void>;
 		minimize: () => void | Promise<void>;
 		closeWindow: () => void | Promise<void>;
 	};
 
-	let { startDrag, toggleMaximize, minimize, closeWindow }: Props = $props();
+	let { startDrag, minimize, closeWindow }: Props = $props();
 </script>
 
 <header
@@ -17,7 +16,6 @@
 	aria-label="Window title bar"
 	tabindex="-1"
 	onmousedown={startDrag}
-	ondblclick={toggleMaximize}
 >
 	<div class="flex items-center gap-1">
 		<button
@@ -28,15 +26,6 @@
 			onclick={minimize}
 		>
 			<Minus size={15} />
-		</button>
-		<button
-			class="window-control"
-			aria-label="Maximize window"
-			title="Развернуть"
-			onmousedown={(event) => event.stopPropagation()}
-			onclick={toggleMaximize}
-		>
-			<Square size={13} />
 		</button>
 		<button
 			class="window-control close"
