@@ -66,16 +66,34 @@
 	onMount(async () => {
 		if ('__TAURI_INTERNALS__' in window) {
 			appWindow = getCurrentWindow();
-			await appWindow.setSize(FIXED_WINDOW_SIZE);
-			await appWindow.setMinSize(FIXED_WINDOW_SIZE);
-			await appWindow.setMaxSize(FIXED_WINDOW_SIZE);
-			await appWindow.setResizable(false);
-			await appWindow.setMaximizable(false);
-			await appWindow.center();
+			void configureFixedWindow();
 		}
 
 		await runBootSequence();
 	});
+
+	async function configureFixedWindow() {
+		if (!appWindow) {
+			return;
+		}
+
+		const windowTasks = [
+			() => appWindow?.setSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setMinSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setMaxSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setResizable(false),
+			() => appWindow?.setMaximizable(false),
+			() => appWindow?.center()
+		];
+
+		for (const task of windowTasks) {
+			try {
+				await task();
+			} catch (error) {
+				console.warn('Window configuration step failed', error);
+			}
+		}
+	}
 
 	function setBootStep(progress: number, label: string) {
 		bootProgress = progress;
@@ -95,13 +113,11 @@
 		await delay(80);
 
 		setBootStep(0.68, 'Проверяем профиль сборки');
-		await appWindow?.setMinSize(FIXED_WINDOW_SIZE);
 		await delay(80);
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
 		bootPhase = 'expanding';
 		await delay(620);
-		await appWindow?.setMaxSize(FIXED_WINDOW_SIZE);
 
 		setBootStep(1, 'Готово');
 		await delay(80);
