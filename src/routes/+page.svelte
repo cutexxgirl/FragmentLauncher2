@@ -252,8 +252,8 @@
 	.shadow-cast {
 		inset: 24px 38px 38px 24px;
 		background: rgba(0, 0, 0, 0.42);
-		filter: blur(24px);
-		opacity: 0.55;
+		filter: blur(31px);
+		opacity: 0.5;
 		transform: translate(12px, 14px);
 		mask-image: linear-gradient(
 			135deg,
@@ -282,8 +282,8 @@
 			rgba(0, 0, 0, 0.06) 68%,
 			transparent 86%
 		);
-		filter: blur(12px);
-		opacity: 0.72;
+		filter: blur(18px);
+		opacity: 0.66;
 		transform: translate(10px, 2px);
 	}
 
