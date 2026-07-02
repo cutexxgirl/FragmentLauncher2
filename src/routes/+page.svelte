@@ -1,12 +1,13 @@
 <script lang="ts">
 	import '$lib/styles/launcher.css';
-	import { Gamepad2, MessageCircle, SlidersHorizontal, User } from '@lucide/svelte';
+	import { Gamepad2, MessageCircle, User } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
 	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
 	import {
 		createBuildProfiles,
+		feedImages,
 		feedItems,
 		presets,
 		type BuildProfile,
@@ -14,11 +15,11 @@
 		type SectionId
 	} from '$lib/launcher-ui';
 	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
-	import BuildSection from '$lib/components/launcher/BuildSection.svelte';
 	import DiagnosticsModal from '$lib/components/launcher/DiagnosticsModal.svelte';
 	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
 	import MobileNav from '$lib/components/launcher/MobileNav.svelte';
 	import ProfileSection from '$lib/components/launcher/ProfileSection.svelte';
+	import SettingsWindow from '$lib/components/launcher/SettingsWindow.svelte';
 	import Sidebar from '$lib/components/launcher/Sidebar.svelte';
 	import SupportSection from '$lib/components/launcher/SupportSection.svelte';
 	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
@@ -55,6 +56,7 @@
 	let attachLastScreenshot = $state(false);
 	let sendDiagnostics = $state(true);
 	let sidebarCollapsed = $state(false);
+	let settingsVisible = $state(false);
 	let diagnosticsNoticeDismissed = $state(false);
 	let showDiagnosticsNotice = $state(false);
 	let supportSent = $state(false);
@@ -72,7 +74,6 @@
 
 	const navigation = [
 		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
-		{ id: 'build', label: 'Сборка', mobileLabel: 'Сборка', icon: SlidersHorizontal },
 		{ id: 'support', label: 'Техподдержка', mobileLabel: 'Поддержка', icon: MessageCircle },
 		{ id: 'profile', label: 'Профиль', mobileLabel: 'Профиль', icon: User }
 	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
@@ -310,28 +311,11 @@
 						<HomeSection
 							{builds}
 							{activeBuild}
-							{activePreset}
 							{selectedBuildId}
 							{feedItems}
+							{feedImages}
 							{selectBuild}
-							setActiveSection={(section) => (activeSection = section)}
-						/>
-					{:else if activeSection === 'build'}
-						<BuildSection
-							{builds}
-							{activeBuild}
-							{selectedBuildId}
-							{presets}
-							{selectBuild}
-							{setPreset}
-							{setRamFromInput}
-							{setJavaPath}
-							{useSuggestedJavaPath}
-							{toggleMod}
-							{addShaderFiles}
-							{addResourcePackFiles}
-							{removeShader}
-							{removeResourcePack}
+							openSettings={() => (settingsVisible = true)}
 						/>
 					{:else if activeSection === 'support'}
 						<SupportSection
@@ -359,6 +343,26 @@
 				</div>
 			</section>
 		</div>
+
+		{#if settingsVisible}
+			<SettingsWindow
+				{builds}
+				{activeBuild}
+				{selectedBuildId}
+				{presets}
+				closeSettings={() => (settingsVisible = false)}
+				{selectBuild}
+				{setPreset}
+				{setRamFromInput}
+				{setJavaPath}
+				{useSuggestedJavaPath}
+				{toggleMod}
+				{addShaderFiles}
+				{addResourcePackFiles}
+				{removeShader}
+				{removeResourcePack}
+			/>
+		{/if}
 
 		{#if showDiagnosticsNotice}
 			<DiagnosticsModal

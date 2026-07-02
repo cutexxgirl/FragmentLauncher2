@@ -1,4 +1,4 @@
-export type SectionId = 'home' | 'build' | 'support' | 'profile';
+export type SectionId = 'home' | 'support' | 'profile';
 export type PresetId = 'low' | 'medium' | 'high';
 export type FeedCategory = 'news' | 'announcements';
 
@@ -43,6 +43,14 @@ export type FeedItem = {
 	headline: string;
 	images: string[];
 };
+
+export const feedImages: string[] = [
+	'linear-gradient(135deg, rgba(240, 179, 93, 0.86), rgba(41, 48, 48, 0.92)), radial-gradient(circle at 78% 26%, rgba(255, 255, 255, 0.38), transparent 26%)',
+	'linear-gradient(140deg, rgba(117, 199, 192, 0.72), rgba(17, 18, 19, 0.96)), radial-gradient(circle at 24% 34%, rgba(240, 179, 93, 0.32), transparent 28%)',
+	'linear-gradient(150deg, rgba(72, 81, 86, 0.9), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 66% 28%, rgba(240, 179, 93, 0.42), transparent 30%)',
+	'linear-gradient(145deg, rgba(58, 63, 70, 0.92), rgba(16, 17, 18, 0.96)), radial-gradient(circle at 28% 25%, rgba(117, 199, 192, 0.42), transparent 25%)',
+	'linear-gradient(135deg, rgba(240, 179, 93, 0.42), rgba(117, 199, 192, 0.34), rgba(12, 13, 14, 0.98))'
+];
 
 export const presets: Preset[] = [
 	{
@@ -118,7 +126,7 @@ export function createBuildProfiles(): BuildProfile[] {
 	return [
 		{
 			id: 'fragment-origin',
-			name: 'Fragment Origin',
+			name: 'Fragment',
 			subtitle: 'Основная одиночная сборка',
 			version: '1.20.1',
 			tag: 'Stable',
