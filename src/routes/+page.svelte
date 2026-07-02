@@ -251,20 +251,20 @@
 
 	.shadow-cast {
 		inset: 24px 38px 38px 24px;
-		background: rgba(0, 0, 0, 0.42);
-		filter: blur(31px);
-		opacity: 0.5;
-		transform: translate(12px, 14px);
+		background: transparent;
+		box-shadow: 15px 18px 34px 8px rgba(0, 0, 0, 0.42);
+		opacity: 0.9;
+		transform: translate(2px, 2px);
 		mask-image: linear-gradient(
 			135deg,
-			rgba(0, 0, 0, 0.18) 0%,
-			rgba(0, 0, 0, 0.62) 44%,
+			rgba(0, 0, 0, 0.08) 0%,
+			rgba(0, 0, 0, 0.55) 38%,
 			#000 100%
 		);
 		-webkit-mask-image: linear-gradient(
 			135deg,
-			rgba(0, 0, 0, 0.18) 0%,
-			rgba(0, 0, 0, 0.62) 44%,
+			rgba(0, 0, 0, 0.08) 0%,
+			rgba(0, 0, 0, 0.55) 38%,
 			#000 100%
 		);
 	}
@@ -275,15 +275,9 @@
 		left: 44px;
 		height: 30px;
 		border-radius: 999px;
-		background: radial-gradient(
-			ellipse at 56% 50%,
-			rgba(0, 0, 0, 0.28) 0%,
-			rgba(0, 0, 0, 0.18) 42%,
-			rgba(0, 0, 0, 0.06) 68%,
-			transparent 86%
-		);
-		filter: blur(18px);
-		opacity: 0.66;
+		background: rgba(0, 0, 0, 0.28);
+		filter: blur(22px);
+		opacity: 0.8;
 		transform: translate(10px, 2px);
 	}
 
