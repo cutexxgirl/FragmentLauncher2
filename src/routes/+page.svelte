@@ -15,6 +15,7 @@
 		| 'SouthEast'
 		| 'SouthWest'
 		| 'West';
+	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
 
 	let status = $state<LauncherStatus>({
 		appName: 'Fragment Launcher',
@@ -25,7 +26,9 @@
 	});
 	let bootProgress = $state(0.08);
 	let bootLabel = $state('Поднимаем оболочку');
-	let launcherReady = $state(false);
+	let bootPhase = $state<BootPhase>('boot');
+	let bootVisible = $derived(bootPhase !== 'ready');
+	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
 
 	const appWindow = browser ? getCurrentWindow() : null;
 
@@ -46,7 +49,7 @@
 		return new Promise((resolve) => window.setTimeout(resolve, ms));
 	}
 
-	async function animateWindowSize(width: number, height: number, duration = 520) {
+	async function animateWindowSize(width: number, height: number, duration = 460) {
 		if (!appWindow) {
 			return;
 		}
@@ -60,7 +63,9 @@
 		const startedAt = performance.now();
 
 		await new Promise<void>((resolve) => {
-			const frame = async (now: number) => {
+			let pendingResize: Promise<unknown> | undefined;
+
+			const frame = (now: number) => {
 				const t = Math.min(1, (now - startedAt) / duration);
 				const eased = smootherStep(t);
 				const nextWidth = Math.round(startSize.width + (targetSize.width - startSize.width) * eased);
@@ -68,7 +73,7 @@
 				const nextX = Math.round(centerX - nextWidth / 2);
 				const nextY = Math.round(centerY - nextHeight / 2);
 
-				await Promise.all([
+				pendingResize = Promise.all([
 					appWindow.setSize(new PhysicalSize(nextWidth, nextHeight)),
 					appWindow.setPosition(new PhysicalPosition(nextX, nextY))
 				]);
@@ -78,7 +83,7 @@
 					return;
 				}
 
-				resolve();
+				pendingResize.finally(resolve);
 			};
 
 			requestAnimationFrame(frame);
@@ -98,12 +103,15 @@
 		await delay(80);
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
+		bootPhase = 'expanding';
 		await animateWindowSize(1320, 800);
 		await appWindow?.setMinSize(new LogicalSize(1100, 680));
 
 		setBootStep(1, 'Готово');
-		await delay(120);
-		launcherReady = true;
+		await delay(80);
+		bootPhase = 'reveal';
+		await delay(420);
+		bootPhase = 'ready';
 	}
 
 	async function minimize() {
@@ -136,8 +144,6 @@
 	<div class="window-shadow shadow-contact"></div>
 
 <main
-	class:ready={launcherReady}
-	class:booting={!launcherReady}
 	class="app-shell absolute overflow-hidden rounded-[18px] border border-border bg-background text-foreground"
 >
 	<button
@@ -181,8 +187,9 @@
 		onmousedown={() => startResize('SouthWest')}
 	></button>
 
-	{#if !launcherReady}
+	{#if bootVisible}
 		<div
+			class:leaving={bootPhase === 'reveal'}
 			class="boot-screen flex h-full min-h-0 flex-col justify-between bg-[radial-gradient(circle_at_70%_18%,#263243_0,#0c0f14_52%)] px-7 py-6"
 			role="toolbar"
 			aria-label="Boot window"
@@ -214,7 +221,9 @@
 				</div>
 			</div>
 		</div>
-	{:else}
+	{/if}
+
+	<div class:visible={launcherVisible} class="launcher-layout">
 	<aside class="launcher-surface flex min-h-0 flex-col border-r border-border bg-panel px-6 py-5">
 		<div class="flex items-center gap-3">
 			<div class="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
@@ -342,7 +351,7 @@
 			</div>
 		</div>
 	</section>
-	{/if}
+	</div>
 </main>
 </div>
 
@@ -357,18 +366,44 @@
 		filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.24));
 	}
 
-	.app-shell.booting {
-		display: grid;
-		grid-template-columns: 1fr;
+	.boot-screen {
+		position: absolute;
+		inset: 0;
+		z-index: 12;
+		opacity: 1;
+		transform: scale(1);
+		transition:
+			opacity 260ms ease,
+			transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
 	}
 
-	.app-shell.ready {
+	.boot-screen.leaving {
+		opacity: 0;
+		transform: scale(1.025);
+		pointer-events: none;
+	}
+
+	.launcher-layout {
+		position: absolute;
+		inset: 0;
 		display: grid;
 		grid-template-columns: 320px 1fr;
+		opacity: 0;
+		pointer-events: none;
+		transform: scale(0.985) translateY(8px);
+		transition:
+			opacity 320ms ease,
+			transform 440ms cubic-bezier(0.22, 1, 0.36, 1);
+	}
+
+	.launcher-layout.visible {
+		opacity: 1;
+		pointer-events: auto;
+		transform: scale(1) translateY(0);
 	}
 
 	.launcher-surface {
-		animation: launcher-surface-in 340ms ease-out both;
+		animation: launcher-surface-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
 	}
 
 	.launcher-surface:nth-of-type(2) {
