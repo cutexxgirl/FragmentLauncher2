@@ -38,10 +38,34 @@
 		removeShader,
 		removeResourcePack
 	}: Props = $props();
+
+	function closeFromBackdrop(event: MouseEvent) {
+		if (event.target === event.currentTarget) {
+			closeSettings();
+		}
+	}
+
+	function closeFromKeyboard(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			closeSettings();
+		}
+	}
 </script>
 
-<div class="settings-backdrop">
-	<div class="settings-window" role="dialog" aria-modal="true" aria-label="Настройки сборки" tabindex="-1">
+<div
+	class="settings-backdrop"
+	role="button"
+	tabindex="-1"
+	onclick={closeFromBackdrop}
+	onkeydown={closeFromKeyboard}
+>
+	<div
+		class="settings-window"
+		role="dialog"
+		aria-modal="true"
+		aria-label="Настройки сборки"
+		tabindex="-1"
+	>
 		<header class="settings-window-head">
 			<div>
 				<p class="section-kicker">Настройки</p>

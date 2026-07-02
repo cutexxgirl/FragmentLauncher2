@@ -212,6 +212,46 @@
 		color: white;
 	}
 
+	.titlebar-menu {
+		position: relative;
+	}
+
+	.window-control.active {
+		background: var(--color-panel-strong);
+		color: var(--color-foreground);
+	}
+
+	.titlebar-dropdown {
+		position: absolute;
+		top: calc(100% + 8px);
+		right: 0;
+		z-index: 36;
+		display: grid;
+		width: 176px;
+		gap: 4px;
+		border-radius: 16px;
+		background: rgba(25, 27, 29, 0.96);
+		padding: 8px;
+	}
+
+	.titlebar-dropdown button {
+		display: flex;
+		height: 34px;
+		align-items: center;
+		gap: 9px;
+		border-radius: 12px;
+		padding: 0 9px;
+		color: var(--color-muted);
+		font-size: 0.8rem;
+		font-weight: 700;
+		text-align: left;
+	}
+
+	.titlebar-dropdown button:hover {
+		background: rgba(255, 255, 255, 0.06);
+		color: var(--color-foreground);
+	}
+
 	.workspace {
 		min-height: 0;
 		padding: 18px 24px 22px !important;
@@ -238,6 +278,8 @@
 	.news-item,
 	.settings-window,
 	.support-window,
+	.profile-window,
+	.stats-window,
 	.settings-window-head,
 	.privacy-modal {
 		border: 0 !important;
@@ -971,45 +1013,6 @@
 		line-height: 1.55;
 	}
 
-	.attach-row {
-		display: grid;
-		grid-template-columns: auto 34px minmax(0, 1fr);
-		align-items: center;
-		gap: 10px;
-		border-radius: 16px;
-		background: rgba(16, 17, 18, 0.42);
-		padding: 10px;
-	}
-
-	.attach-row input {
-		accent-color: var(--color-accent);
-	}
-
-	.attach-icon {
-		display: grid;
-		width: 34px;
-		height: 34px;
-		place-items: center;
-		border-radius: 14px;
-		background: rgba(255, 255, 255, 0.06);
-		color: var(--color-accent);
-	}
-
-	.attach-row strong,
-	.attach-row small {
-		display: block;
-	}
-
-	.attach-row strong {
-		font-size: 0.9rem;
-	}
-
-	.attach-row small {
-		margin-top: 2px;
-		color: var(--color-muted);
-		font-size: 0.76rem;
-	}
-
 	.support-summary-row,
 	.subscription-row,
 	.quick-row {
@@ -1079,7 +1082,6 @@
 	}
 
 	.profile-link-row,
-	.diagnostics-row,
 	.subscription-summary {
 		display: flex;
 		align-items: center;
@@ -1093,47 +1095,43 @@
 		padding: 12px;
 	}
 
-	.diagnostics-row {
-		border-radius: 18px;
-		background: rgba(16, 17, 18, 0.4);
-		padding: 12px;
-	}
-
 	.support-textarea {
 		min-height: 76px;
-	}
-
-	.support-package {
-		align-self: start;
 	}
 
 	.support-layout > form {
 		padding: 14px !important;
 	}
 
-	.support-layout .attach-row {
-		padding: 8px;
+	.support-attachments {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 8px;
 	}
 
-	.support-layout .attach-icon {
-		width: 30px;
-		height: 30px;
-		border-radius: 12px;
+	.attach-button {
+		display: inline-flex;
+		min-width: 0;
+		min-height: 38px;
+		align-items: center;
+		justify-content: center;
+		border-radius: 14px;
+		background: rgba(16, 17, 18, 0.42);
+		padding: 0 10px;
+		color: var(--color-muted);
+		font-size: 0.78rem;
+		font-weight: 800;
+		text-align: center;
 	}
 
-	.support-layout .attach-row strong {
-		font-size: 0.84rem;
-	}
-
-	.support-layout .attach-row small {
-		font-size: 0.7rem;
-	}
-
-	.support-layout .diagnostics-row {
-		padding: 10px;
+	.attach-button:hover,
+	.attach-button.active {
+		background: rgba(240, 179, 93, 0.12);
+		color: var(--color-foreground);
 	}
 
 	.support-actions {
+		display: flex;
 		justify-content: flex-end !important;
 	}
 
@@ -1152,7 +1150,9 @@
 	}
 
 	.settings-backdrop,
-	.support-backdrop {
+	.support-backdrop,
+	.profile-backdrop,
+	.stats-backdrop {
 		position: absolute;
 		inset: 0;
 		z-index: 38;
@@ -1166,8 +1166,18 @@
 		z-index: 39;
 	}
 
+	.profile-backdrop {
+		z-index: 39;
+	}
+
+	.stats-backdrop {
+		z-index: 39;
+	}
+
 	.settings-window,
-	.support-window {
+	.support-window,
+	.profile-window,
+	.stats-window {
 		display: grid;
 		width: min(860px, calc(100% - 72px));
 		max-height: calc(100% - 72px);
@@ -1182,7 +1192,15 @@
 	}
 
 	.support-window {
-		width: min(860px, calc(100% - 64px));
+		width: min(720px, calc(100% - 72px));
+	}
+
+	.profile-window {
+		width: min(780px, calc(100% - 72px));
+	}
+
+	.stats-window {
+		width: min(480px, calc(100% - 72px));
 	}
 
 	.settings-window-head {
@@ -1195,7 +1213,9 @@
 	}
 
 	.settings-window-body,
-	.support-window-body {
+	.support-window-body,
+	.profile-window-body,
+	.stats-window-body {
 		min-height: 0;
 		overflow-y: auto;
 		padding: 12px;
@@ -1212,6 +1232,10 @@
 	}
 
 	.support-window .section-grid > .page-heading {
+		display: none;
+	}
+
+	.profile-window .section-grid > .page-heading {
 		display: none;
 	}
 
@@ -1303,6 +1327,21 @@
 	.support-window .support-layout {
 		grid-template-columns: minmax(0, 1fr);
 		gap: 12px;
+	}
+
+	.profile-window .profile-layout {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 12px;
+	}
+
+	.profile-window .profile-main-card,
+	.profile-window .telegram-card {
+		max-width: none;
+	}
+
+	.stats-grid {
+		display: grid;
+		gap: 8px;
 	}
 
 	.privacy-modal {
@@ -1427,12 +1466,16 @@
 		}
 
 		.settings-backdrop,
-		.support-backdrop {
+		.support-backdrop,
+		.profile-backdrop,
+		.stats-backdrop {
 			padding: 10px;
 		}
 
 		.settings-window,
-		.support-window {
+		.support-window,
+		.profile-window,
+		.stats-window {
 			width: 100%;
 			max-height: 100%;
 			border-radius: 24px;
@@ -1440,7 +1483,13 @@
 
 		.settings-window-head,
 		.settings-window-body,
-		.support-window-body {
+		.support-window-body,
+		.profile-window-body,
+		.stats-window-body {
 			padding: 12px;
+		}
+
+		.support-attachments {
+			grid-template-columns: 1fr;
 		}
 	}

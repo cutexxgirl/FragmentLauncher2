@@ -39,6 +39,7 @@
 	let carouselImages = $derived(feedImages.slice(0, 8));
 	let imageCount = $derived(carouselImages.length);
 	let activeImage = $derived(carouselImages[activeImageIndex] ?? carouselImages[0] ?? '');
+	let buildReleaseName = $derived(activeBuild.id === 'fragment-origin' ? 'Claws & Bloom' : '');
 
 	onMount(() => {
 		const timer = window.setInterval(() => {
@@ -74,7 +75,9 @@
 			<h2 class="text-[clamp(2.35rem,5vw,4rem)] font-semibold leading-[1.02]">
 				{activeBuild.name}
 			</h2>
-			<p class="build-version-name mt-4">Claws & Bloom</p>
+			{#if buildReleaseName}
+				<p class="build-version-name mt-4">{buildReleaseName}</p>
+			{/if}
 		</div>
 	</section>
 

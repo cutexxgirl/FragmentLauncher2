@@ -1,6 +1,6 @@
 <script lang="ts">
 	import '$lib/styles/launcher.css';
-	import { Gamepad2, MessageCircle, User } from '@lucide/svelte';
+	import { Gamepad2 } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
@@ -15,12 +15,12 @@
 		type SectionId
 	} from '$lib/launcher-ui';
 	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
-	import DiagnosticsModal from '$lib/components/launcher/DiagnosticsModal.svelte';
 	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
 	import MobileNav from '$lib/components/launcher/MobileNav.svelte';
-	import ProfileSection from '$lib/components/launcher/ProfileSection.svelte';
+	import ProfileWindow from '$lib/components/launcher/ProfileWindow.svelte';
 	import SettingsWindow from '$lib/components/launcher/SettingsWindow.svelte';
 	import Sidebar from '$lib/components/launcher/Sidebar.svelte';
+	import StatsWindow from '$lib/components/launcher/StatsWindow.svelte';
 	import SupportWindow from '$lib/components/launcher/SupportWindow.svelte';
 	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
 
@@ -40,11 +40,10 @@
 	let attachCrashReport = $state(true);
 	let attachLastLog = $state(true);
 	let attachLastScreenshot = $state(false);
-	let sendDiagnostics = $state(true);
 	let settingsVisible = $state(false);
 	let supportVisible = $state(false);
-	let diagnosticsNoticeDismissed = $state(false);
-	let showDiagnosticsNotice = $state(false);
+	let profileVisible = $state(false);
+	let statsVisible = $state(false);
 	let supportSent = $state(false);
 	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
 
@@ -53,14 +52,11 @@
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
-	let activePreset = $derived(presets.find((preset) => preset.id === activeBuild.preset) ?? presets[1]);
 	let availableBuildsCount = $derived(builds.filter((build) => build.access === 'available').length);
 	let supportReady = $derived(supportTopic.trim().length > 2 && supportDescription.trim().length > 12);
 
 	const navigation = [
-		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
-		{ id: 'support', label: 'Поддержка', mobileLabel: 'Поддержка', icon: MessageCircle },
-		{ id: 'profile', label: 'Профиль', mobileLabel: 'Профиль', icon: User }
+		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 }
 	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
 
 	onMount(async () => {
@@ -136,6 +132,11 @@
 			return;
 		}
 
+		if (section === 'profile') {
+			profileVisible = true;
+			return;
+		}
+
 		activeSection = section;
 	}
 
@@ -195,19 +196,6 @@
 		activeBuild.resourcePacks = activeBuild.resourcePacks.filter((item) => item !== name);
 	}
 
-	function setDiagnosticsEnabled(enabled: boolean) {
-		sendDiagnostics = enabled;
-
-		if (!enabled && !diagnosticsNoticeDismissed) {
-			showDiagnosticsNotice = true;
-		}
-	}
-
-	function dismissDiagnosticsNotice() {
-		diagnosticsNoticeDismissed = true;
-		showDiagnosticsNotice = false;
-	}
-
 	function submitSupportRequest(event: SubmitEvent) {
 		event.preventDefault();
 
@@ -254,6 +242,10 @@
 					{startDrag}
 					{minimize}
 					{closeWindow}
+					openSupport={() => (supportVisible = true)}
+					openProfile={() => (profileVisible = true)}
+					openStats={() => (statsVisible = true)}
+					openSettings={() => (settingsVisible = true)}
 				/>
 
 				<MobileNav
@@ -272,13 +264,6 @@
 							{feedImages}
 							{selectBuild}
 							openSettings={() => (settingsVisible = true)}
-						/>
-					{:else if activeSection === 'profile'}
-						<ProfileSection
-							{builds}
-							bind:nickname
-							{telegramAccount}
-							{availableBuildsCount}
 						/>
 					{/if}
 				</div>
@@ -307,26 +292,32 @@
 
 		{#if supportVisible}
 			<SupportWindow
-				{activeBuild}
-				{activePreset}
 				bind:supportTopic
 				bind:supportDescription
 				bind:attachCrashReport
 				bind:attachLastLog
 				bind:attachLastScreenshot
-				{sendDiagnostics}
 				{supportReady}
 				{supportSent}
 				closeSupport={() => (supportVisible = false)}
-				{setDiagnosticsEnabled}
 				{submitSupportRequest}
 			/>
 		{/if}
 
-		{#if showDiagnosticsNotice}
-			<DiagnosticsModal
-				closeDiagnosticsNotice={() => (showDiagnosticsNotice = false)}
-				{dismissDiagnosticsNotice}
+		{#if profileVisible}
+			<ProfileWindow
+				{builds}
+				bind:nickname
+				{telegramAccount}
+				{availableBuildsCount}
+				closeProfile={() => (profileVisible = false)}
+			/>
+		{/if}
+
+		{#if statsVisible}
+			<StatsWindow
+				{activeBuild}
+				closeStats={() => (statsVisible = false)}
 			/>
 		{/if}
 	</main>
