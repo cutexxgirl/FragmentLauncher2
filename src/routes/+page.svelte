@@ -26,7 +26,7 @@
 
 	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
 
-	const FIXED_WINDOW_SIZE = new LogicalSize(1224, 764);
+	const FIXED_WINDOW_SIZE = new LogicalSize(1244, 764);
 
 	let bootProgress = $state(0.08);
 	let bootLabel = $state('Поднимаем оболочку');
@@ -236,9 +236,6 @@
 </svelte:head>
 
 <div class:expanded={bootPhase !== 'boot'} class="window-stage fixed inset-0 overflow-hidden">
-	<div class="window-shadow shadow-cast"></div>
-	<div class="window-shadow shadow-contact"></div>
-
 	<main
 		class="app-shell absolute overflow-hidden rounded-[30px] border border-border bg-background text-foreground"
 	>
