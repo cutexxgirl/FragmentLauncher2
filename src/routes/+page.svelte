@@ -3,7 +3,7 @@
 	import { browser } from '$app/environment';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi';
+	import { LogicalSize } from '@tauri-apps/api/dpi';
 	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
 
 	type ResizeDirection =
@@ -41,53 +41,8 @@
 		bootLabel = label;
 	}
 
-	function smootherStep(value: number) {
-		return value * value * value * (value * (value * 6 - 15) + 10);
-	}
-
 	function delay(ms: number) {
 		return new Promise((resolve) => window.setTimeout(resolve, ms));
-	}
-
-	async function animateWindowSize(width: number, height: number, duration = 460) {
-		if (!appWindow) {
-			return;
-		}
-
-		const scaleFactor = await appWindow.scaleFactor();
-		const startSize = await appWindow.outerSize();
-		const startPosition = await appWindow.outerPosition();
-		const targetSize = new LogicalSize(width, height).toPhysical(scaleFactor);
-		const centerX = startPosition.x + startSize.width / 2;
-		const centerY = startPosition.y + startSize.height / 2;
-		const startedAt = performance.now();
-
-		await new Promise<void>((resolve) => {
-			let pendingResize: Promise<unknown> | undefined;
-
-			const frame = (now: number) => {
-				const t = Math.min(1, (now - startedAt) / duration);
-				const eased = smootherStep(t);
-				const nextWidth = Math.round(startSize.width + (targetSize.width - startSize.width) * eased);
-				const nextHeight = Math.round(startSize.height + (targetSize.height - startSize.height) * eased);
-				const nextX = Math.round(centerX - nextWidth / 2);
-				const nextY = Math.round(centerY - nextHeight / 2);
-
-				pendingResize = Promise.all([
-					appWindow.setSize(new PhysicalSize(nextWidth, nextHeight)),
-					appWindow.setPosition(new PhysicalPosition(nextX, nextY))
-				]);
-
-				if (t < 1) {
-					requestAnimationFrame(frame);
-					return;
-				}
-
-				pendingResize.finally(resolve);
-			};
-
-			requestAnimationFrame(frame);
-		});
 	}
 
 	async function runBootSequence() {
@@ -104,7 +59,7 @@
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
 		bootPhase = 'expanding';
-		await animateWindowSize(1320, 800);
+		await delay(620);
 		await appWindow?.setMinSize(new LogicalSize(1100, 680));
 
 		setBootStep(1, 'Готово');
@@ -139,7 +94,7 @@
 	<title>Fragment Launcher</title>
 </svelte:head>
 
-<div class="window-stage fixed inset-0 overflow-hidden">
+<div class:expanded={bootPhase !== 'boot'} class="window-stage fixed inset-0 overflow-hidden">
 	<div class="window-shadow shadow-cast"></div>
 	<div class="window-shadow shadow-contact"></div>
 
@@ -357,12 +312,26 @@
 
 <style>
 	.window-stage {
+		--shell-height: 292px;
+		--shell-width: 512px;
 		pointer-events: none;
 	}
 
+	.window-stage.expanded {
+		--shell-height: calc(100% - 64px);
+		--shell-width: calc(100% - 64px);
+	}
+
 	.app-shell {
-		inset: 24px 38px 38px 24px;
+		top: 50%;
+		left: 50%;
+		width: var(--shell-width);
+		height: var(--shell-height);
 		pointer-events: auto;
+		transform: translate(-50%, -50%);
+		transition:
+			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
+			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
 		filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.24));
 	}
 
@@ -429,11 +398,17 @@
 	}
 
 	.shadow-cast {
-		inset: 24px 38px 38px 24px;
+		top: 50%;
+		left: 50%;
+		width: var(--shell-width);
+		height: var(--shell-height);
 		background: transparent;
 		box-shadow: 14px 16px 26px 6px rgba(0, 0, 0, 0.42);
 		opacity: 0.9;
-		transform: translate(2px, 2px);
+		transform: translate(calc(-50% + 2px), calc(-50% + 2px));
+		transition:
+			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
+			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
 		mask-image: linear-gradient(
 			135deg,
 			rgba(0, 0, 0, 0.08) 0%,
@@ -449,15 +424,17 @@
 	}
 
 	.shadow-contact {
-		right: 62px;
-		bottom: 31px;
-		left: 44px;
-		height: 30px;
-		border-radius: 999px;
-		background: rgba(0, 0, 0, 0.28);
-		filter: blur(14px);
-		opacity: 0.76;
-		transform: translate(10px, 2px);
+		top: 50%;
+		left: 50%;
+		width: var(--shell-width);
+		height: var(--shell-height);
+		background: transparent;
+		box-shadow: 9px 15px 18px -12px rgba(0, 0, 0, 0.34);
+		opacity: 0.78;
+		transform: translate(-50%, -50%);
+		transition:
+			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
+			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
 	}
 
 	.window-control {
