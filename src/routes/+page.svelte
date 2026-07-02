@@ -7,7 +7,7 @@
 	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
 	import {
 		createBuildProfiles,
-		news,
+		feedItems,
 		presets,
 		type BuildProfile,
 		type PresetId,
@@ -54,6 +54,7 @@
 	let attachLastLog = $state(true);
 	let attachLastScreenshot = $state(false);
 	let sendDiagnostics = $state(true);
+	let sidebarCollapsed = $state(false);
 	let diagnosticsNoticeDismissed = $state(false);
 	let showDiagnosticsNotice = $state(false);
 	let supportSent = $state(false);
@@ -102,13 +103,13 @@
 		await delay(80);
 
 		setBootStep(0.68, 'Проверяем профиль сборки');
-		await appWindow?.setMinSize(new LogicalSize(860, 620));
+		await appWindow?.setMinSize(new LogicalSize(760, 520));
 		await delay(80);
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
 		bootPhase = 'expanding';
 		await delay(620);
-		await appWindow?.setMinSize(new LogicalSize(1080, 680));
+		await appWindow?.setMinSize(new LogicalSize(760, 520));
 
 		setBootStep(1, 'Готово');
 		await delay(80);
@@ -277,20 +278,21 @@
 			<BootScreen {bootPhase} {bootProgress} {bootLabel} {startDrag} />
 		{/if}
 
-		<div class:visible={launcherVisible} class="launcher-layout">
+		<div
+			class:sidebar-collapsed={sidebarCollapsed}
+			class:visible={launcherVisible}
+			class="launcher-layout"
+		>
 			<Sidebar
 				{navigation}
 				{activeSection}
-				{activeBuild}
-				{status}
-				{enabledModsCount}
+				collapsed={sidebarCollapsed}
 				setActiveSection={(section) => (activeSection = section)}
+				toggleCollapsed={() => (sidebarCollapsed = !sidebarCollapsed)}
 			/>
 
 			<section class="main-surface flex min-w-0 flex-col">
 				<TitleBar
-					{activeBuild}
-					{activePreset}
 					{startDrag}
 					{toggleMaximize}
 					{minimize}
@@ -310,8 +312,7 @@
 							{activeBuild}
 							{activePreset}
 							{selectedBuildId}
-							{enabledModsCount}
-							{news}
+							{feedItems}
 							{selectBuild}
 							setActiveSection={(section) => (activeSection = section)}
 						/>

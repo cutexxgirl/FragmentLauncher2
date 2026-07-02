@@ -1,5 +1,5 @@
 <script lang="ts">
-import { FolderPlus, Image, Info, Package, Play, X, Zap } from '@lucide/svelte';
+import { FolderPlus, Image, Info, Package, X, Zap } from '@lucide/svelte';
 import type { BuildProfile, Preset, PresetId } from '$lib/launcher-ui';
 
 type Props = {
@@ -46,10 +46,6 @@ let resourcePackInput = $state<HTMLInputElement | null>(null);
 									<p class="section-kicker">Настройки сборки</p>
 									<h2 class="page-title">{activeBuild.name}</h2>
 								</div>
-								<button class="play-button compact">
-									<Play size={18} fill="currentColor" />
-									<span>Играть</span>
-								</button>
 							</div>
 
 							<div class="settings-layout">
