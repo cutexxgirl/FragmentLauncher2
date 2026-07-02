@@ -74,7 +74,7 @@
 
 	const navigation = [
 		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
-		{ id: 'support', label: 'Техподдержка', mobileLabel: 'Поддержка', icon: MessageCircle },
+		{ id: 'support', label: 'Поддержка', mobileLabel: 'Поддержка', icon: MessageCircle },
 		{ id: 'profile', label: 'Профиль', mobileLabel: 'Профиль', icon: User }
 	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
 
