@@ -29,19 +29,18 @@
 	onclick={closeFromBackdrop}
 	onkeydown={closeFromKeyboard}
 >
-	<div
-		class="stats-window"
-		role="dialog"
-		aria-modal="true"
-		aria-label="Статистика"
-		tabindex="-1"
-	>
+	<div class="stats-window" role="dialog" aria-modal="true" aria-label="Статистика" tabindex="-1">
 		<header class="settings-window-head">
 			<div class="modal-title-row">
 				<h2 class="modal-title">Статистика</h2>
 				<span class="modal-context">{activeBuild.name}</span>
 			</div>
-			<button type="button" class="ghost-icon-button" title="Закрыть статистику" onclick={closeStats}>
+			<button
+				type="button"
+				class="ghost-icon-button"
+				title="Закрыть статистику"
+				onclick={closeStats}
+			>
 				<X size={18} />
 			</button>
 		</header>

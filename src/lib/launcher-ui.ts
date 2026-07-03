@@ -49,7 +49,7 @@ export const feedImages: string[] = [
 	'linear-gradient(140deg, rgba(117, 199, 192, 0.72), rgba(17, 18, 19, 0.96)), radial-gradient(circle at 24% 34%, rgba(240, 179, 93, 0.32), transparent 28%)',
 	'linear-gradient(150deg, rgba(72, 81, 86, 0.9), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 66% 28%, rgba(240, 179, 93, 0.42), transparent 30%)',
 	'linear-gradient(145deg, rgba(58, 63, 70, 0.92), rgba(16, 17, 18, 0.96)), radial-gradient(circle at 28% 25%, rgba(117, 199, 192, 0.42), transparent 25%)',
-	'linear-gradient(135deg, rgba(240, 179, 93, 0.42), rgba(117, 199, 192, 0.34), rgba(12, 13, 14, 0.98))'
+	'linear-gradient(135deg, rgba(240, 179, 93, 0.42), rgba(117, 199, 192, 0.34), rgba(12, 13, 14, 0.98))',
 ];
 
 export const presets: Preset[] = [
@@ -57,20 +57,20 @@ export const presets: Preset[] = [
 		id: 'low',
 		name: 'Слабый',
 		description: 'Меньше эффектов, быстрый старт',
-		ram: 4
+		ram: 4,
 	},
 	{
 		id: 'medium',
 		name: 'Средний',
 		description: 'Баланс графики и FPS',
-		ram: 6
+		ram: 6,
 	},
 	{
 		id: 'high',
 		name: 'Высокий',
 		description: 'Максимум визуала',
-		ram: 10
-	}
+		ram: 10,
+	},
 ];
 
 export const feedItems: FeedItem[] = [
@@ -83,8 +83,8 @@ export const feedItems: FeedItem[] = [
 		images: [
 			'linear-gradient(135deg, rgba(240, 179, 93, 0.86), rgba(41, 48, 48, 0.92)), radial-gradient(circle at 78% 26%, rgba(255, 255, 255, 0.38), transparent 26%)',
 			'linear-gradient(140deg, rgba(117, 199, 192, 0.72), rgba(17, 18, 19, 0.96)), radial-gradient(circle at 24% 34%, rgba(240, 179, 93, 0.32), transparent 28%)',
-			'linear-gradient(150deg, rgba(72, 81, 86, 0.9), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 66% 28%, rgba(240, 179, 93, 0.42), transparent 30%)'
-		]
+			'linear-gradient(150deg, rgba(72, 81, 86, 0.9), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 66% 28%, rgba(240, 179, 93, 0.42), transparent 30%)',
+		],
 	},
 	{
 		id: 'optional-mods',
@@ -94,8 +94,8 @@ export const feedItems: FeedItem[] = [
 		headline: 'Карта, камера и визуальные эффекты теперь живут отдельно от ядра сборки.',
 		images: [
 			'linear-gradient(145deg, rgba(58, 63, 70, 0.92), rgba(16, 17, 18, 0.96)), radial-gradient(circle at 28% 25%, rgba(117, 199, 192, 0.42), transparent 25%)',
-			'linear-gradient(135deg, rgba(240, 179, 93, 0.52), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 72% 18%, rgba(255, 255, 255, 0.3), transparent 22%)'
-		]
+			'linear-gradient(135deg, rgba(240, 179, 93, 0.52), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 72% 18%, rgba(255, 255, 255, 0.3), transparent 22%)',
+		],
 	},
 	{
 		id: 'support-diagnostics',
@@ -105,8 +105,8 @@ export const feedItems: FeedItem[] = [
 		headline: 'Логи, crash report и скриншот можно подготовить в одном месте.',
 		images: [
 			'linear-gradient(140deg, rgba(117, 199, 192, 0.5), rgba(21, 23, 25, 0.96)), radial-gradient(circle at 72% 32%, rgba(240, 179, 93, 0.36), transparent 28%)',
-			'linear-gradient(145deg, rgba(37, 41, 45, 0.96), rgba(12, 13, 14, 0.98)), radial-gradient(circle at 35% 30%, rgba(116, 211, 169, 0.34), transparent 26%)'
-		]
+			'linear-gradient(145deg, rgba(37, 41, 45, 0.96), rgba(12, 13, 14, 0.98)), radial-gradient(circle at 35% 30%, rgba(116, 211, 169, 0.34), transparent 26%)',
+		],
 	},
 	{
 		id: 'visual-pack',
@@ -117,9 +117,9 @@ export const feedItems: FeedItem[] = [
 		images: [
 			'linear-gradient(135deg, rgba(240, 179, 93, 0.42), rgba(117, 199, 192, 0.34), rgba(12, 13, 14, 0.98))',
 			'linear-gradient(145deg, rgba(82, 71, 56, 0.86), rgba(18, 18, 18, 0.96)), radial-gradient(circle at 70% 36%, rgba(240, 179, 93, 0.5), transparent 28%)',
-			'linear-gradient(145deg, rgba(56, 64, 69, 0.9), rgba(15, 16, 17, 0.98)), radial-gradient(circle at 28% 28%, rgba(117, 199, 192, 0.38), transparent 24%)'
-		]
-	}
+			'linear-gradient(145deg, rgba(56, 64, 69, 0.9), rgba(15, 16, 17, 0.98)), radial-gradient(circle at 28% 28%, rgba(117, 199, 192, 0.38), transparent 24%)',
+		],
+	},
 ];
 
 export function createBuildProfiles(): BuildProfile[] {
@@ -130,7 +130,8 @@ export function createBuildProfiles(): BuildProfile[] {
 			subtitle: 'Основная одиночная сборка',
 			version: '1.20.1',
 			tag: 'Stable',
-			description: 'Базовый опыт Fragment: исследование, техника и аккуратные визуальные улучшения.',
+			description:
+				'Базовый опыт Fragment: исследование, техника и аккуратные визуальные улучшения.',
 			access: 'available',
 			size: '18.4 ГБ',
 			minecraft: 'Forge 47.3',
@@ -143,32 +144,32 @@ export function createBuildProfiles(): BuildProfile[] {
 					name: 'Миникарта',
 					description: 'Навигация без вмешательства в баланс.',
 					impact: 'легко',
-					enabled: true
+					enabled: true,
 				},
 				{
 					id: 'ambient',
 					name: 'Ambient FX',
 					description: 'Погода, частицы и мягкая атмосфера.',
 					impact: 'средне',
-					enabled: true
+					enabled: true,
 				},
 				{
 					id: 'camera',
 					name: 'Cinematic Camera',
 					description: 'Плавная камера для скриншотов и видео.',
 					impact: 'легко',
-					enabled: false
+					enabled: false,
 				},
 				{
 					id: 'waystones',
 					name: 'Waystones Lite',
 					description: 'Удобные точки перемещения в одиночном мире.',
 					impact: 'средне',
-					enabled: false
-				}
+					enabled: false,
+				},
 			],
 			shaders: ['Fragment Soft Light.zip'],
-			resourcePacks: ['Fragment UI Clean.zip']
+			resourcePacks: ['Fragment UI Clean.zip'],
 		},
 		{
 			id: 'fragment-sky',
@@ -189,25 +190,25 @@ export function createBuildProfiles(): BuildProfile[] {
 					name: 'Sky Map',
 					description: 'Маршруты островов и быстрые метки.',
 					impact: 'легко',
-					enabled: true
+					enabled: true,
 				},
 				{
 					id: 'clouds',
 					name: 'Cloud Depth',
 					description: 'Дополнительные облака и глубина неба.',
 					impact: 'средне',
-					enabled: false
+					enabled: false,
 				},
 				{
 					id: 'quests',
 					name: 'Quest Hints',
 					description: 'Подсказки по ранним цепочкам прогресса.',
 					impact: 'легко',
-					enabled: true
-				}
+					enabled: true,
+				},
 			],
 			shaders: [],
-			resourcePacks: ['Sky Minimal UI.zip']
+			resourcePacks: ['Sky Minimal UI.zip'],
 		},
 		{
 			id: 'fragment-visual',
@@ -228,25 +229,25 @@ export function createBuildProfiles(): BuildProfile[] {
 					name: 'Visual FX Pack',
 					description: 'Свет, отражения и улучшенные частицы.',
 					impact: 'тяжело',
-					enabled: true
+					enabled: true,
 				},
 				{
 					id: 'photo-mode',
 					name: 'Photo Mode',
 					description: 'Инструменты для постановочных скриншотов.',
 					impact: 'средне',
-					enabled: true
+					enabled: true,
 				},
 				{
 					id: 'motion',
 					name: 'Motion Detail',
 					description: 'Плавные анимации окружения.',
 					impact: 'тяжело',
-					enabled: false
-				}
+					enabled: false,
+				},
 			],
 			shaders: ['Fragment Cinematic.zip', 'Soft Shadows.zip'],
-			resourcePacks: ['Fragment HD Surfaces.zip']
-		}
+			resourcePacks: ['Fragment HD Surfaces.zip'],
+		},
 	];
 }

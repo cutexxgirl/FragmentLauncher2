@@ -13,7 +13,7 @@ const fallbackStatus: LauncherStatus = {
 	version: '1.0.0',
 	profile: 'singleplayer',
 	servicesConnected: false,
-	updaterReady: true
+	updaterReady: true,
 };
 
 export async function getLauncherStatus(): Promise<LauncherStatus> {

@@ -23,7 +23,7 @@
 		supportReady,
 		supportSent,
 		closeSupport,
-		submitSupportRequest
+		submitSupportRequest,
 	}: Props = $props();
 
 	function closeFromBackdrop(event: MouseEvent) {
@@ -57,7 +57,12 @@
 			<div class="modal-title-row">
 				<h2 class="modal-title">Поддержка</h2>
 			</div>
-			<button type="button" class="ghost-icon-button" title="Закрыть поддержку" onclick={closeSupport}>
+			<button
+				type="button"
+				class="ghost-icon-button"
+				title="Закрыть поддержку"
+				onclick={closeSupport}
+			>
 				<X size={18} />
 			</button>
 		</header>

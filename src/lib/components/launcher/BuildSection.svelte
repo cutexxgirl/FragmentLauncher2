@@ -33,7 +33,7 @@
 		addShaderFiles,
 		addResourcePackFiles,
 		removeShader,
-		removeResourcePack
+		removeResourcePack,
 	}: Props = $props();
 
 	let shaderInput = $state<HTMLInputElement | null>(null);

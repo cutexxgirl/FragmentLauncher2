@@ -36,7 +36,7 @@
 		addShaderFiles,
 		addResourcePackFiles,
 		removeShader,
-		removeResourcePack
+		removeResourcePack,
 	}: Props = $props();
 
 	function closeFromBackdrop(event: MouseEvent) {
@@ -71,7 +71,12 @@
 				<h2 class="modal-title">Настройки</h2>
 				<span class="modal-context">{activeBuild.name}</span>
 			</div>
-			<button type="button" class="ghost-icon-button" title="Закрыть настройки" onclick={closeSettings}>
+			<button
+				type="button"
+				class="ghost-icon-button"
+				title="Закрыть настройки"
+				onclick={closeSettings}
+			>
 				<X size={18} />
 			</button>
 		</header>

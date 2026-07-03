@@ -4,6 +4,18 @@
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
+	import {
+		clearStoredAuthSession,
+		createTelegramLoginChallenge,
+		getCurrentProfile,
+		loadStoredAuthSession,
+		logoutAuthSession,
+		pollTelegramLoginChallenge,
+		refreshAuthSession,
+		storeAuthSession,
+		type LauncherAuthSession,
+		type LauncherProfile,
+	} from '$lib/fragment-api';
 	import { getLauncherStatus } from '$lib/launcher';
 	import {
 		createBuildProfiles,
@@ -12,7 +24,7 @@
 		presets,
 		type BuildProfile,
 		type PresetId,
-		type SectionId
+		type SectionId,
 	} from '$lib/launcher-ui';
 	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
 	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
@@ -26,6 +38,7 @@
 	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
 
 	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
+	type AuthState = 'checking' | 'signed-out' | 'waiting' | 'signed-in' | 'error';
 
 	const FIXED_WINDOW_SIZE = new LogicalSize(1244, 764);
 
@@ -35,7 +48,6 @@
 	let activeSection = $state<SectionId>('home');
 	let selectedBuildId = $state('fragment-origin');
 	let nickname = $state('FragmentPlayer');
-	let telegramAccount = $state('@fragment_player');
 	let supportTopic = $state('');
 	let supportDescription = $state('');
 	let attachCrashReport = $state(true);
@@ -51,26 +63,40 @@
 	let anonymizeAnalytics = $state(true);
 	let includeDiagnosticsInSupport = $state(false);
 	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
+	let authSession = $state<LauncherAuthSession | null>(null);
+	let authState = $state<AuthState>('checking');
+	let authError = $state('');
+	let telegramLoginLink = $state<string | null>(null);
+	let loginPollTimer: number | null = null;
 
 	let builds = $state<BuildProfile[]>(createBuildProfiles());
 
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
-	let availableBuildsCount = $derived(builds.filter((build) => build.access === 'available').length);
-	let supportReady = $derived(supportTopic.trim().length > 2 && supportDescription.trim().length > 12);
+	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
+	let availableBuildsCount = $derived(
+		builds.filter((build) => build.access === 'available' || hasActiveSubscription).length,
+	);
+	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
+	let supportReady = $derived(
+		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
+	);
 
 	const navigation = [
-		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 }
+		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
 	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
 
-	onMount(async () => {
+	onMount(() => {
 		if ('__TAURI_INTERNALS__' in window) {
 			appWindow = getCurrentWindow();
 			void configureFixedWindow();
 		}
 
-		await runBootSequence();
+		void restoreAuthSession();
+		void runBootSequence();
+
+		return () => stopLoginPolling();
 	});
 
 	async function configureFixedWindow() {
@@ -84,7 +110,7 @@
 			() => appWindow?.setMaxSize(FIXED_WINDOW_SIZE),
 			() => appWindow?.setResizable(false),
 			() => appWindow?.setMaximizable(false),
-			() => appWindow?.center()
+			() => appWindow?.center(),
 		];
 
 		for (const task of windowTasks) {
@@ -126,6 +152,114 @@
 		bootPhase = 'reveal';
 		await delay(420);
 		bootPhase = 'ready';
+	}
+
+	async function restoreAuthSession() {
+		const storedSession = loadStoredAuthSession();
+		if (!storedSession) {
+			authState = 'signed-out';
+			return;
+		}
+
+		authState = 'checking';
+		try {
+			const profile = await getCurrentProfile(storedSession.accessToken);
+			authSession = { ...storedSession, profile };
+			storeAuthSession(authSession);
+			authState = 'signed-in';
+		} catch {
+			try {
+				const refreshed = await refreshAuthSession(storedSession.refreshToken);
+				authSession = refreshed;
+				storeAuthSession(refreshed);
+				authState = 'signed-in';
+			} catch {
+				clearStoredAuthSession();
+				authSession = null;
+				authState = 'signed-out';
+			}
+		}
+	}
+
+	async function loginWithTelegram() {
+		stopLoginPolling();
+		authError = '';
+		telegramLoginLink = null;
+		authState = 'waiting';
+
+		try {
+			const challenge = await createTelegramLoginChallenge('Fragment Launcher');
+			telegramLoginLink = challenge.telegramLink;
+			window.open(challenge.telegramLink, '_blank', 'noopener,noreferrer');
+			void pollLoginChallenge(challenge.challengeId, challenge.pollToken, challenge.expiresAt);
+		} catch (error) {
+			authError = error instanceof Error ? error.message : 'Не удалось начать вход через Telegram';
+			authState = 'error';
+		}
+	}
+
+	async function pollLoginChallenge(challengeId: string, pollToken: string, expiresAt: string) {
+		if (authState !== 'waiting') {
+			return;
+		}
+
+		if (Date.now() > new Date(expiresAt).getTime()) {
+			authError = 'Ссылка для входа истекла. Создайте новую.';
+			authState = 'error';
+			return;
+		}
+
+		try {
+			const result = await pollTelegramLoginChallenge(challengeId, pollToken);
+			if (result.status === 'confirmed') {
+				authSession = {
+					tokenType: result.tokenType,
+					accessToken: result.accessToken,
+					refreshToken: result.refreshToken,
+					expiresIn: result.expiresIn,
+					profile: result.profile,
+				};
+				storeAuthSession(authSession);
+				authState = 'signed-in';
+				telegramLoginLink = null;
+				return;
+			}
+
+			if (result.status === 'expired' || result.status === 'consumed') {
+				authError = 'Ссылка для входа уже недействительна. Создайте новую.';
+				authState = 'error';
+				return;
+			}
+		} catch (error) {
+			authError = error instanceof Error ? error.message : 'Не удалось проверить вход';
+			authState = 'error';
+			return;
+		}
+
+		loginPollTimer = window.setTimeout(() => {
+			void pollLoginChallenge(challengeId, pollToken, expiresAt);
+		}, 1800);
+	}
+
+	async function logoutFromTelegram() {
+		const session = authSession;
+		stopLoginPolling();
+		authSession = null;
+		authState = 'signed-out';
+		authError = '';
+		telegramLoginLink = null;
+		clearStoredAuthSession();
+
+		if (session) {
+			await logoutAuthSession(session.refreshToken).catch(() => undefined);
+		}
+	}
+
+	function stopLoginPolling() {
+		if (loginPollTimer) {
+			window.clearTimeout(loginPollTimer);
+			loginPollTimer = null;
+		}
 	}
 
 	function selectBuild(buildId: string) {
@@ -190,7 +324,10 @@
 		const input = event.currentTarget as HTMLInputElement;
 		const fileNames = Array.from(input.files ?? []).map((file) => file.name);
 
-		activeBuild.resourcePacks = [...new Set([...activeBuild.resourcePacks, ...fileNames])].slice(0, 8);
+		activeBuild.resourcePacks = [...new Set([...activeBuild.resourcePacks, ...fileNames])].slice(
+			0,
+			8,
+		);
 		input.value = '';
 	}
 
@@ -223,6 +360,18 @@
 	async function startDrag() {
 		await appWindow?.startDragging();
 	}
+
+	function formatTelegramAccount(profile: LauncherProfile | undefined) {
+		if (!profile) {
+			return 'Не подключён';
+		}
+
+		if (profile.username) {
+			return `@${profile.username}`;
+		}
+
+		return profile.telegramId ? `ID ${profile.telegramId}` : 'Telegram подключён';
+	}
 </script>
 
 <svelte:head>
@@ -237,10 +386,7 @@
 			<BootScreen {bootPhase} {bootProgress} {bootLabel} {startDrag} />
 		{/if}
 
-		<div
-			class:visible={launcherVisible}
-			class="launcher-layout"
-		>
+		<div class:visible={launcherVisible} class="launcher-layout">
 			<Sidebar {navigation} setActiveSection={openSection} />
 
 			<section class="main-surface flex min-w-0 flex-col">
@@ -254,11 +400,7 @@
 					openSettings={() => (launcherSettingsVisible = true)}
 				/>
 
-				<MobileNav
-					{navigation}
-					{activeSection}
-					setActiveSection={openSection}
-				/>
+				<MobileNav {navigation} {activeSection} setActiveSection={openSection} />
 
 				<div class="workspace min-h-0 flex-1 overflow-y-auto px-6 py-6">
 					{#if activeSection === 'home'}
@@ -325,15 +467,18 @@
 				bind:nickname
 				{telegramAccount}
 				{availableBuildsCount}
+				{authSession}
+				{authState}
+				{authError}
+				{telegramLoginLink}
+				{loginWithTelegram}
+				{logoutFromTelegram}
 				closeProfile={() => (profileVisible = false)}
 			/>
 		{/if}
 
 		{#if statsVisible}
-			<StatsWindow
-				{activeBuild}
-				closeStats={() => (statsVisible = false)}
-			/>
+			<StatsWindow {activeBuild} closeStats={() => (statsVisible = false)} />
 		{/if}
 	</main>
 </div>

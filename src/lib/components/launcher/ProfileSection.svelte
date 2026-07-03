@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { Link2, User } from '@lucide/svelte';
+	import { CheckCircle2, Link2, LogOut, Send, User } from '@lucide/svelte';
+	import type { LauncherAuthSession, SubscriptionLevel } from '$lib/fragment-api';
 	import type { BuildProfile } from '$lib/launcher-ui';
 
 	type Props = {
@@ -7,9 +8,36 @@
 		nickname: string;
 		telegramAccount: string;
 		availableBuildsCount: number;
+		authSession: LauncherAuthSession | null;
+		authState: 'checking' | 'signed-out' | 'waiting' | 'signed-in' | 'error';
+		authError: string;
+		telegramLoginLink: string | null;
+		loginWithTelegram: () => void;
+		logoutFromTelegram: () => void;
 	};
 
-	let { builds, nickname = $bindable(), telegramAccount, availableBuildsCount }: Props = $props();
+	let {
+		builds,
+		nickname = $bindable(),
+		telegramAccount,
+		availableBuildsCount,
+		authSession,
+		authState,
+		authError,
+		telegramLoginLink,
+		loginWithTelegram,
+		logoutFromTelegram,
+	}: Props = $props();
+
+	const subscriptionNames: Record<SubscriptionLevel, string> = {
+		none: 'Нет подписки',
+		novice: 'Новичок',
+		legend: 'Легенда',
+		spark: 'Искра',
+	};
+
+	let profile = $derived(authSession?.profile ?? null);
+	let authBusy = $derived(authState === 'checking' || authState === 'waiting');
 
 	function normalizeNickname(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
@@ -51,6 +79,70 @@
 						<p class="truncate text-sm text-muted">{telegramAccount}</p>
 					</div>
 				</div>
+			</div>
+
+			<div class="telegram-auth-card rounded-[18px]">
+				{#if profile}
+					<div class="auth-state-row">
+						<div class="profile-row-icon text-success">
+							<CheckCircle2 size={17} />
+						</div>
+						<div class="min-w-0">
+							<p class="text-sm font-semibold">Аккаунт подключён</p>
+							<p class="truncate text-sm text-muted">
+								FID {profile.fid ?? 'не выдан'} · {subscriptionNames[profile.subscriptionLevel]}
+							</p>
+						</div>
+					</div>
+
+					<div class="auth-detail-grid">
+						<div>
+							<span>Подписка</span>
+							<strong>{profile.entitlement.active ? subscriptionNames[profile.entitlement.level] : 'Неактивна'}</strong>
+						</div>
+						<div>
+							<span>Telegram ID</span>
+							<strong>{profile.telegramId ?? 'неизвестен'}</strong>
+						</div>
+					</div>
+
+					<button type="button" class="secondary-button auth-action-button" onclick={logoutFromTelegram}>
+						<LogOut size={16} />
+						<span>Выйти</span>
+					</button>
+				{:else}
+					<div class="auth-state-row">
+						<div class="profile-row-icon text-sky">
+							<Send size={17} />
+						</div>
+						<div class="min-w-0">
+							<p class="text-sm font-semibold">Вход через Telegram</p>
+							<p class="text-sm text-muted">
+								Лаунчер откроет бота, а после подтверждения вход завершится автоматически.
+							</p>
+						</div>
+					</div>
+
+					<button
+						type="button"
+						class="primary-button auth-action-button"
+						disabled={authBusy}
+						onclick={loginWithTelegram}
+					>
+						<Send size={16} />
+						<span>{authState === 'waiting' ? 'Ждём подтверждение' : 'Войти'}</span>
+					</button>
+
+					{#if telegramLoginLink && authState === 'waiting'}
+						<a class="auth-link" href={telegramLoginLink} target="_blank" rel="noreferrer">
+							Открыть ссылку ещё раз
+						</a>
+					{/if}
+
+					{#if authError}
+						<p class="auth-error">{authError}</p>
+					{/if}
+				{/if}
 			</div>
 		</section>
 

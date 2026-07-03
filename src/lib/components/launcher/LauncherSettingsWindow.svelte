@@ -12,7 +12,7 @@
 		launcherVersion,
 		anonymizeAnalytics = $bindable(),
 		includeDiagnosticsInSupport = $bindable(),
-		closeLauncherSettings
+		closeLauncherSettings,
 	}: Props = $props();
 
 	function closeFromBackdrop(event: MouseEvent) {
@@ -47,7 +47,12 @@
 				<h2 class="modal-title">Лаунчер</h2>
 				<span class="modal-context">v{launcherVersion}</span>
 			</div>
-			<button type="button" class="ghost-icon-button" title="Закрыть настройки" onclick={closeLauncherSettings}>
+			<button
+				type="button"
+				class="ghost-icon-button"
+				title="Закрыть настройки"
+				onclick={closeLauncherSettings}
+			>
 				<X size={18} />
 			</button>
 		</header>

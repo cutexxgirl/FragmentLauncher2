@@ -6,7 +6,7 @@
 		Package,
 		Play,
 		RefreshCw,
-		Settings
+		Settings,
 	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import type { BuildProfile, FeedCategory, FeedItem } from '$lib/launcher-ui';
@@ -28,7 +28,7 @@
 		feedItems,
 		feedImages,
 		selectBuild,
-		openSettings
+		openSettings,
 	}: Props = $props();
 
 	let activeCategory = $state<FeedCategory>('news');
@@ -110,7 +110,11 @@
 
 		<div class="feed-panel-body">
 			<div class="feed-tabs">
-				<button type="button" class:active={activeCategory === 'news'} onclick={() => setCategory('news')}>
+				<button
+					type="button"
+					class:active={activeCategory === 'news'}
+					onclick={() => setCategory('news')}
+				>
 					Новости
 				</button>
 				<button

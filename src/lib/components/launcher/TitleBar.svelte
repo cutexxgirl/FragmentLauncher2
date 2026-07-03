@@ -1,5 +1,13 @@
 <script lang="ts">
-	import { BarChart3, Headphones, Minus, Settings, SlidersHorizontal, User, X } from '@lucide/svelte';
+	import {
+		BarChart3,
+		Headphones,
+		Minus,
+		Settings,
+		SlidersHorizontal,
+		User,
+		X,
+	} from '@lucide/svelte';
 
 	type Props = {
 		startDrag: () => void | Promise<void>;
@@ -18,7 +26,7 @@
 		openSupport,
 		openProfile,
 		openStats,
-		openSettings
+		openSettings,
 	}: Props = $props();
 
 	let menuOpen = $state(false);

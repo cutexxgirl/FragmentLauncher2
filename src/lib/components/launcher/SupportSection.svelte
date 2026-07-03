@@ -20,13 +20,16 @@
 		attachLastScreenshot = $bindable(),
 		supportReady,
 		supportSent,
-		submitSupportRequest
+		submitSupportRequest,
 	}: Props = $props();
 </script>
 
 <div class="support-content">
 	<div class="support-layout">
-		<form class="panel-card support-form rounded-[22px] border border-border p-4" onsubmit={submitSupportRequest}>
+		<form
+			class="panel-card support-form rounded-[22px] border border-border p-4"
+			onsubmit={submitSupportRequest}
+		>
 			<div class="support-fields">
 				<div>
 					<label class="sr-only" for="support-topic">Тема</label>
@@ -45,8 +48,7 @@
 						aria-label="Описание"
 						class="text-area support-textarea"
 						placeholder="Что случилось?"
-						bind:value={supportDescription}
-					></textarea>
+						bind:value={supportDescription}></textarea>
 				</div>
 			</div>
 
