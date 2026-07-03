@@ -277,6 +277,7 @@
 	.metric-card,
 	.news-item,
 	.settings-window,
+	.launcher-settings-window,
 	.support-window,
 	.profile-window,
 	.stats-window,
@@ -533,7 +534,7 @@
 	}
 
 	.home-play {
-		width: 190px;
+		width: 172px;
 	}
 
 	.build-menu {
@@ -863,7 +864,56 @@
 
 	.range-control {
 		width: 100%;
-		accent-color: var(--color-accent);
+		height: 16px;
+		appearance: none;
+		background: transparent;
+		outline: none;
+	}
+
+	.range-control::-webkit-slider-runnable-track {
+		height: 2px;
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.22);
+	}
+
+	.range-control::-webkit-slider-thumb {
+		width: 14px;
+		height: 14px;
+		appearance: none;
+		border: 0;
+		border-radius: 50%;
+		background: var(--color-muted);
+		box-shadow: none;
+		margin-top: -6px;
+		transition: none;
+	}
+
+	.range-control::-moz-range-track {
+		height: 2px;
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.22);
+	}
+
+	.range-control::-moz-range-progress {
+		background: rgba(255, 255, 255, 0.22);
+	}
+
+	.range-control::-moz-range-thumb {
+		width: 14px;
+		height: 14px;
+		border: 0;
+		border-radius: 50%;
+		background: var(--color-muted);
+		box-shadow: none;
+		transition: none;
+	}
+
+	.range-control:active::-webkit-slider-thumb,
+	.range-control:focus::-webkit-slider-thumb,
+	.range-control:active::-moz-range-thumb,
+	.range-control:focus::-moz-range-thumb {
+		background: var(--color-muted);
+		box-shadow: none;
 	}
 
 	.preset-grid {
@@ -1096,11 +1146,11 @@
 	}
 
 	.support-textarea {
-		min-height: 76px;
+		min-height: 116px;
 	}
 
 	.support-layout > form {
-		padding: 14px !important;
+		padding: 18px !important;
 	}
 
 	.support-attachments {
@@ -1112,10 +1162,11 @@
 	.attach-button {
 		display: inline-flex;
 		min-width: 0;
-		min-height: 38px;
+		min-height: 42px;
 		align-items: center;
 		justify-content: center;
-		border-radius: 14px;
+		gap: 7px;
+		border-radius: 15px;
 		background: rgba(16, 17, 18, 0.42);
 		padding: 0 10px;
 		color: var(--color-muted);
@@ -1124,8 +1175,17 @@
 		text-align: center;
 	}
 
-	.attach-button:hover,
 	.attach-button.active {
+		background: rgba(240, 179, 93, 0.12);
+		color: var(--color-foreground);
+	}
+
+	.attach-button:hover {
+		background: rgba(16, 17, 18, 0.42);
+		color: var(--color-muted);
+	}
+
+	.attach-button.active:hover {
 		background: rgba(240, 179, 93, 0.12);
 		color: var(--color-foreground);
 	}
@@ -1150,6 +1210,7 @@
 	}
 
 	.settings-backdrop,
+	.launcher-settings-backdrop,
 	.support-backdrop,
 	.profile-backdrop,
 	.stats-backdrop {
@@ -1158,8 +1219,8 @@
 		z-index: 38;
 		display: grid;
 		place-items: center;
-		background: rgba(0, 0, 0, 0.3);
-		padding: 32px;
+		background: rgba(0, 0, 0, 0.24);
+		padding: 24px;
 	}
 
 	.support-backdrop {
@@ -1175,32 +1236,41 @@
 	}
 
 	.settings-window,
+	.launcher-settings-window,
 	.support-window,
 	.profile-window,
 	.stats-window {
 		display: grid;
-		width: min(860px, calc(100% - 72px));
-		max-height: calc(100% - 72px);
+		width: min(960px, calc(100% - 56px));
+		max-height: 100%;
 		grid-template-rows: auto minmax(0, 1fr);
 		margin: 0;
 		overflow: hidden;
 		padding: 0;
 		border: 1px solid var(--color-border);
-		border-radius: 24px;
-		background: rgba(19, 21, 23, 0.96);
+		border-radius: 26px;
+		background: rgba(16, 17, 18, 0.95);
 		color: var(--color-foreground);
 	}
 
+	.settings-window {
+		height: 692px;
+	}
+
 	.support-window {
-		width: min(720px, calc(100% - 72px));
+		width: min(760px, calc(100% - 56px));
+	}
+
+	.launcher-settings-window {
+		width: min(460px, calc(100% - 56px));
 	}
 
 	.profile-window {
-		width: min(780px, calc(100% - 72px));
+		width: min(680px, calc(100% - 56px));
 	}
 
 	.stats-window {
-		width: min(480px, calc(100% - 72px));
+		width: min(460px, calc(100% - 56px));
 	}
 
 	.settings-window-head {
@@ -1208,44 +1278,202 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: 16px;
-		border-bottom: 1px solid var(--color-border);
-		padding: 14px 16px;
+		min-height: 62px;
+		padding: 18px 22px 8px;
+	}
+
+	.modal-title-row {
+		display: flex;
+		min-width: 0;
+		align-items: baseline;
+		gap: 12px;
+	}
+
+	.modal-title {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 1.24rem;
+		font-weight: 800;
+		line-height: 1.1;
+	}
+
+	.modal-context {
+		overflow: hidden;
+		max-width: 260px;
+		color: var(--color-muted);
+		font-size: 0.82rem;
+		font-weight: 700;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.settings-window-body,
+	.launcher-settings-window-body,
 	.support-window-body,
 	.profile-window-body,
 	.stats-window-body {
 		min-height: 0;
 		overflow-y: auto;
-		padding: 12px;
+		padding: 12px 22px 22px;
 		scrollbar-width: thin;
 		scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
 	}
 
-	.settings-window .section-grid {
+	.settings-content,
+	.profile-content,
+	.support-content {
+		display: grid;
+		gap: 14px;
+	}
+
+	.settings-stack,
+	.support-fields,
+	.launcher-settings-list,
+	.subscription-builds {
+		display: grid;
+		gap: 9px;
+	}
+
+	.settings-toggle-row {
+		min-height: 48px;
+		padding: 10px 11px;
+	}
+
+	.ram-badge {
+		border-radius: 13px;
+		background: rgba(116, 211, 169, 0.12);
+		color: var(--color-success);
+		padding: 5px 9px;
+		font-size: 0.76rem;
+		font-weight: 800;
+	}
+
+	.compact-build-button {
+		display: grid;
+		gap: 7px;
+		min-height: 62px;
+	}
+
+	.build-meta-line {
+		display: flex;
+		min-width: 0;
+		flex-wrap: wrap;
+		gap: 8px;
+		color: var(--color-muted);
+		font-size: 0.72rem;
+		font-weight: 700;
+	}
+
+	.compact-presets .preset-button {
+		min-height: 42px;
+		place-items: center;
+		text-align: center;
+	}
+
+	.java-inline {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 9px;
+	}
+
+	.icon-only-button {
+		width: 40px;
+		min-width: 40px;
+		height: 40px;
+		min-height: 40px;
+		padding: 0;
+	}
+
+	.compact-toggle-row {
+		min-height: 46px;
+	}
+
+	.asset-head {
+		display: flex;
+		min-width: 0;
+		align-items: center;
+		justify-content: space-between;
 		gap: 10px;
 	}
 
-	.settings-window .section-grid > .page-heading {
-		display: none;
+	.file-chip-row {
+		display: flex;
+		min-width: 0;
+		flex-wrap: wrap;
+		gap: 7px;
 	}
 
-	.support-window .section-grid > .page-heading {
-		display: none;
+	.empty-chip {
+		display: inline-flex;
+		min-height: 30px;
+		align-items: center;
+		border-radius: 13px;
+		background: rgba(255, 255, 255, 0.05);
+		color: var(--color-muted);
+		padding: 0 10px;
+		font-size: 0.76rem;
+		font-weight: 700;
 	}
 
-	.profile-window .section-grid > .page-heading {
-		display: none;
+	.profile-identity-row {
+		display: flex;
+		min-width: 0;
+		align-items: center;
+		gap: 13px;
+	}
+
+	.profile-main-card {
+		display: grid;
+		gap: 12px;
+	}
+
+	.profile-row-icon {
+		display: grid;
+		width: 46px;
+		height: 46px;
+		flex: 0 0 auto;
+		place-items: center;
+		border-radius: 17px;
+		background: rgba(117, 199, 192, 0.13);
+	}
+
+	.profile-name-input {
+		height: 46px;
+		font-size: 1rem;
+		font-weight: 700;
+	}
+
+	.subscription-headline {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+
+	.subscription-summary strong {
+		font-size: 1.45rem;
+		line-height: 1;
+	}
+
+	.subscription-summary span {
+		color: var(--color-muted);
+		font-size: 0.82rem;
+		font-weight: 700;
+	}
+
+	.support-form {
+		display: grid;
+		gap: 0;
 	}
 
 	.settings-window .settings-layout,
 	.settings-window .settings-layout.bottom {
-		gap: 10px;
+		gap: 14px;
 	}
 
 	.settings-window .settings-layout {
-		grid-template-columns: minmax(210px, 0.74fr) minmax(0, 1.26fr);
+		grid-template-columns: minmax(245px, 0.72fr) minmax(0, 1.28fr);
 	}
 
 	.settings-window .settings-layout.bottom {
@@ -1253,8 +1481,8 @@
 	}
 
 	.settings-window .panel-card {
-		border-radius: 18px !important;
-		padding: 12px !important;
+		border-radius: 20px !important;
+		padding: 14px !important;
 	}
 
 	.settings-window .section-head {
@@ -1271,15 +1499,8 @@
 	}
 
 	.settings-window .build-card-button {
-		border-radius: 14px;
-		padding: 9px;
-	}
-
-	.settings-window .build-card-button p.text-sm,
-	.settings-window .build-card-button .mt-4,
-	.settings-window .preset-button span:last-child,
-	.settings-window .toggle-row p.mt-1 {
-		display: none;
+		border-radius: 15px;
+		padding: 10px;
 	}
 
 	.settings-window .build-tag,
@@ -1290,8 +1511,8 @@
 
 	.settings-window .control-block,
 	.settings-window .asset-block {
-		border-radius: 14px;
-		padding: 10px;
+		border-radius: 16px;
+		padding: 11px;
 	}
 
 	.settings-window .preset-grid {
@@ -1299,13 +1520,13 @@
 	}
 
 	.settings-window .preset-button {
-		border-radius: 14px;
+		border-radius: 15px;
 		padding: 10px;
 	}
 
 	.settings-window .toggle-row {
-		border-radius: 14px;
-		padding: 9px;
+		border-radius: 15px;
+		padding: 9px 10px;
 	}
 
 	.settings-window .text-field {
@@ -1314,14 +1535,7 @@
 
 	.settings-window .secondary-button,
 	.settings-window .mini-button {
-		min-height: 36px;
-	}
-
-	.settings-window .notice-line {
-		border-radius: 14px;
-		padding: 10px;
-		font-size: 0.78rem;
-		line-height: 1.45;
+		min-height: 38px;
 	}
 
 	.support-window .support-layout {
@@ -1466,6 +1680,7 @@
 		}
 
 		.settings-backdrop,
+		.launcher-settings-backdrop,
 		.support-backdrop,
 		.profile-backdrop,
 		.stats-backdrop {
@@ -1473,6 +1688,7 @@
 		}
 
 		.settings-window,
+		.launcher-settings-window,
 		.support-window,
 		.profile-window,
 		.stats-window {
@@ -1483,6 +1699,7 @@
 
 		.settings-window-head,
 		.settings-window-body,
+		.launcher-settings-window-body,
 		.support-window-body,
 		.profile-window-body,
 		.stats-window-body {

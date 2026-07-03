@@ -47,9 +47,9 @@
 		tabindex="-1"
 	>
 		<header class="settings-window-head">
-			<div>
-				<p class="section-kicker">Профиль</p>
-				<h2 class="page-title">Игрок и подписка</h2>
+			<div class="modal-title-row">
+				<h2 class="modal-title">Профиль</h2>
+				<span class="modal-context">{nickname}</span>
 			</div>
 			<button type="button" class="ghost-icon-button" title="Закрыть профиль" onclick={closeProfile}>
 				<X size={18} />

@@ -37,9 +37,9 @@
 		tabindex="-1"
 	>
 		<header class="settings-window-head">
-			<div>
-				<p class="section-kicker">Статистика</p>
-				<h2 class="page-title">Сводка</h2>
+			<div class="modal-title-row">
+				<h2 class="modal-title">Статистика</h2>
+				<span class="modal-context">{activeBuild.name}</span>
 			</div>
 			<button type="button" class="ghost-icon-button" title="Закрыть статистику" onclick={closeStats}>
 				<X size={18} />

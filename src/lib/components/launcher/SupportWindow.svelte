@@ -54,9 +54,8 @@
 		tabindex="-1"
 	>
 		<header class="settings-window-head">
-			<div>
-				<p class="section-kicker">Поддержка</p>
-				<h2 class="page-title">Новое обращение</h2>
+			<div class="modal-title-row">
+				<h2 class="modal-title">Поддержка</h2>
 			</div>
 			<button type="button" class="ghost-icon-button" title="Закрыть поддержку" onclick={closeSupport}>
 				<X size={18} />

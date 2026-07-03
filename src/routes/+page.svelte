@@ -16,6 +16,7 @@
 	} from '$lib/launcher-ui';
 	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
 	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
+	import LauncherSettingsWindow from '$lib/components/launcher/LauncherSettingsWindow.svelte';
 	import MobileNav from '$lib/components/launcher/MobileNav.svelte';
 	import ProfileWindow from '$lib/components/launcher/ProfileWindow.svelte';
 	import SettingsWindow from '$lib/components/launcher/SettingsWindow.svelte';
@@ -41,10 +42,14 @@
 	let attachLastLog = $state(true);
 	let attachLastScreenshot = $state(false);
 	let settingsVisible = $state(false);
+	let launcherSettingsVisible = $state(false);
 	let supportVisible = $state(false);
 	let profileVisible = $state(false);
 	let statsVisible = $state(false);
 	let supportSent = $state(false);
+	let launcherVersion = $state('1.0.0');
+	let anonymizeAnalytics = $state(true);
+	let includeDiagnosticsInSupport = $state(false);
 	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
 
 	let builds = $state<BuildProfile[]>(createBuildProfiles());
@@ -105,7 +110,8 @@
 		await delay(80);
 
 		setBootStep(0.46, 'Подключаем локальный бэкенд');
-		await getLauncherStatus();
+		const launcherStatus = await getLauncherStatus();
+		launcherVersion = launcherStatus.version;
 		await delay(80);
 
 		setBootStep(0.68, 'Проверяем профиль сборки');
@@ -245,7 +251,7 @@
 					openSupport={() => (supportVisible = true)}
 					openProfile={() => (profileVisible = true)}
 					openStats={() => (statsVisible = true)}
-					openSettings={() => (settingsVisible = true)}
+					openSettings={() => (launcherSettingsVisible = true)}
 				/>
 
 				<MobileNav
@@ -287,6 +293,15 @@
 				{addResourcePackFiles}
 				{removeShader}
 				{removeResourcePack}
+			/>
+		{/if}
+
+		{#if launcherSettingsVisible}
+			<LauncherSettingsWindow
+				{launcherVersion}
+				bind:anonymizeAnalytics
+				bind:includeDiagnosticsInSupport
+				closeLauncherSettings={() => (launcherSettingsVisible = false)}
 			/>
 		{/if}
 

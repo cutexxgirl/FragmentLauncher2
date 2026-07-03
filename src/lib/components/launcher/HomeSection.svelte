@@ -167,7 +167,7 @@
 
 					<button type="button" class="menu-action" onclick={openSettingsWindow}>
 						<Settings size={16} />
-						<span>Настройки</span>
+						<span>Настройки сборки</span>
 					</button>
 					<button type="button" class="menu-action">
 						<RefreshCw size={16} />

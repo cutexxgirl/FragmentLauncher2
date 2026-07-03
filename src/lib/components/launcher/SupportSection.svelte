@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { FileWarning, Image, ScrollText } from '@lucide/svelte';
+
 	type Props = {
 		supportTopic: string;
 		supportDescription: string;
@@ -22,32 +24,27 @@
 	}: Props = $props();
 </script>
 
-<div class="section-grid compact-section">
-	<div class="page-heading">
-		<div>
-			<p class="section-kicker">Техподдержка</p>
-			<h2 class="page-title">Новое обращение</h2>
-		</div>
-	</div>
-
+<div class="support-content">
 	<div class="support-layout">
-		<form class="panel-card rounded-[22px] border border-border p-4" onsubmit={submitSupportRequest}>
-			<div class="grid gap-3">
+		<form class="panel-card support-form rounded-[22px] border border-border p-4" onsubmit={submitSupportRequest}>
+			<div class="support-fields">
 				<div>
-					<label class="text-sm font-semibold" for="support-topic">Тема</label>
+					<label class="sr-only" for="support-topic">Тема</label>
 					<input
 						id="support-topic"
-						class="text-field mt-2"
-						placeholder="Вылет при запуске мира"
+						aria-label="Тема"
+						class="text-field"
+						placeholder="Тема"
 						bind:value={supportTopic}
 					/>
 				</div>
 				<div>
-					<label class="text-sm font-semibold" for="support-description">Описание</label>
+					<label class="sr-only" for="support-description">Описание</label>
 					<textarea
 						id="support-description"
-						class="text-area support-textarea mt-2"
-						placeholder="Что произошло и после какого действия?"
+						aria-label="Описание"
+						class="text-area support-textarea"
+						placeholder="Что случилось?"
 						bind:value={supportDescription}
 					></textarea>
 				</div>
@@ -58,31 +55,37 @@
 					type="button"
 					class:active={attachCrashReport}
 					class="attach-button"
+					title="Приложить последний crash report"
 					onclick={() => (attachCrashReport = !attachCrashReport)}
 				>
-					Последний краш
+					<FileWarning size={16} />
+					<span>Краш</span>
 				</button>
 				<button
 					type="button"
 					class:active={attachLastLog}
 					class="attach-button"
+					title="Приложить последний лог"
 					onclick={() => (attachLastLog = !attachLastLog)}
 				>
-					Последний лог
+					<ScrollText size={16} />
+					<span>Лог</span>
 				</button>
 				<button
 					type="button"
 					class:active={attachLastScreenshot}
 					class="attach-button"
+					title="Приложить последний скриншот"
 					onclick={() => (attachLastScreenshot = !attachLastScreenshot)}
 				>
-					Последний скриншот
+					<Image size={16} />
+					<span>Скрин</span>
 				</button>
 			</div>
 
 			<div class="support-actions mt-4">
 				<button class="primary-button compact-button" disabled={!supportReady} type="submit">
-					<span>{supportSent ? 'Готово' : 'Подготовить'}</span>
+					<span>{supportSent ? 'Готово' : 'Отправить'}</span>
 				</button>
 			</div>
 		</form>
