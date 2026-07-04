@@ -1493,17 +1493,6 @@
 	gap: 12px;
 }
 
-.profile-telegram-row {
-	display: flex;
-	min-width: 0;
-	align-items: center;
-	justify-content: space-between;
-	gap: 14px;
-	border-radius: 16px;
-	background: rgba(16, 17, 18, 0.42);
-	padding: 10px 12px;
-}
-
 .profile-logout-button {
 	min-width: 76px;
 	min-height: 34px;

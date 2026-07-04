@@ -77,6 +77,10 @@
 	let appVisible = $derived(launcherVisible && userIsSignedIn);
 	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
+	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
+	let availableBuildsCount = $derived(
+		builds.filter((build) => build.access === 'available' || hasActiveSubscription).length,
+	);
 	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
 	let supportReady = $derived(
 		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
@@ -479,9 +483,10 @@
 
 		{#if profileVisible}
 			<ProfileWindow
+				{builds}
 				bind:nickname
 				{telegramAccount}
-				{authSession}
+				{availableBuildsCount}
 				{logoutFromTelegram}
 				closeProfile={() => (profileVisible = false)}
 			/>
