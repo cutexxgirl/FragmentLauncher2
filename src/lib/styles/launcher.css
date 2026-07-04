@@ -204,6 +204,135 @@
 	backdrop-filter: none;
 }
 
+.auth-gate {
+	position: absolute;
+	inset: 0;
+	z-index: 4;
+	display: grid;
+	grid-template-rows: 48px minmax(0, 1fr);
+	opacity: 1;
+}
+
+.auth-gate-titlebar {
+	display: flex;
+	height: 48px;
+	align-items: center;
+	justify-content: space-between;
+	padding: 0 14px 0 18px;
+}
+
+.auth-gate-brand {
+	display: inline-flex;
+	min-width: 0;
+	align-items: center;
+	gap: 10px;
+	color: var(--color-foreground);
+	font-size: 0.84rem;
+	font-weight: 800;
+}
+
+.auth-brand-mark {
+	display: grid;
+	width: 30px;
+	height: 30px;
+	place-items: center;
+	border-radius: 12px;
+	background: var(--color-accent);
+	color: var(--color-accent-foreground);
+	font-size: 0.75rem;
+	font-weight: 900;
+}
+
+.auth-gate-body {
+	display: grid;
+	min-height: 0;
+	place-items: center;
+	padding: 24px;
+}
+
+.auth-login-panel {
+	display: grid;
+	width: min(420px, 100%);
+	gap: 16px;
+	border-radius: 24px;
+	background: rgba(16, 17, 18, 0.82);
+	padding: 26px;
+}
+
+.auth-login-icon {
+	display: grid;
+	width: 54px;
+	height: 54px;
+	place-items: center;
+	border-radius: 19px;
+	background: rgba(117, 199, 192, 0.13);
+	color: var(--color-sky);
+}
+
+.auth-login-icon.waiting {
+	background: rgba(240, 179, 93, 0.12);
+	color: var(--color-accent);
+}
+
+.auth-login-icon.error {
+	background: rgba(217, 92, 87, 0.14);
+	color: #ff8d86;
+}
+
+.auth-login-copy {
+	display: grid;
+	gap: 8px;
+}
+
+.auth-login-copy h1 {
+	font-size: 1.55rem;
+	font-weight: 850;
+	line-height: 1.08;
+}
+
+.auth-login-copy p:last-child {
+	color: var(--color-muted);
+	font-size: 0.9rem;
+	line-height: 1.55;
+}
+
+.auth-login-button {
+	width: 100%;
+	min-height: 46px;
+}
+
+.auth-status-line {
+	display: flex;
+	min-width: 0;
+	align-items: center;
+	gap: 8px;
+	border-radius: 14px;
+	background: rgba(255, 255, 255, 0.045);
+	padding: 10px 11px;
+	color: var(--color-muted);
+	font-size: 0.78rem;
+	font-weight: 750;
+	line-height: 1.35;
+}
+
+.auth-status-line.waiting {
+	color: var(--color-accent);
+}
+
+.auth-status-line.danger {
+	color: #ff8d86;
+}
+
+.spin-icon {
+	animation: spin-icon 900ms linear infinite;
+}
+
+@keyframes spin-icon {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
 .window-control {
 	display: grid;
 	width: 34px;
@@ -1470,9 +1599,7 @@
 	padding: 10px;
 }
 
-.auth-detail-grid span,
-.auth-link,
-.auth-error {
+.auth-detail-grid span {
 	font-size: 0.76rem;
 	font-weight: 700;
 }
@@ -1491,16 +1618,6 @@
 
 .auth-action-button {
 	width: 100%;
-}
-
-.auth-link {
-	color: var(--color-sky);
-	text-align: center;
-}
-
-.auth-error {
-	color: #ff8d86;
-	line-height: 1.45;
 }
 
 .profile-row-icon {

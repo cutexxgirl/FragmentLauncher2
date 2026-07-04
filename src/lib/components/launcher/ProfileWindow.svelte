@@ -10,10 +10,6 @@
 		telegramAccount: string;
 		availableBuildsCount: number;
 		authSession: LauncherAuthSession | null;
-		authState: 'checking' | 'signed-out' | 'waiting' | 'signed-in' | 'error';
-		authError: string;
-		telegramLoginLink: string | null;
-		loginWithTelegram: () => void;
 		logoutFromTelegram: () => void;
 		closeProfile: () => void;
 	};
@@ -24,10 +20,6 @@
 		telegramAccount,
 		availableBuildsCount,
 		authSession,
-		authState,
-		authError,
-		telegramLoginLink,
-		loginWithTelegram,
 		logoutFromTelegram,
 		closeProfile,
 	}: Props = $props();
@@ -75,10 +67,6 @@
 				{telegramAccount}
 				{availableBuildsCount}
 				{authSession}
-				{authState}
-				{authError}
-				{telegramLoginLink}
-				{loginWithTelegram}
 				{logoutFromTelegram}
 			/>
 		</div>

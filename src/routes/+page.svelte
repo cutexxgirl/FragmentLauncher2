@@ -16,7 +16,7 @@
 		type LauncherAuthSession,
 		type LauncherProfile,
 	} from '$lib/fragment-api';
-	import { getLauncherStatus } from '$lib/launcher';
+	import { getLauncherStatus, openExternalUrl } from '$lib/launcher';
 	import {
 		createBuildProfiles,
 		feedImages,
@@ -26,6 +26,7 @@
 		type PresetId,
 		type SectionId,
 	} from '$lib/launcher-ui';
+	import AuthGate from '$lib/components/launcher/AuthGate.svelte';
 	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
 	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
 	import LauncherSettingsWindow from '$lib/components/launcher/LauncherSettingsWindow.svelte';
@@ -73,6 +74,9 @@
 
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
+	let userIsSignedIn = $derived(authState === 'signed-in' && authSession !== null);
+	let appVisible = $derived(launcherVisible && userIsSignedIn);
+	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
 	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
 	let availableBuildsCount = $derived(
@@ -182,6 +186,11 @@
 	}
 
 	async function loginWithTelegram() {
+		if (authState === 'waiting' && telegramLoginLink) {
+			await openExternalUrl(telegramLoginLink);
+			return;
+		}
+
 		stopLoginPolling();
 		authError = '';
 		telegramLoginLink = null;
@@ -190,7 +199,7 @@
 		try {
 			const challenge = await createTelegramLoginChallenge('Fragment Launcher');
 			telegramLoginLink = challenge.telegramLink;
-			window.open(challenge.telegramLink, '_blank', 'noopener,noreferrer');
+			await openExternalUrl(challenge.telegramLink);
 			void pollLoginChallenge(challenge.challengeId, challenge.pollToken, challenge.expiresAt);
 		} catch (error) {
 			authError = error instanceof Error ? error.message : 'Не удалось начать вход через Telegram';
@@ -248,6 +257,12 @@
 		authState = 'signed-out';
 		authError = '';
 		telegramLoginLink = null;
+		settingsVisible = false;
+		launcherSettingsVisible = false;
+		supportVisible = false;
+		profileVisible = false;
+		statsVisible = false;
+		activeSection = 'home';
 		clearStoredAuthSession();
 
 		if (session) {
@@ -386,7 +401,18 @@
 			<BootScreen {bootPhase} {bootProgress} {bootLabel} {startDrag} />
 		{/if}
 
-		<div class:visible={launcherVisible} class="launcher-layout">
+		{#if authGateVisible}
+			<AuthGate
+				{authState}
+				{authError}
+				{loginWithTelegram}
+				{startDrag}
+				{minimize}
+				{closeWindow}
+			/>
+		{/if}
+
+		<div class:visible={appVisible} class="launcher-layout">
 			<Sidebar {navigation} setActiveSection={openSection} />
 
 			<section class="main-surface flex min-w-0 flex-col">
@@ -468,10 +494,6 @@
 				{telegramAccount}
 				{availableBuildsCount}
 				{authSession}
-				{authState}
-				{authError}
-				{telegramLoginLink}
-				{loginWithTelegram}
 				{logoutFromTelegram}
 				closeProfile={() => (profileVisible = false)}
 			/>

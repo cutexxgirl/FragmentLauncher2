@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CheckCircle2, Link2, LogOut, Send, User } from '@lucide/svelte';
+	import { CheckCircle2, LogOut, User } from '@lucide/svelte';
 	import type { LauncherAuthSession, SubscriptionLevel } from '$lib/fragment-api';
 	import type { BuildProfile } from '$lib/launcher-ui';
 
@@ -9,10 +9,6 @@
 		telegramAccount: string;
 		availableBuildsCount: number;
 		authSession: LauncherAuthSession | null;
-		authState: 'checking' | 'signed-out' | 'waiting' | 'signed-in' | 'error';
-		authError: string;
-		telegramLoginLink: string | null;
-		loginWithTelegram: () => void;
 		logoutFromTelegram: () => void;
 	};
 
@@ -22,10 +18,6 @@
 		telegramAccount,
 		availableBuildsCount,
 		authSession,
-		authState,
-		authError,
-		telegramLoginLink,
-		loginWithTelegram,
 		logoutFromTelegram,
 	}: Props = $props();
 
@@ -37,7 +29,6 @@
 	};
 
 	let profile = $derived(authSession?.profile ?? null);
-	let authBusy = $derived(authState === 'checking' || authState === 'waiting');
 
 	function normalizeNickname(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
@@ -69,40 +60,38 @@
 				</div>
 			</div>
 
-			<div class="profile-link-row telegram-card rounded-[18px] p-0">
-				<div class="flex min-w-0 items-center gap-3">
-					<div class="profile-row-icon text-sky">
-						<Link2 size={17} />
-					</div>
-					<div class="min-w-0">
-						<p class="text-sm font-semibold">Telegram</p>
-						<p class="truncate text-sm text-muted">{telegramAccount}</p>
-					</div>
-				</div>
-			</div>
-
-			<div class="telegram-auth-card rounded-[18px]">
-				{#if profile}
+			{#if profile}
+				<div class="telegram-auth-card rounded-[18px]">
 					<div class="auth-state-row">
 						<div class="profile-row-icon text-success">
 							<CheckCircle2 size={17} />
 						</div>
 						<div class="min-w-0">
 							<p class="text-sm font-semibold">Аккаунт подключён</p>
-							<p class="truncate text-sm text-muted">
-								FID {profile.fid ?? 'не выдан'} · {subscriptionNames[profile.subscriptionLevel]}
-							</p>
+							<p class="truncate text-sm text-muted">{telegramAccount}</p>
 						</div>
 					</div>
 
 					<div class="auth-detail-grid">
 						<div>
+							<span>FID</span>
+							<strong>{profile.fid ?? 'не выдан'}</strong>
+						</div>
+						<div>
 							<span>Подписка</span>
-							<strong>{profile.entitlement.active ? subscriptionNames[profile.entitlement.level] : 'Неактивна'}</strong>
+							<strong>
+								{profile.entitlement.active
+									? subscriptionNames[profile.entitlement.level]
+									: 'Неактивна'}
+							</strong>
 						</div>
 						<div>
 							<span>Telegram ID</span>
 							<strong>{profile.telegramId ?? 'неизвестен'}</strong>
+						</div>
+						<div>
+							<span>Статус</span>
+							<strong>{profile.entitlement.active ? 'Активна' : 'Неактивна'}</strong>
 						</div>
 					</div>
 
@@ -110,47 +99,15 @@
 						<LogOut size={16} />
 						<span>Выйти</span>
 					</button>
-				{:else}
-					<div class="auth-state-row">
-						<div class="profile-row-icon text-sky">
-							<Send size={17} />
-						</div>
-						<div class="min-w-0">
-							<p class="text-sm font-semibold">Вход через Telegram</p>
-							<p class="text-sm text-muted">
-								Лаунчер откроет бота, а после подтверждения вход завершится автоматически.
-							</p>
-						</div>
-					</div>
-
-					<button
-						type="button"
-						class="primary-button auth-action-button"
-						disabled={authBusy}
-						onclick={loginWithTelegram}
-					>
-						<Send size={16} />
-						<span>{authState === 'waiting' ? 'Ждём подтверждение' : 'Войти'}</span>
-					</button>
-
-					{#if telegramLoginLink && authState === 'waiting'}
-						<a class="auth-link" href={telegramLoginLink} target="_blank" rel="noreferrer">
-							Открыть ссылку ещё раз
-						</a>
-					{/if}
-
-					{#if authError}
-						<p class="auth-error">{authError}</p>
-					{/if}
-				{/if}
-			</div>
+				</div>
+			{/if}
 		</section>
 
 		<section class="panel-card subscription-card rounded-[22px] border border-border p-4">
 			<div class="subscription-headline">
 				<h3 class="section-title">Fragment Plus</h3>
 				<span class="rounded-[13px] bg-accent/14 px-3 py-1 text-xs font-semibold text-accent">
-					Активна
+					{profile?.entitlement.active ? 'Активна' : 'Неактивна'}
 				</span>
 			</div>
 
