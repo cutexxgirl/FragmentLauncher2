@@ -2,23 +2,18 @@
 	import { X } from '@lucide/svelte';
 	import ProfileSection from '$lib/components/launcher/ProfileSection.svelte';
 	import type { LauncherAuthSession } from '$lib/fragment-api';
-	import type { BuildProfile } from '$lib/launcher-ui';
 
 	type Props = {
-		builds: BuildProfile[];
 		nickname: string;
 		telegramAccount: string;
-		availableBuildsCount: number;
 		authSession: LauncherAuthSession | null;
 		logoutFromTelegram: () => void;
 		closeProfile: () => void;
 	};
 
 	let {
-		builds,
 		nickname = $bindable(),
 		telegramAccount,
-		availableBuildsCount,
 		authSession,
 		logoutFromTelegram,
 		closeProfile,
@@ -62,10 +57,8 @@
 
 		<div class="profile-window-body">
 			<ProfileSection
-				{builds}
 				bind:nickname
 				{telegramAccount}
-				{availableBuildsCount}
 				{authSession}
 				{logoutFromTelegram}
 			/>

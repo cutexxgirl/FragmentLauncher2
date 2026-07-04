@@ -66,7 +66,6 @@
 	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
 	let authSession = $state<LauncherAuthSession | null>(null);
 	let authState = $state<AuthState>('checking');
-	let authError = $state('');
 	let telegramLoginLink = $state<string | null>(null);
 	let loginPollTimer: number | null = null;
 
@@ -78,10 +77,6 @@
 	let appVisible = $derived(launcherVisible && userIsSignedIn);
 	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
-	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
-	let availableBuildsCount = $derived(
-		builds.filter((build) => build.access === 'available' || hasActiveSubscription).length,
-	);
 	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
 	let supportReady = $derived(
 		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
@@ -192,7 +187,6 @@
 		}
 
 		stopLoginPolling();
-		authError = '';
 		telegramLoginLink = null;
 		authState = 'waiting';
 
@@ -202,7 +196,7 @@
 			await openExternalUrl(challenge.telegramLink);
 			void pollLoginChallenge(challenge.challengeId, challenge.pollToken, challenge.expiresAt);
 		} catch (error) {
-			authError = error instanceof Error ? error.message : 'Не удалось начать вход через Telegram';
+			console.warn('Telegram login failed', error);
 			authState = 'error';
 		}
 	}
@@ -213,7 +207,6 @@
 		}
 
 		if (Date.now() > new Date(expiresAt).getTime()) {
-			authError = 'Ссылка для входа истекла. Создайте новую.';
 			authState = 'error';
 			return;
 		}
@@ -235,12 +228,11 @@
 			}
 
 			if (result.status === 'expired' || result.status === 'consumed') {
-				authError = 'Ссылка для входа уже недействительна. Создайте новую.';
 				authState = 'error';
 				return;
 			}
 		} catch (error) {
-			authError = error instanceof Error ? error.message : 'Не удалось проверить вход';
+			console.warn('Telegram login poll failed', error);
 			authState = 'error';
 			return;
 		}
@@ -255,7 +247,6 @@
 		stopLoginPolling();
 		authSession = null;
 		authState = 'signed-out';
-		authError = '';
 		telegramLoginLink = null;
 		settingsVisible = false;
 		launcherSettingsVisible = false;
@@ -404,7 +395,6 @@
 		{#if authGateVisible}
 			<AuthGate
 				{authState}
-				{authError}
 				{loginWithTelegram}
 				{startDrag}
 				{minimize}
@@ -489,10 +479,8 @@
 
 		{#if profileVisible}
 			<ProfileWindow
-				{builds}
 				bind:nickname
 				{telegramAccount}
-				{availableBuildsCount}
 				{authSession}
 				{logoutFromTelegram}
 				closeProfile={() => (profileVisible = false)}
