@@ -11,10 +11,11 @@
 
 	type Props = {
 		navigation: NavigationItem[];
+		activeSection: SectionId;
 		setActiveSection: (section: SectionId) => void;
 	};
 
-	let { navigation, setActiveSection }: Props = $props();
+	let { navigation, activeSection, setActiveSection }: Props = $props();
 </script>
 
 <aside class="sidebar-surface flex min-h-0 flex-col border-r border-border">
@@ -28,6 +29,7 @@
 		{#each navigation as item}
 			{@const Icon = item.icon}
 			<button
+				class:active={activeSection === item.id}
 				class="nav-button"
 				title={item.label}
 				aria-label={item.label}

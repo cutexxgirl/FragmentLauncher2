@@ -578,7 +578,7 @@
 		{/if}
 
 		<div class:visible={appVisible} class="launcher-layout">
-			<Sidebar {navigation} setActiveSection={openSection} />
+			<Sidebar {navigation} {activeSection} setActiveSection={openSection} />
 
 			<section class="main-surface flex min-w-0 flex-col">
 				<TitleBar
