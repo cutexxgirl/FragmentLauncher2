@@ -6,7 +6,12 @@
 		builds: BuildProfile[];
 		nickname: string;
 		telegramAccount: string;
+		telegramAvatarUrl: string | null;
+		nicknameDirty: boolean;
+		nicknameSaving: boolean;
+		nicknameSaveMessage: string;
 		availableBuildsCount: number;
+		saveLauncherNickname: () => void | Promise<void>;
 		logoutFromTelegram: () => void;
 	};
 
@@ -14,14 +19,33 @@
 		builds,
 		nickname = $bindable(),
 		telegramAccount,
+		telegramAvatarUrl,
+		nicknameDirty,
+		nicknameSaving,
+		nicknameSaveMessage,
 		availableBuildsCount,
+		saveLauncherNickname,
 		logoutFromTelegram,
 	}: Props = $props();
+
+	let avatarFailed = $state(false);
+
+	$effect(() => {
+		telegramAvatarUrl;
+		avatarFailed = false;
+	});
 
 	function normalizeNickname(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		nickname = input.value.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 30);
 		input.value = nickname;
+	}
+
+	function saveNicknameFromKeyboard(event: KeyboardEvent) {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void saveLauncherNickname();
+		}
 	}
 </script>
 
@@ -29,22 +53,50 @@
 	<div class="profile-layout">
 		<section class="panel-card profile-main-card rounded-[22px] border border-border p-4">
 			<div class="profile-identity-row">
-				<div class="avatar-badge profile-row-icon">
-					<User size={18} />
+				<div class:has-image={telegramAvatarUrl && !avatarFailed} class="avatar-badge profile-row-icon">
+					{#if telegramAvatarUrl && !avatarFailed}
+						<img
+							class="profile-avatar-image"
+							src={telegramAvatarUrl}
+							alt=""
+							referrerpolicy="no-referrer"
+							onerror={() => (avatarFailed = true)}
+						/>
+					{:else}
+						<User size={18} />
+					{/if}
 				</div>
 
 				<div class="min-w-0 flex-1">
-					<label class="sr-only" for="nickname">Ник</label>
-					<input
-						id="nickname"
-						aria-label="Ник"
-						class="text-field profile-name-input"
-						bind:value={nickname}
-						maxlength="30"
-						placeholder="FragmentPlayer"
-						spellcheck="false"
-						oninput={normalizeNickname}
-					/>
+					<label class="sr-only" for="nickname">Псевдоним</label>
+					<div class="profile-name-row">
+						<input
+							id="nickname"
+							aria-label="Псевдоним"
+							class="text-field profile-name-input"
+							bind:value={nickname}
+							maxlength="30"
+							placeholder="Псевдоним"
+							spellcheck="false"
+							oninput={normalizeNickname}
+							onkeydown={saveNicknameFromKeyboard}
+						/>
+
+						{#if nicknameDirty}
+							<button
+								type="button"
+								class="mini-button profile-save-button"
+								disabled={nicknameSaving}
+								onclick={saveLauncherNickname}
+							>
+								{nicknameSaving ? '...' : 'Сохранить'}
+							</button>
+						{/if}
+					</div>
+
+					{#if nicknameSaveMessage}
+						<p class="profile-nickname-note">{nicknameSaveMessage}</p>
+					{/if}
 				</div>
 			</div>
 

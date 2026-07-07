@@ -7,7 +7,12 @@
 		builds: BuildProfile[];
 		nickname: string;
 		telegramAccount: string;
+		telegramAvatarUrl: string | null;
+		nicknameDirty: boolean;
+		nicknameSaving: boolean;
+		nicknameSaveMessage: string;
 		availableBuildsCount: number;
+		saveLauncherNickname: () => void | Promise<void>;
 		logoutFromTelegram: () => void;
 		closeProfile: () => void;
 	};
@@ -16,7 +21,12 @@
 		builds,
 		nickname = $bindable(),
 		telegramAccount,
+		telegramAvatarUrl,
+		nicknameDirty,
+		nicknameSaving,
+		nicknameSaveMessage,
 		availableBuildsCount,
+		saveLauncherNickname,
 		logoutFromTelegram,
 		closeProfile,
 	}: Props = $props();
@@ -62,7 +72,12 @@
 				{builds}
 				bind:nickname
 				{telegramAccount}
+				{telegramAvatarUrl}
+				{nicknameDirty}
+				{nicknameSaving}
+				{nicknameSaveMessage}
 				{availableBuildsCount}
+				{saveLauncherNickname}
 				{logoutFromTelegram}
 			/>
 		</div>

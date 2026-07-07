@@ -13,10 +13,17 @@
 		pollTelegramLoginChallenge,
 		refreshAuthSession,
 		storeAuthSession,
+		updateLauncherNickname,
 		type LauncherAuthSession,
 		type LauncherProfile,
 	} from '$lib/fragment-api';
-	import { getLauncherStatus, openExternalUrl } from '$lib/launcher';
+	import {
+		getLauncherStatus,
+		getTgWsProxyStatus,
+		installTgWsProxy,
+		openTelegramAppUrl,
+		type TgWsProxyStatus,
+	} from '$lib/launcher';
 	import {
 		createBuildProfiles,
 		feedImages,
@@ -36,6 +43,7 @@
 	import Sidebar from '$lib/components/launcher/Sidebar.svelte';
 	import StatsWindow from '$lib/components/launcher/StatsWindow.svelte';
 	import SupportWindow from '$lib/components/launcher/SupportWindow.svelte';
+	import TelegramHelpWindow from '$lib/components/launcher/TelegramHelpWindow.svelte';
 	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
 
 	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
@@ -48,7 +56,9 @@
 	let bootPhase = $state<BootPhase>('boot');
 	let activeSection = $state<SectionId>('home');
 	let selectedBuildId = $state('fragment-origin');
-	let nickname = $state('FragmentPlayer');
+	let nickname = $state('');
+	let nicknameSaveMessage = $state('');
+	let nicknameSaving = $state(false);
 	let supportTopic = $state('');
 	let supportDescription = $state('');
 	let attachCrashReport = $state(true);
@@ -67,7 +77,13 @@
 	let authSession = $state<LauncherAuthSession | null>(null);
 	let authState = $state<AuthState>('checking');
 	let telegramLoginLink = $state<string | null>(null);
+	let showTelegramHelpPill = $state(false);
+	let telegramHelpVisible = $state(false);
+	let tgWsProxyStatus = $state<TgWsProxyStatus | null>(null);
+	let tgWsProxyBusy = $state(false);
+	let tgWsProxyMessage = $state('');
 	let loginPollTimer: number | null = null;
+	let telegramHelpTimer: number | null = null;
 
 	let builds = $state<BuildProfile[]>(createBuildProfiles());
 
@@ -82,6 +98,9 @@
 		builds.filter((build) => build.access === 'available' || hasActiveSubscription).length,
 	);
 	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
+	let telegramAvatarUrl = $derived(resolveTelegramAvatarUrl(authSession?.profile));
+	let savedLauncherNick = $derived(authSession?.profile.launcherNick ?? '');
+	let nicknameDirty = $derived(normalizeLauncherNickname(nickname) !== savedLauncherNick);
 	let supportReady = $derived(
 		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
 	);
@@ -99,7 +118,10 @@
 		void restoreAuthSession();
 		void runBootSequence();
 
-		return () => stopLoginPolling();
+		return () => {
+			stopLoginPolling();
+			stopTelegramHelpTimer();
+		};
 	});
 
 	async function configureFixedWindow() {
@@ -169,13 +191,19 @@
 			const profile = await getCurrentProfile(storedSession.accessToken);
 			authSession = { ...storedSession, profile };
 			storeAuthSession(authSession);
+			syncNicknameFromProfile(profile);
 			authState = 'signed-in';
+			resetTelegramHelpPill();
+			telegramHelpVisible = false;
 		} catch {
 			try {
 				const refreshed = await refreshAuthSession(storedSession.refreshToken);
 				authSession = refreshed;
 				storeAuthSession(refreshed);
+				syncNicknameFromProfile(refreshed.profile);
 				authState = 'signed-in';
+				resetTelegramHelpPill();
+				telegramHelpVisible = false;
 			} catch {
 				clearStoredAuthSession();
 				authSession = null;
@@ -186,21 +214,28 @@
 
 	async function loginWithTelegram() {
 		if (authState === 'waiting' && telegramLoginLink) {
-			await openExternalUrl(telegramLoginLink);
+			await openTelegramAppUrl(telegramLoginLink);
+			if (!showTelegramHelpPill) {
+				scheduleTelegramHelpPill();
+			}
 			return;
 		}
 
 		stopLoginPolling();
 		telegramLoginLink = null;
+		showTelegramHelpPill = false;
 		authState = 'waiting';
+		scheduleTelegramHelpPill();
 
 		try {
 			const challenge = await createTelegramLoginChallenge('Fragment Launcher');
 			telegramLoginLink = challenge.telegramLink;
-			await openExternalUrl(challenge.telegramLink);
+			await openTelegramAppUrl(challenge.telegramLink);
 			void pollLoginChallenge(challenge.challengeId, challenge.pollToken, challenge.expiresAt);
 		} catch (error) {
 			console.warn('Telegram login failed', error);
+			stopTelegramHelpTimer();
+			showTelegramHelpPill = true;
 			authState = 'error';
 		}
 	}
@@ -226,17 +261,24 @@
 					profile: result.profile,
 				};
 				storeAuthSession(authSession);
+				syncNicknameFromProfile(authSession.profile);
 				authState = 'signed-in';
 				telegramLoginLink = null;
+				resetTelegramHelpPill();
+				telegramHelpVisible = false;
 				return;
 			}
 
 			if (result.status === 'expired' || result.status === 'consumed') {
+				stopTelegramHelpTimer();
+				showTelegramHelpPill = true;
 				authState = 'error';
 				return;
 			}
 		} catch (error) {
 			console.warn('Telegram login poll failed', error);
+			stopTelegramHelpTimer();
+			showTelegramHelpPill = true;
 			authState = 'error';
 			return;
 		}
@@ -252,6 +294,10 @@
 		authSession = null;
 		authState = 'signed-out';
 		telegramLoginLink = null;
+		nickname = '';
+		nicknameSaveMessage = '';
+		resetTelegramHelpPill();
+		telegramHelpVisible = false;
 		settingsVisible = false;
 		launcherSettingsVisible = false;
 		supportVisible = false;
@@ -272,6 +318,101 @@
 		}
 	}
 
+	function scheduleTelegramHelpPill() {
+		stopTelegramHelpTimer();
+
+		telegramHelpTimer = window.setTimeout(() => {
+			if (authState === 'waiting') {
+				showTelegramHelpPill = true;
+			}
+
+			telegramHelpTimer = null;
+		}, 7000);
+	}
+
+	function stopTelegramHelpTimer() {
+		if (telegramHelpTimer) {
+			window.clearTimeout(telegramHelpTimer);
+			telegramHelpTimer = null;
+		}
+	}
+
+	function resetTelegramHelpPill() {
+		stopTelegramHelpTimer();
+		showTelegramHelpPill = false;
+	}
+
+	async function openTelegramHelp() {
+		telegramHelpVisible = true;
+		await refreshTgWsProxyStatus();
+	}
+
+	async function refreshTgWsProxyStatus() {
+		tgWsProxyStatus = await getTgWsProxyStatus();
+		tgWsProxyMessage = tgWsProxyStatus.running
+			? 'TG WS Proxy работает. Подтвердите прокси в Telegram и повторите вход.'
+			: tgWsProxyStatus.message;
+	}
+
+	async function installTelegramProxy() {
+		if (tgWsProxyBusy) {
+			return;
+		}
+
+		tgWsProxyBusy = true;
+		tgWsProxyMessage = 'Скачиваем TG WS Proxy';
+
+		try {
+			tgWsProxyStatus = await installTgWsProxy();
+			tgWsProxyMessage = tgWsProxyStatus.running
+				? 'TG WS Proxy работает. Подтвердите прокси в Telegram и повторите вход.'
+				: tgWsProxyStatus.message;
+		} catch (error) {
+			tgWsProxyMessage = error instanceof Error ? error.message : 'Не удалось установить TG WS Proxy';
+		} finally {
+			tgWsProxyBusy = false;
+		}
+	}
+
+	function syncNicknameFromProfile(profile: LauncherProfile) {
+		nickname = profile.launcherNick ?? '';
+		nicknameSaveMessage = '';
+	}
+
+	function normalizeLauncherNickname(value: string) {
+		return value.trim().replace(/[^a-zA-Z0-9_]/g, '').slice(0, 30);
+	}
+
+	async function saveLauncherNickname() {
+		const session = authSession;
+		if (!session || nicknameSaving) {
+			return;
+		}
+
+		const nextNickname = normalizeLauncherNickname(nickname);
+		nickname = nextNickname;
+
+		if (nextNickname === (session.profile.launcherNick ?? '')) {
+			nicknameSaveMessage = '';
+			return;
+		}
+
+		nicknameSaving = true;
+		nicknameSaveMessage = '';
+
+		try {
+			const profile = await updateLauncherNickname(session.accessToken, nextNickname || null);
+			authSession = { ...session, profile };
+			storeAuthSession(authSession);
+			syncNicknameFromProfile(profile);
+			nicknameSaveMessage = profile.launcherNick ? 'Ник сохранён' : 'Ник очищен';
+		} catch (error) {
+			nicknameSaveMessage = error instanceof Error ? error.message : 'Не удалось сохранить ник';
+		} finally {
+			nicknameSaving = false;
+		}
+	}
+
 	function selectBuild(buildId: string) {
 		selectedBuildId = buildId;
 	}
@@ -288,6 +429,11 @@
 		}
 
 		activeSection = section;
+	}
+
+	function closeProfileWindow() {
+		profileVisible = false;
+		nicknameSaveMessage = '';
 	}
 
 	function setPreset(presetId: PresetId) {
@@ -382,6 +528,19 @@
 
 		return profile.telegramId ? `ID ${profile.telegramId}` : 'Telegram подключён';
 	}
+
+	function resolveTelegramAvatarUrl(profile: LauncherProfile | undefined) {
+		if (!profile) {
+			return null;
+		}
+
+		return (
+			profile.avatarUrl ??
+			profile.telegramAvatarUrl ??
+			profile.photoUrl ??
+			null
+		);
+	}
 </script>
 
 <svelte:head>
@@ -399,10 +558,22 @@
 		{#if authGateVisible}
 			<AuthGate
 				{authState}
+				showTelegramHelp={showTelegramHelpPill}
 				{loginWithTelegram}
+				{openTelegramHelp}
 				{startDrag}
 				{minimize}
 				{closeWindow}
+			/>
+		{/if}
+
+		{#if telegramHelpVisible}
+			<TelegramHelpWindow
+				proxyStatus={tgWsProxyStatus}
+				proxyBusy={tgWsProxyBusy}
+				proxyMessage={tgWsProxyMessage}
+				closeTelegramHelp={() => (telegramHelpVisible = false)}
+				{installTelegramProxy}
 			/>
 		{/if}
 
@@ -486,9 +657,14 @@
 				{builds}
 				bind:nickname
 				{telegramAccount}
+				{telegramAvatarUrl}
+				{nicknameDirty}
+				{nicknameSaving}
+				{nicknameSaveMessage}
 				{availableBuildsCount}
+				{saveLauncherNickname}
 				{logoutFromTelegram}
-				closeProfile={() => (profileVisible = false)}
+				closeProfile={closeProfileWindow}
 			/>
 		{/if}
 

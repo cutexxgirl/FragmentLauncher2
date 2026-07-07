@@ -2,10 +2,16 @@ export type SubscriptionLevel = 'none' | 'novice' | 'legend' | 'spark';
 
 export type LauncherProfile = {
 	userId: string;
+	launcherNick: string | null;
+	launcherNickUpdatedAt?: string | null;
+	launcherNickNextChangeAt?: string | null;
 	telegramId: string | null;
 	username: string | null;
 	firstName: string | null;
 	lastName: string | null;
+	avatarUrl?: string | null;
+	telegramAvatarUrl?: string | null;
+	photoUrl?: string | null;
 	fid: string | null;
 	subscriptionLevel: SubscriptionLevel;
 	entitlement: {
@@ -47,6 +53,10 @@ const API_BASE_URL = (
 ).replace(/\/+$/, '');
 
 const SESSION_STORAGE_KEY = 'fragment.launcher.authSession.v1';
+
+export function getUserAvatarUrl(userId: string): string {
+	return `${API_BASE_URL}/users/${encodeURIComponent(userId)}/avatar`;
+}
 
 export function loadStoredAuthSession(): LauncherAuthSession | null {
 	if (typeof localStorage === 'undefined') {
@@ -124,6 +134,16 @@ export async function getCurrentProfile(accessToken: string) {
 	});
 }
 
+export async function updateLauncherNickname(accessToken: string, nickname: string | null) {
+	return request<LauncherProfile>('/auth/me/nickname', {
+		method: 'PATCH',
+		headers: {
+			authorization: `Bearer ${accessToken}`,
+		},
+		body: JSON.stringify({ nickname }),
+	});
+}
+
 async function request<T>(path: string, init: RequestInit): Promise<T> {
 	const response = await fetch(`${API_BASE_URL}${path}`, {
 		...init,
@@ -135,8 +155,14 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
 	});
 
 	if (!response.ok) {
-		const payload = (await response.json().catch(() => null)) as { message?: string; error?: string } | null;
-		throw new Error(payload?.message || payload?.error || `Fragment API responded with ${response.status}`);
+		const payload = (await response.json().catch(() => null)) as
+			| { message?: string; error?: string | { message?: string } }
+			| null;
+		const message =
+			payload?.message ||
+			(typeof payload?.error === 'string' ? payload.error : payload?.error?.message) ||
+			`Fragment API responded with ${response.status}`;
+		throw new Error(message);
 	}
 
 	return (await response.json()) as T;

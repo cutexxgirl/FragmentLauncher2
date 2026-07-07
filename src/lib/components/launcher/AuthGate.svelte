@@ -5,13 +5,23 @@
 
 	type Props = {
 		authState: AuthState;
+		showTelegramHelp: boolean;
 		loginWithTelegram: () => void | Promise<void>;
+		openTelegramHelp: () => void | Promise<void>;
 		startDrag: () => void | Promise<void>;
 		minimize: () => void | Promise<void>;
 		closeWindow: () => void | Promise<void>;
 	};
 
-	let { authState, loginWithTelegram, startDrag, minimize, closeWindow }: Props = $props();
+	let {
+		authState,
+		showTelegramHelp,
+		loginWithTelegram,
+		openTelegramHelp,
+		startDrag,
+		minimize,
+		closeWindow,
+	}: Props = $props();
 
 	let isChecking = $derived(authState === 'checking');
 </script>
@@ -61,4 +71,10 @@
 			Войти через Telegram
 		</button>
 	</div>
+
+	{#if showTelegramHelp}
+		<button type="button" class="telegram-help-pill" onclick={openTelegramHelp}>
+			Проблемы с подключением в Telegram?
+		</button>
+	{/if}
 </section>
