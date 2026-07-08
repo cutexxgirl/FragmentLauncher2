@@ -1,40 +1,129 @@
 <script lang="ts">
-	import { Download, Minus, Play, Settings, Sparkles, Square, X } from '@lucide/svelte';
-	import { browser } from '$app/environment';
+	import '$lib/styles/launcher.css';
+	import { Gamepad2 } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
-	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
+	import {
+		clearStoredAuthSession,
+		createTelegramLoginChallenge,
+		getCurrentProfile,
+		loadStoredAuthSession,
+		logoutAuthSession,
+		pollTelegramLoginChallenge,
+		refreshAuthSession,
+		storeAuthSession,
+		type LauncherAuthSession,
+		type LauncherProfile,
+	} from '$lib/fragment-api';
+	import { getLauncherStatus, openExternalUrl } from '$lib/launcher';
+	import {
+		createBuildProfiles,
+		feedImages,
+		feedItems,
+		presets,
+		type BuildProfile,
+		type PresetId,
+		type SectionId,
+	} from '$lib/launcher-ui';
+	import AuthGate from '$lib/components/launcher/AuthGate.svelte';
+	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
+	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
+	import LauncherSettingsWindow from '$lib/components/launcher/LauncherSettingsWindow.svelte';
+	import MobileNav from '$lib/components/launcher/MobileNav.svelte';
+	import ProfileWindow from '$lib/components/launcher/ProfileWindow.svelte';
+	import SettingsWindow from '$lib/components/launcher/SettingsWindow.svelte';
+	import Sidebar from '$lib/components/launcher/Sidebar.svelte';
+	import StatsWindow from '$lib/components/launcher/StatsWindow.svelte';
+	import SupportWindow from '$lib/components/launcher/SupportWindow.svelte';
+	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
 
-	type ResizeDirection =
-		| 'East'
-		| 'North'
-		| 'NorthEast'
-		| 'NorthWest'
-		| 'South'
-		| 'SouthEast'
-		| 'SouthWest'
-		| 'West';
 	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
+	type AuthState = 'checking' | 'signed-out' | 'waiting' | 'signed-in' | 'error';
 
-	let status = $state<LauncherStatus>({
-		appName: 'Fragment Launcher',
-		version: '1.0.0',
-		profile: 'singleplayer',
-		servicesConnected: false,
-		updaterReady: true
-	});
+	const FIXED_WINDOW_SIZE = new LogicalSize(1244, 764);
+
 	let bootProgress = $state(0.08);
 	let bootLabel = $state('Поднимаем оболочку');
 	let bootPhase = $state<BootPhase>('boot');
+	let activeSection = $state<SectionId>('home');
+	let selectedBuildId = $state('fragment-origin');
+	let nickname = $state('FragmentPlayer');
+	let supportTopic = $state('');
+	let supportDescription = $state('');
+	let attachCrashReport = $state(true);
+	let attachLastLog = $state(true);
+	let attachLastScreenshot = $state(false);
+	let settingsVisible = $state(false);
+	let launcherSettingsVisible = $state(false);
+	let supportVisible = $state(false);
+	let profileVisible = $state(false);
+	let statsVisible = $state(false);
+	let supportSent = $state(false);
+	let launcherVersion = $state('1.0.0');
+	let anonymizeAnalytics = $state(true);
+	let includeDiagnosticsInSupport = $state(false);
+	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
+	let authSession = $state<LauncherAuthSession | null>(null);
+	let authState = $state<AuthState>('checking');
+	let telegramLoginLink = $state<string | null>(null);
+	let loginPollTimer: number | null = null;
+
+	let builds = $state<BuildProfile[]>(createBuildProfiles());
+
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
+	let userIsSignedIn = $derived(authState === 'signed-in' && authSession !== null);
+	let appVisible = $derived(launcherVisible && userIsSignedIn);
+	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
+	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
+	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
+	let availableBuildsCount = $derived(
+		builds.filter((build) => build.access === 'available' || hasActiveSubscription).length,
+	);
+	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
+	let supportReady = $derived(
+		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
+	);
 
-	const appWindow = browser ? getCurrentWindow() : null;
+	const navigation = [
+		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
+	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
 
-	onMount(async () => {
-		await runBootSequence();
+	onMount(() => {
+		if ('__TAURI_INTERNALS__' in window) {
+			appWindow = getCurrentWindow();
+			void configureFixedWindow();
+		}
+
+		void restoreAuthSession();
+		void runBootSequence();
+
+		return () => stopLoginPolling();
 	});
+
+	async function configureFixedWindow() {
+		if (!appWindow) {
+			return;
+		}
+
+		const windowTasks = [
+			() => appWindow?.setSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setMinSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setMaxSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setResizable(false),
+			() => appWindow?.setMaximizable(false),
+			() => appWindow?.center(),
+		];
+
+		for (const task of windowTasks) {
+			try {
+				await task();
+			} catch (error) {
+				console.warn('Window configuration step failed', error);
+			}
+		}
+	}
 
 	function setBootStep(progress: number, label: string) {
 		bootProgress = progress;
@@ -49,18 +138,17 @@
 		setBootStep(0.18, 'Готовим интерфейс');
 		await delay(80);
 
-		setBootStep(0.46, 'Подключаем локальный бекенд');
-		status = await getLauncherStatus();
+		setBootStep(0.46, 'Подключаем локальный бэкенд');
+		const launcherStatus = await getLauncherStatus();
+		launcherVersion = launcherStatus.version;
 		await delay(80);
 
 		setBootStep(0.68, 'Проверяем профиль сборки');
-		await appWindow?.setMinSize(new LogicalSize(520, 320));
 		await delay(80);
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
 		bootPhase = 'expanding';
 		await delay(620);
-		await appWindow?.setMinSize(new LogicalSize(1100, 680));
 
 		setBootStep(1, 'Готово');
 		await delay(80);
@@ -69,12 +157,210 @@
 		bootPhase = 'ready';
 	}
 
-	async function minimize() {
-		await appWindow?.minimize();
+	async function restoreAuthSession() {
+		const storedSession = loadStoredAuthSession();
+		if (!storedSession) {
+			authState = 'signed-out';
+			return;
+		}
+
+		authState = 'checking';
+		try {
+			const profile = await getCurrentProfile(storedSession.accessToken);
+			authSession = { ...storedSession, profile };
+			storeAuthSession(authSession);
+			authState = 'signed-in';
+		} catch {
+			try {
+				const refreshed = await refreshAuthSession(storedSession.refreshToken);
+				authSession = refreshed;
+				storeAuthSession(refreshed);
+				authState = 'signed-in';
+			} catch {
+				clearStoredAuthSession();
+				authSession = null;
+				authState = 'signed-out';
+			}
+		}
 	}
 
-	async function toggleMaximize() {
-		await appWindow?.toggleMaximize();
+	async function loginWithTelegram() {
+		if (authState === 'waiting' && telegramLoginLink) {
+			await openExternalUrl(telegramLoginLink);
+			return;
+		}
+
+		stopLoginPolling();
+		telegramLoginLink = null;
+		authState = 'waiting';
+
+		try {
+			const challenge = await createTelegramLoginChallenge('Fragment Launcher');
+			telegramLoginLink = challenge.telegramLink;
+			await openExternalUrl(challenge.telegramLink);
+			void pollLoginChallenge(challenge.challengeId, challenge.pollToken, challenge.expiresAt);
+		} catch (error) {
+			console.warn('Telegram login failed', error);
+			authState = 'error';
+		}
+	}
+
+	async function pollLoginChallenge(challengeId: string, pollToken: string, expiresAt: string) {
+		if (authState !== 'waiting') {
+			return;
+		}
+
+		if (Date.now() > new Date(expiresAt).getTime()) {
+			authState = 'error';
+			return;
+		}
+
+		try {
+			const result = await pollTelegramLoginChallenge(challengeId, pollToken);
+			if (result.status === 'confirmed') {
+				authSession = {
+					tokenType: result.tokenType,
+					accessToken: result.accessToken,
+					refreshToken: result.refreshToken,
+					expiresIn: result.expiresIn,
+					profile: result.profile,
+				};
+				storeAuthSession(authSession);
+				authState = 'signed-in';
+				telegramLoginLink = null;
+				return;
+			}
+
+			if (result.status === 'expired' || result.status === 'consumed') {
+				authState = 'error';
+				return;
+			}
+		} catch (error) {
+			console.warn('Telegram login poll failed', error);
+			authState = 'error';
+			return;
+		}
+
+		loginPollTimer = window.setTimeout(() => {
+			void pollLoginChallenge(challengeId, pollToken, expiresAt);
+		}, 1800);
+	}
+
+	async function logoutFromTelegram() {
+		const session = authSession;
+		stopLoginPolling();
+		authSession = null;
+		authState = 'signed-out';
+		telegramLoginLink = null;
+		settingsVisible = false;
+		launcherSettingsVisible = false;
+		supportVisible = false;
+		profileVisible = false;
+		statsVisible = false;
+		activeSection = 'home';
+		clearStoredAuthSession();
+
+		if (session) {
+			await logoutAuthSession(session.refreshToken).catch(() => undefined);
+		}
+	}
+
+	function stopLoginPolling() {
+		if (loginPollTimer) {
+			window.clearTimeout(loginPollTimer);
+			loginPollTimer = null;
+		}
+	}
+
+	function selectBuild(buildId: string) {
+		selectedBuildId = buildId;
+	}
+
+	function openSection(section: SectionId) {
+		if (section === 'support') {
+			supportVisible = true;
+			return;
+		}
+
+		if (section === 'profile') {
+			profileVisible = true;
+			return;
+		}
+
+		activeSection = section;
+	}
+
+	function setPreset(presetId: PresetId) {
+		const preset = presets.find((item) => item.id === presetId);
+
+		activeBuild.preset = presetId;
+
+		if (preset) {
+			activeBuild.selectedRam = preset.ram;
+		}
+	}
+
+	function setRamFromInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		activeBuild.selectedRam = Number(input.value);
+	}
+
+	function setJavaPath(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		activeBuild.javaPath = input.value;
+	}
+
+	function useSuggestedJavaPath() {
+		activeBuild.javaPath = 'C:\\Program Files\\Eclipse Adoptium\\jdk-21\\bin\\javaw.exe';
+	}
+
+	function toggleMod(modId: string) {
+		const mod = activeBuild.mods.find((item) => item.id === modId);
+
+		if (mod) {
+			mod.enabled = !mod.enabled;
+		}
+	}
+
+	function addShaderFiles(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		const fileNames = Array.from(input.files ?? []).map((file) => file.name);
+
+		activeBuild.shaders = [...new Set([...activeBuild.shaders, ...fileNames])].slice(0, 8);
+		input.value = '';
+	}
+
+	function addResourcePackFiles(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		const fileNames = Array.from(input.files ?? []).map((file) => file.name);
+
+		activeBuild.resourcePacks = [...new Set([...activeBuild.resourcePacks, ...fileNames])].slice(
+			0,
+			8,
+		);
+		input.value = '';
+	}
+
+	function removeShader(name: string) {
+		activeBuild.shaders = activeBuild.shaders.filter((item) => item !== name);
+	}
+
+	function removeResourcePack(name: string) {
+		activeBuild.resourcePacks = activeBuild.resourcePacks.filter((item) => item !== name);
+	}
+
+	function submitSupportRequest(event: SubmitEvent) {
+		event.preventDefault();
+
+		if (!supportReady) {
+			return;
+		}
+
+		supportSent = true;
+	}
+
+	async function minimize() {
+		await appWindow?.minimize();
 	}
 
 	async function closeWindow() {
@@ -85,8 +371,16 @@
 		await appWindow?.startDragging();
 	}
 
-	async function startResize(direction: ResizeDirection) {
-		await appWindow?.startResizeDragging(direction);
+	function formatTelegramAccount(profile: LauncherProfile | undefined) {
+		if (!profile) {
+			return 'Не подключён';
+		}
+
+		if (profile.username) {
+			return `@${profile.username}`;
+		}
+
+		return profile.telegramId ? `ID ${profile.telegramId}` : 'Telegram подключён';
 	}
 </script>
 
@@ -95,439 +389,111 @@
 </svelte:head>
 
 <div class:expanded={bootPhase !== 'boot'} class="window-stage fixed inset-0 overflow-hidden">
-	<div class="window-shadow shadow-cast"></div>
-	<div class="window-shadow shadow-contact"></div>
+	<main
+		class="app-shell absolute overflow-hidden rounded-[30px] border border-border bg-background text-foreground"
+	>
+		{#if bootVisible}
+			<BootScreen {bootPhase} {bootProgress} {bootLabel} {startDrag} />
+		{/if}
 
-<main
-	class="app-shell absolute overflow-hidden rounded-[18px] border border-border bg-background text-foreground"
->
-	<button
-		class="resize-edge resize-n"
-		aria-label="Resize north"
-		onmousedown={() => startResize('North')}
-	></button>
-	<button
-		class="resize-edge resize-e"
-		aria-label="Resize east"
-		onmousedown={() => startResize('East')}
-	></button>
-	<button
-		class="resize-edge resize-s"
-		aria-label="Resize south"
-		onmousedown={() => startResize('South')}
-	></button>
-	<button
-		class="resize-edge resize-w"
-		aria-label="Resize west"
-		onmousedown={() => startResize('West')}
-	></button>
-	<button
-		class="resize-corner resize-ne"
-		aria-label="Resize northeast"
-		onmousedown={() => startResize('NorthEast')}
-	></button>
-	<button
-		class="resize-corner resize-nw"
-		aria-label="Resize northwest"
-		onmousedown={() => startResize('NorthWest')}
-	></button>
-	<button
-		class="resize-corner resize-se"
-		aria-label="Resize southeast"
-		onmousedown={() => startResize('SouthEast')}
-	></button>
-	<button
-		class="resize-corner resize-sw"
-		aria-label="Resize southwest"
-		onmousedown={() => startResize('SouthWest')}
-	></button>
+		{#if authGateVisible}
+			<AuthGate
+				{authState}
+				{loginWithTelegram}
+				{startDrag}
+				{minimize}
+				{closeWindow}
+			/>
+		{/if}
 
-	{#if bootVisible}
-		<div
-			class:leaving={bootPhase === 'reveal'}
-			class="boot-screen flex h-full min-h-0 flex-col justify-between bg-[radial-gradient(circle_at_70%_18%,#263243_0,#0c0f14_52%)] px-7 py-6"
-			role="toolbar"
-			aria-label="Boot window"
-			tabindex="-1"
-			onmousedown={startDrag}
-		>
-			<div class="flex items-center gap-3">
-				<div class="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
-					<Sparkles size={20} strokeWidth={2.2} />
-				</div>
-				<div>
-					<p class="text-sm font-medium text-muted">Fragment</p>
-					<h1 class="text-xl font-semibold leading-tight">Launcher</h1>
-				</div>
-			</div>
+		<div class:visible={appVisible} class="launcher-layout">
+			<Sidebar {navigation} setActiveSection={openSection} />
 
-			<div>
-				<p class="text-xs uppercase tracking-[0.18em] text-accent">Запуск</p>
-				<p class="mt-3 text-2xl font-semibold">{bootLabel}</p>
-				<div class="mt-6 h-1.5 overflow-hidden rounded-full bg-panel-strong">
-					<div
-						class="h-full rounded-full bg-accent transition-[width] duration-300 ease-out"
-						style={`width: ${Math.round(bootProgress * 100)}%`}
-					></div>
-				</div>
-				<div class="mt-3 flex items-center justify-between text-xs text-muted">
-					<span>Локальный запуск</span>
-					<span>{Math.round(bootProgress * 100)}%</span>
-				</div>
-			</div>
-		</div>
-	{/if}
+			<section class="main-surface flex min-w-0 flex-col">
+				<TitleBar
+					{startDrag}
+					{minimize}
+					{closeWindow}
+					openSupport={() => (supportVisible = true)}
+					openProfile={() => (profileVisible = true)}
+					openStats={() => (statsVisible = true)}
+					openSettings={() => (launcherSettingsVisible = true)}
+				/>
 
-	<div class:visible={launcherVisible} class="launcher-layout">
-	<aside class="launcher-surface flex min-h-0 flex-col border-r border-border bg-panel px-6 py-5">
-		<div class="flex items-center gap-3">
-			<div class="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
-				<Sparkles size={20} strokeWidth={2.2} />
-			</div>
-			<div>
-				<p class="text-sm font-medium text-muted">Fragment</p>
-				<h1 class="text-xl font-semibold leading-tight">Launcher</h1>
-			</div>
+				<MobileNav {navigation} {activeSection} setActiveSection={openSection} />
+
+				<div class="workspace min-h-0 flex-1 overflow-y-auto px-6 py-6">
+					{#if activeSection === 'home'}
+						<HomeSection
+							{builds}
+							{activeBuild}
+							{selectedBuildId}
+							{feedItems}
+							{feedImages}
+							{selectBuild}
+							openSettings={() => (settingsVisible = true)}
+						/>
+					{/if}
+				</div>
+			</section>
 		</div>
 
-		<nav class="mt-8 grid gap-2">
-			<button class="flex h-10 items-center gap-3 rounded-md bg-panel-strong px-3 text-left text-sm font-medium">
-				<Play size={17} />
-				Играть
-			</button>
-			<button
-				class="flex h-10 items-center gap-3 rounded-md px-3 text-left text-sm text-muted transition hover:bg-panel-strong hover:text-foreground"
-			>
-				<Download size={17} />
-				Обновления
-			</button>
-			<button
-				class="flex h-10 items-center gap-3 rounded-md px-3 text-left text-sm text-muted transition hover:bg-panel-strong hover:text-foreground"
-			>
-				<Settings size={17} />
-				Настройки
-			</button>
-		</nav>
+		{#if settingsVisible}
+			<SettingsWindow
+				{builds}
+				{activeBuild}
+				{selectedBuildId}
+				{presets}
+				closeSettings={() => (settingsVisible = false)}
+				{selectBuild}
+				{setPreset}
+				{setRamFromInput}
+				{setJavaPath}
+				{useSuggestedJavaPath}
+				{toggleMod}
+				{addShaderFiles}
+				{addResourcePackFiles}
+				{removeShader}
+				{removeResourcePack}
+			/>
+		{/if}
 
-		<div class="mt-auto rounded-md border border-border bg-background/45 p-4">
-			<p class="text-xs uppercase tracking-[0.18em] text-muted">Версия</p>
-			<p class="mt-2 text-lg font-semibold">{status.version}</p>
-		</div>
-	</aside>
+		{#if launcherSettingsVisible}
+			<LauncherSettingsWindow
+				{launcherVersion}
+				bind:anonymizeAnalytics
+				bind:includeDiagnosticsInSupport
+				closeLauncherSettings={() => (launcherSettingsVisible = false)}
+			/>
+		{/if}
 
-	<section class="launcher-surface flex min-w-0 flex-col bg-[radial-gradient(circle_at_68%_18%,#263243_0,#0c0f14_42%)]">
-		<header
-			class="flex h-14 select-none items-center justify-between border-b border-border px-5"
-			role="toolbar"
-			aria-label="Window title bar"
-			tabindex="-1"
-			onmousedown={startDrag}
-			ondblclick={toggleMaximize}
-		>
-			<div class="flex items-center gap-3">
-				<span class="size-2 rounded-full bg-success"></span>
-				<div>
-					<p class="text-xs text-muted">Профиль</p>
-					<p class="text-sm font-medium">Одиночная сборка</p>
-				</div>
-			</div>
+		{#if supportVisible}
+			<SupportWindow
+				bind:supportTopic
+				bind:supportDescription
+				bind:attachCrashReport
+				bind:attachLastLog
+				bind:attachLastScreenshot
+				{supportReady}
+				{supportSent}
+				closeSupport={() => (supportVisible = false)}
+				{submitSupportRequest}
+			/>
+		{/if}
 
-			<div class="flex items-center gap-1">
-				<button
-					class="window-control"
-					aria-label="Minimize window"
-					title="Свернуть"
-					onmousedown={(event) => event.stopPropagation()}
-					onclick={minimize}
-				>
-					<Minus size={15} />
-				</button>
-				<button
-					class="window-control"
-					aria-label="Maximize window"
-					title="Развернуть"
-					onmousedown={(event) => event.stopPropagation()}
-					onclick={toggleMaximize}
-				>
-					<Square size={13} />
-				</button>
-				<button
-					class="window-control close"
-					aria-label="Close window"
-					title="Закрыть"
-					onmousedown={(event) => event.stopPropagation()}
-					onclick={closeWindow}
-				>
-					<X size={16} />
-				</button>
-			</div>
-		</header>
+		{#if profileVisible}
+			<ProfileWindow
+				{builds}
+				bind:nickname
+				{telegramAccount}
+				{availableBuildsCount}
+				{logoutFromTelegram}
+				closeProfile={() => (profileVisible = false)}
+			/>
+		{/if}
 
-		<div class="grid flex-1 content-between px-8 py-8">
-			<div class="max-w-3xl">
-				<p class="text-sm font-medium uppercase tracking-[0.18em] text-accent">Minecraft modpack</p>
-				<h2 class="mt-4 text-5xl font-semibold leading-[1.05]">Fragment Launcher</h2>
-				<p class="mt-5 max-w-2xl text-base leading-7 text-muted">
-					Каркас для одиночной сборки готов: локальный Tauri-бекенд, статический SvelteKit-фронтенд и
-					место под обновления без подключения внешних сервисов.
-				</p>
-			</div>
-
-			<div class="grid grid-cols-3 gap-4">
-				<div class="rounded-md border border-border bg-panel/90 p-5">
-					<p class="text-sm text-muted">Режим</p>
-					<p class="mt-3 text-xl font-semibold">Singleplayer</p>
-				</div>
-				<div class="rounded-md border border-border bg-panel/90 p-5">
-					<p class="text-sm text-muted">Сервисы</p>
-					<p class="mt-3 text-xl font-semibold">
-						{status.servicesConnected ? 'Подключены' : 'Отключены'}
-					</p>
-				</div>
-				<div class="rounded-md border border-border bg-panel/90 p-5">
-					<p class="text-sm text-muted">Updater</p>
-					<p class="mt-3 text-xl font-semibold">{status.updaterReady ? 'Tauri' : 'Не настроен'}</p>
-				</div>
-			</div>
-
-			<div class="flex items-center gap-3">
-				<button
-					class="inline-flex h-12 items-center gap-3 rounded-md bg-accent px-5 text-sm font-semibold text-accent-foreground transition hover:brightness-105"
-				>
-					<Play size={18} fill="currentColor" />
-					Играть
-				</button>
-				<button
-					class="inline-flex h-12 items-center gap-3 rounded-md border border-border bg-panel px-5 text-sm font-medium text-muted transition hover:text-foreground"
-				>
-					<Settings size={18} />
-					Настройки
-				</button>
-			</div>
-		</div>
-	</section>
-	</div>
-</main>
+		{#if statsVisible}
+			<StatsWindow {activeBuild} closeStats={() => (statsVisible = false)} />
+		{/if}
+	</main>
 </div>
-
-<style>
-	.window-stage {
-		--shell-height: 292px;
-		--shell-width: 512px;
-		pointer-events: none;
-	}
-
-	.window-stage.expanded {
-		--shell-height: calc(100% - 64px);
-		--shell-width: calc(100% - 64px);
-	}
-
-	.app-shell {
-		top: 50%;
-		left: 50%;
-		width: var(--shell-width);
-		height: var(--shell-height);
-		pointer-events: auto;
-		transform: translate(-50%, -50%);
-		transition:
-			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
-			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
-		filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.24));
-	}
-
-	.boot-screen {
-		position: absolute;
-		inset: 0;
-		z-index: 12;
-		opacity: 1;
-		transform: scale(1);
-		transition:
-			opacity 260ms ease,
-			transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
-	}
-
-	.boot-screen.leaving {
-		opacity: 0;
-		transform: scale(1.025);
-		pointer-events: none;
-	}
-
-	.launcher-layout {
-		position: absolute;
-		inset: 0;
-		display: grid;
-		grid-template-columns: 320px 1fr;
-		opacity: 0;
-		pointer-events: none;
-		transform: scale(0.985) translateY(8px);
-		transition:
-			opacity 320ms ease,
-			transform 440ms cubic-bezier(0.22, 1, 0.36, 1);
-	}
-
-	.launcher-layout.visible {
-		opacity: 1;
-		pointer-events: auto;
-		transform: scale(1) translateY(0);
-	}
-
-	.launcher-surface {
-		animation: launcher-surface-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
-	}
-
-	.launcher-surface:nth-of-type(2) {
-		animation-delay: 70ms;
-	}
-
-	@keyframes launcher-surface-in {
-		from {
-			opacity: 0;
-			transform: translateY(10px);
-		}
-
-		to {
-			opacity: 1;
-			transform: translateY(0);
-		}
-	}
-
-	.window-shadow {
-		position: absolute;
-		pointer-events: none;
-		border-radius: 20px;
-	}
-
-	.shadow-cast {
-		top: 50%;
-		left: 50%;
-		width: var(--shell-width);
-		height: var(--shell-height);
-		background: transparent;
-		box-shadow: 14px 16px 26px 6px rgba(0, 0, 0, 0.42);
-		opacity: 0.9;
-		transform: translate(calc(-50% + 2px), calc(-50% + 2px));
-		transition:
-			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
-			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
-		mask-image: linear-gradient(
-			135deg,
-			rgba(0, 0, 0, 0.08) 0%,
-			rgba(0, 0, 0, 0.55) 38%,
-			#000 100%
-		);
-		-webkit-mask-image: linear-gradient(
-			135deg,
-			rgba(0, 0, 0, 0.08) 0%,
-			rgba(0, 0, 0, 0.55) 38%,
-			#000 100%
-		);
-	}
-
-	.shadow-contact {
-		top: 50%;
-		left: 50%;
-		width: var(--shell-width);
-		height: var(--shell-height);
-		background: transparent;
-		box-shadow: 9px 15px 18px -12px rgba(0, 0, 0, 0.34);
-		opacity: 0.78;
-		transform: translate(-50%, -50%);
-		transition:
-			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
-			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
-	}
-
-	.window-control {
-		display: grid;
-		width: 34px;
-		height: 30px;
-		place-items: center;
-		border-radius: 6px;
-		color: var(--color-muted);
-		transition:
-			background-color 140ms ease,
-			color 140ms ease;
-	}
-
-	.window-control:hover {
-		background: var(--color-panel-strong);
-		color: var(--color-foreground);
-	}
-
-	.window-control.close:hover {
-		background: #c94d4d;
-		color: white;
-	}
-
-	.resize-edge,
-	.resize-corner {
-		position: absolute;
-		z-index: 30;
-		border: 0;
-		background: transparent;
-		padding: 0;
-	}
-
-	.resize-n,
-	.resize-s {
-		left: 10px;
-		right: 10px;
-		height: 6px;
-	}
-
-	.resize-n {
-		top: 0;
-		cursor: ns-resize;
-	}
-
-	.resize-s {
-		bottom: 0;
-		cursor: ns-resize;
-	}
-
-	.resize-e,
-	.resize-w {
-		top: 10px;
-		bottom: 10px;
-		width: 6px;
-	}
-
-	.resize-e {
-		right: 0;
-		cursor: ew-resize;
-	}
-
-	.resize-w {
-		left: 0;
-		cursor: ew-resize;
-	}
-
-	.resize-corner {
-		width: 12px;
-		height: 12px;
-	}
-
-	.resize-ne {
-		top: 0;
-		right: 0;
-		cursor: nesw-resize;
-	}
-
-	.resize-nw {
-		top: 0;
-		left: 0;
-		cursor: nwse-resize;
-	}
-
-	.resize-se {
-		right: 0;
-		bottom: 0;
-		cursor: nwse-resize;
-	}
-
-	.resize-sw {
-		bottom: 0;
-		left: 0;
-		cursor: nesw-resize;
-	}
-</style>
