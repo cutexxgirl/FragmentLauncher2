@@ -380,7 +380,7 @@
 	}
 
 	function normalizeLauncherNickname(value: string) {
-		return value.trim().replace(/[^a-zA-Z0-9_]/g, '').slice(0, 30);
+		return value.trim().replace(/[^a-zA-Z0-9_]/g, '').slice(0, 16);
 	}
 
 	async function saveLauncherNickname() {

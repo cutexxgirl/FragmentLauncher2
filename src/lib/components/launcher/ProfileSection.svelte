@@ -37,7 +37,7 @@
 
 	function normalizeNickname(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
-		nickname = input.value.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 30);
+		nickname = input.value.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 16);
 		input.value = nickname;
 	}
 
@@ -75,7 +75,7 @@
 							aria-label="Псевдоним"
 							class="text-field profile-name-input"
 							bind:value={nickname}
-							maxlength="30"
+							maxlength="16"
 							placeholder="Псевдоним"
 							spellcheck="false"
 							oninput={normalizeNickname}
