@@ -12,6 +12,9 @@
 		nicknameSaving: boolean;
 		nicknameSaveMessage: string;
 		availableBuildsCount: number;
+		subscriptionActive: boolean;
+		subscriptionName: string;
+		hasDevAccess: boolean;
 		saveLauncherNickname: () => void | Promise<void>;
 		logoutFromTelegram: () => void;
 		closeProfile: () => void;
@@ -26,6 +29,9 @@
 		nicknameSaving,
 		nicknameSaveMessage,
 		availableBuildsCount,
+		subscriptionActive,
+		subscriptionName,
+		hasDevAccess,
 		saveLauncherNickname,
 		logoutFromTelegram,
 		closeProfile,
@@ -77,6 +83,9 @@
 				{nicknameSaving}
 				{nicknameSaveMessage}
 				{availableBuildsCount}
+				{subscriptionActive}
+				{subscriptionName}
+				{hasDevAccess}
 				{saveLauncherNickname}
 				{logoutFromTelegram}
 			/>

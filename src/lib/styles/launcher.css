@@ -626,6 +626,110 @@
 	width: 172px;
 }
 
+.primary-action-wrap {
+	position: relative;
+}
+
+.play-button:disabled {
+	cursor: not-allowed;
+	opacity: 0.62;
+}
+
+.play-button.blocked {
+	cursor: not-allowed;
+	opacity: 0.68;
+}
+
+.operation-status-popover {
+	position: absolute;
+	right: 0;
+	bottom: calc(100% + 12px);
+	z-index: 24;
+	display: grid;
+	width: 294px;
+	gap: 10px;
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	border-radius: 18px;
+	background: rgba(20, 22, 24, 0.98);
+	padding: 13px;
+	opacity: 0;
+	pointer-events: none;
+	transform: translateY(6px);
+	transition:
+		opacity 140ms ease,
+		transform 140ms ease;
+}
+
+.primary-action-wrap:hover .operation-status-popover,
+.primary-action-wrap:focus-within .operation-status-popover {
+	opacity: 1;
+	transform: translateY(0);
+}
+
+.operation-status-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	font-size: 0.75rem;
+}
+
+.operation-status-head strong {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.operation-status-head span,
+.operation-status-grid span,
+.operation-current-file {
+	color: var(--color-muted);
+}
+
+.operation-progress-track {
+	height: 5px;
+	overflow: hidden;
+	border-radius: 999px;
+	background: rgba(255, 255, 255, 0.09);
+}
+
+.operation-progress-track span {
+	display: block;
+	height: 100%;
+	border-radius: inherit;
+	background: var(--color-accent);
+}
+
+.operation-status-grid {
+	display: grid;
+	grid-template-columns: 1fr auto;
+	gap: 5px 12px;
+	font-size: 0.7rem;
+}
+
+.operation-status-grid span {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+}
+
+.operation-current-file {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 0.66rem;
+}
+
+.spin-icon {
+	animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
 .build-menu {
 	position: relative;
 }
@@ -1035,6 +1139,42 @@
 	border-color: rgba(240, 179, 93, 0.45);
 	background: rgba(240, 179, 93, 0.12);
 	color: var(--color-foreground);
+}
+
+.secure-build-settings {
+	display: grid;
+	gap: 14px;
+}
+
+.secure-preset-button small {
+	color: var(--color-muted);
+	font-size: 0.7rem;
+	line-height: 1.35;
+}
+
+.install-location-card {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	border-radius: 16px;
+	background: rgba(16, 17, 18, 0.42);
+	padding: 12px;
+}
+
+.install-location-path {
+	overflow: hidden;
+	margin-top: 4px;
+	color: var(--color-muted);
+	font-size: 0.72rem;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.secure-runtime-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 14px;
 }
 
 .text-field,

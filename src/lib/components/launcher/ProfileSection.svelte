@@ -11,6 +11,9 @@
 		nicknameSaving: boolean;
 		nicknameSaveMessage: string;
 		availableBuildsCount: number;
+		subscriptionActive: boolean;
+		subscriptionName: string;
+		hasDevAccess: boolean;
 		saveLauncherNickname: () => void | Promise<void>;
 		logoutFromTelegram: () => void;
 	};
@@ -24,6 +27,9 @@
 		nicknameSaving,
 		nicknameSaveMessage,
 		availableBuildsCount,
+		subscriptionActive,
+		subscriptionName,
+		hasDevAccess,
 		saveLauncherNickname,
 		logoutFromTelegram,
 	}: Props = $props();
@@ -119,9 +125,13 @@
 
 		<section class="panel-card subscription-card rounded-[22px] border border-border p-4">
 			<div class="subscription-headline">
-				<h3 class="section-title">Fragment Plus</h3>
-				<span class="rounded-[13px] bg-accent/14 px-3 py-1 text-xs font-semibold text-accent">
-					Активна
+				<h3 class="section-title">Доступ к Fragment</h3>
+				<span
+					class:text-accent={subscriptionActive}
+					class:text-muted={!subscriptionActive}
+					class="rounded-[13px] bg-accent/14 px-3 py-1 text-xs font-semibold"
+				>
+					{subscriptionActive ? subscriptionName : 'Нет доступа'}
 				</span>
 			</div>
 
@@ -134,8 +144,17 @@
 				{#each builds as build}
 					<div class="subscription-row">
 						<p class="min-w-0 truncate text-sm font-semibold">{build.name}</p>
-						<span class:locked={build.access === 'subscription'} class="access-pill">
-							{build.access === 'available' ? 'доступно' : 'Plus'}
+						<span
+							class:locked={!subscriptionActive || (build.channel === 'dev' && !hasDevAccess)}
+							class="access-pill"
+						>
+							{!subscriptionActive
+								? 'нет доступа'
+								: build.channel === 'dev'
+									? hasDevAccess
+										? 'Dev'
+										: 'нужна роль'
+									: 'доступно'}
 						</span>
 					</div>
 				{/each}

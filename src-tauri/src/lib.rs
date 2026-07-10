@@ -1,3 +1,6 @@
+pub mod build_manager;
+
+use build_manager::{BuildChannel, BuildManager, BuildStatus, PresetId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -386,6 +389,25 @@ fn launcher_status() -> LauncherStatus {
 }
 
 #[tauri::command]
+fn build_status(
+    manager: tauri::State<'_, BuildManager>,
+    channel: BuildChannel,
+    preset: PresetId,
+) -> Result<BuildStatus, String> {
+    manager.status(channel, preset)
+}
+
+#[tauri::command]
+fn set_build_install_directory(
+    manager: tauri::State<'_, BuildManager>,
+    path: String,
+    channel: BuildChannel,
+    preset: PresetId,
+) -> Result<BuildStatus, String> {
+    manager.set_install_directory(PathBuf::from(path), channel, preset)
+}
+
+#[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     if !is_allowed_external_url(&url) {
         return Err("external URL is not allowed".into());
@@ -449,8 +471,11 @@ async fn install_tg_ws_proxy() -> Result<TgWsProxyStatus, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            let config_path = app.path().app_local_data_dir()?.join("build-manager.json");
+            app.manage(BuildManager::new(config_path));
             if let Some(window) = app.get_webview_window("main") {
                 configure_windows_frame(&window)?;
                 window.center()?;
@@ -467,6 +492,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             launcher_status,
+            build_status,
+            set_build_install_directory,
             open_external_url,
             tg_ws_proxy_status,
             install_tg_ws_proxy

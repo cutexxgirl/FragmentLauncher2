@@ -13,6 +13,8 @@ export type LauncherProfile = {
 	telegramAvatarUrl?: string | null;
 	photoUrl?: string | null;
 	fid: string | null;
+	launcherRole: 'player' | 'tester' | 'developer';
+	launcherPermissions: string[];
 	subscriptionLevel: SubscriptionLevel;
 	entitlement: {
 		active: boolean;
@@ -107,15 +109,10 @@ export async function pollTelegramLoginChallenge(challengeId: string, pollToken:
 }
 
 export async function refreshAuthSession(refreshToken: string) {
-	const refreshed = await request<Omit<LauncherAuthSession, 'refreshToken'>>('/auth/refresh', {
+	return request<LauncherAuthSession>('/auth/refresh', {
 		method: 'POST',
 		body: JSON.stringify({ refreshToken }),
 	});
-
-	return {
-		...refreshed,
-		refreshToken,
-	} satisfies LauncherAuthSession;
 }
 
 export async function logoutAuthSession(refreshToken: string) {

@@ -4,51 +4,29 @@
 	import type { BuildProfile, Preset, PresetId } from '$lib/launcher-ui';
 
 	type Props = {
-		builds: BuildProfile[];
 		activeBuild: BuildProfile;
-		selectedBuildId: string;
 		presets: Preset[];
+		installDirectory: string | null;
 		closeSettings: () => void;
-		selectBuild: (buildId: string) => void;
 		setPreset: (presetId: PresetId) => void;
-		setRamFromInput: (event: Event) => void;
-		setJavaPath: (event: Event) => void;
-		useSuggestedJavaPath: () => void;
-		toggleMod: (modId: string) => void;
-		addShaderFiles: (event: Event) => void;
-		addResourcePackFiles: (event: Event) => void;
-		removeShader: (name: string) => void;
-		removeResourcePack: (name: string) => void;
+		chooseInstallDirectory: () => void;
 	};
 
 	let {
-		builds,
 		activeBuild,
-		selectedBuildId,
 		presets,
+		installDirectory,
 		closeSettings,
-		selectBuild,
 		setPreset,
-		setRamFromInput,
-		setJavaPath,
-		useSuggestedJavaPath,
-		toggleMod,
-		addShaderFiles,
-		addResourcePackFiles,
-		removeShader,
-		removeResourcePack,
+		chooseInstallDirectory,
 	}: Props = $props();
 
 	function closeFromBackdrop(event: MouseEvent) {
-		if (event.target === event.currentTarget) {
-			closeSettings();
-		}
+		if (event.target === event.currentTarget) closeSettings();
 	}
 
 	function closeFromKeyboard(event: KeyboardEvent) {
-		if (event.key === 'Escape') {
-			closeSettings();
-		}
+		if (event.key === 'Escape') closeSettings();
 	}
 </script>
 
@@ -83,20 +61,11 @@
 
 		<div class="settings-window-body">
 			<BuildSection
-				{builds}
 				{activeBuild}
-				{selectedBuildId}
 				{presets}
-				{selectBuild}
+				{installDirectory}
 				{setPreset}
-				{setRamFromInput}
-				{setJavaPath}
-				{useSuggestedJavaPath}
-				{toggleMod}
-				{addShaderFiles}
-				{addResourcePackFiles}
-				{removeShader}
-				{removeResourcePack}
+				{chooseInstallDirectory}
 			/>
 		</div>
 	</div>

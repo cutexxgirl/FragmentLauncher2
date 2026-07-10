@@ -1,5 +1,50 @@
 import { invoke } from '@tauri-apps/api/core';
 
+export type BuildChannel = 'stable' | 'dev';
+export type BuildPreset = 'low' | 'medium' | 'high';
+export type BuildPhase =
+	| 'checking'
+	| 'notInstalled'
+	| 'outdated'
+	| 'repairNeeded'
+	| 'ready'
+	| 'authorizing'
+	| 'downloading'
+	| 'updating'
+	| 'repairing'
+	| 'verifying'
+	| 'launching'
+	| 'running'
+	| 'subscriptionRequired'
+	| 'devForbidden'
+	| 'authUnavailable'
+	| 'diskInsufficient'
+	| 'launcherUpdateRequired'
+	| 'error';
+
+export type BuildPrimaryAction = 'download' | 'update' | 'repair' | 'play' | 'busy' | 'blocked';
+
+export type BuildStatus = {
+	channel: BuildChannel;
+	preset: BuildPreset;
+	phase: BuildPhase;
+	primaryAction: BuildPrimaryAction;
+	installDirectory: string | null;
+	installedReleaseId: string | null;
+	availableReleaseId: string | null;
+	message: string;
+	operationActive: boolean;
+	progress: {
+		currentFile: string | null;
+		downloadedBytes: number;
+		totalBytes: number;
+		speedBytesPerSecond: number;
+		remainingBytes: number;
+		diskFreeBytes: number;
+		diskRequiredBytes: number;
+	};
+};
+
 export type LauncherStatus = {
 	appName: string;
 	version: string;
@@ -50,6 +95,21 @@ export async function getLauncherStatus(): Promise<LauncherStatus> {
 	} catch {
 		return fallbackStatus;
 	}
+}
+
+export async function getBuildStatus(
+	channel: BuildChannel,
+	preset: BuildPreset,
+): Promise<BuildStatus> {
+	return invoke<BuildStatus>('build_status', { channel, preset });
+}
+
+export async function setBuildInstallDirectory(
+	path: string,
+	channel: BuildChannel,
+	preset: BuildPreset,
+): Promise<BuildStatus> {
+	return invoke<BuildStatus>('set_build_install_directory', { path, channel, preset });
 }
 
 export async function openExternalUrl(url: string): Promise<void> {

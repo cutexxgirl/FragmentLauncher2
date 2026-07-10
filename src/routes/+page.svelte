@@ -4,6 +4,7 @@
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
+	import { open } from '@tauri-apps/plugin-dialog';
 	import {
 		clearStoredAuthSession,
 		createTelegramLoginChallenge,
@@ -19,9 +20,13 @@
 	} from '$lib/fragment-api';
 	import {
 		getLauncherStatus,
+		getBuildStatus,
 		getTgWsProxyStatus,
 		installTgWsProxy,
 		openTelegramAppUrl,
+		setBuildInstallDirectory,
+		type BuildChannel,
+		type BuildStatus,
 		type TgWsProxyStatus,
 	} from '$lib/launcher';
 	import {
@@ -55,7 +60,7 @@
 	let bootLabel = $state('Поднимаем оболочку');
 	let bootPhase = $state<BootPhase>('boot');
 	let activeSection = $state<SectionId>('home');
-	let selectedBuildId = $state('fragment-origin');
+	let selectedBuildId = $state('fragment-stable');
 	let nickname = $state('');
 	let nicknameSaveMessage = $state('');
 	let nicknameSaving = $state(false);
@@ -86,6 +91,27 @@
 	let telegramHelpTimer: number | null = null;
 
 	let builds = $state<BuildProfile[]>(createBuildProfiles());
+	let buildStatusRequestGeneration = 0;
+	let buildStatus = $state<BuildStatus>({
+		channel: 'stable',
+		preset: 'medium',
+		phase: 'checking',
+		primaryAction: 'busy',
+		installDirectory: null,
+		installedReleaseId: null,
+		availableReleaseId: null,
+		message: 'Проверяем состояние сборки…',
+		operationActive: false,
+		progress: {
+			currentFile: null,
+			downloadedBytes: 0,
+			totalBytes: 0,
+			speedBytesPerSecond: 0,
+			remainingBytes: 0,
+			diskFreeBytes: 0,
+			diskRequiredBytes: 0,
+		},
+	});
 
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
@@ -93,9 +119,25 @@
 	let appVisible = $derived(launcherVisible && userIsSignedIn);
 	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
+	let activeChannel = $derived<BuildChannel>(activeBuild.channel);
 	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
+	let subscriptionName = $derived(
+		({
+			none: 'Нет доступа',
+			novice: 'Новичок',
+			legend: 'Легенда',
+			spark: 'Искра',
+		})[authSession?.profile.entitlement.level ?? 'none'],
+	);
+	let hasDevAccess = $derived(
+		authSession?.profile.launcherPermissions?.includes('launcher.channel.dev') ?? false,
+	);
+	let visibleBuilds = $derived(builds.filter((build) => build.channel === 'stable' || hasDevAccess));
 	let availableBuildsCount = $derived(
-		builds.filter((build) => build.access === 'available' || hasActiveSubscription).length,
+		builds.filter(
+			(build) =>
+				hasActiveSubscription && (build.channel === 'stable' || (build.channel === 'dev' && hasDevAccess)),
+		).length,
 	);
 	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
 	let telegramAvatarUrl = $derived(resolveTelegramAvatarUrl(authSession?.profile));
@@ -104,6 +146,20 @@
 	let supportReady = $derived(
 		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
 	);
+
+	$effect(() => {
+		if (!visibleBuilds.some((build) => build.id === selectedBuildId)) {
+			selectedBuildId = 'fragment-stable';
+		}
+	});
+
+	$effect(() => {
+		if (authState === 'signed-in') {
+			authSession?.profile.entitlement.active;
+			authSession?.profile.launcherPermissions;
+			void refreshBuildStatus();
+		}
+	});
 
 	const navigation = [
 		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
@@ -116,6 +172,7 @@
 		}
 
 		void restoreAuthSession();
+		void refreshBuildStatus();
 		void runBootSequence();
 
 		return () => {
@@ -414,7 +471,10 @@
 	}
 
 	function selectBuild(buildId: string) {
+		const build = visibleBuilds.find((candidate) => candidate.id === buildId);
+		if (!build) return;
 		selectedBuildId = buildId;
+		window.setTimeout(() => void refreshBuildStatus(), 0);
 	}
 
 	function openSection(section: SectionId) {
@@ -437,62 +497,114 @@
 	}
 
 	function setPreset(presetId: PresetId) {
-		const preset = presets.find((item) => item.id === presetId);
-
 		activeBuild.preset = presetId;
 
-		if (preset) {
-			activeBuild.selectedRam = preset.ram;
+		void refreshBuildStatus();
+	}
+
+	async function refreshBuildStatus() {
+		if (!(typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window)) return;
+		const requestGeneration = ++buildStatusRequestGeneration;
+		const channel = activeChannel;
+		const preset = activeBuild.preset;
+		try {
+			const localStatus = await getBuildStatus(channel, preset);
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			buildStatus = applyAccessOverlay(localStatus, channel);
+		} catch (error) {
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				error instanceof Error ? error.message : 'Не удалось проверить сборку.',
+			);
 		}
 	}
 
-	function setRamFromInput(event: Event) {
-		const input = event.currentTarget as HTMLInputElement;
-		activeBuild.selectedRam = Number(input.value);
-	}
-
-	function setJavaPath(event: Event) {
-		const input = event.currentTarget as HTMLInputElement;
-		activeBuild.javaPath = input.value;
-	}
-
-	function useSuggestedJavaPath() {
-		activeBuild.javaPath = 'C:\\Program Files\\Eclipse Adoptium\\jdk-21\\bin\\javaw.exe';
-	}
-
-	function toggleMod(modId: string) {
-		const mod = activeBuild.mods.find((item) => item.id === modId);
-
-		if (mod) {
-			mod.enabled = !mod.enabled;
+	async function chooseInstallDirectory() {
+		try {
+			const selected = await open({ directory: true, multiple: false, title: 'Папка Fragment' });
+			if (typeof selected !== 'string') return;
+			const requestGeneration = ++buildStatusRequestGeneration;
+			const channel = activeChannel;
+			const preset = activeBuild.preset;
+			const localStatus = await setBuildInstallDirectory(selected, channel, preset);
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			buildStatus = applyAccessOverlay(localStatus, channel);
+		} catch (error) {
+			buildStatus = errorBuildStatus(
+				activeChannel,
+				activeBuild.preset,
+				error instanceof Error ? error.message : 'Не удалось выбрать папку Fragment.',
+			);
 		}
 	}
 
-	function addShaderFiles(event: Event) {
-		const input = event.currentTarget as HTMLInputElement;
-		const fileNames = Array.from(input.files ?? []).map((file) => file.name);
-
-		activeBuild.shaders = [...new Set([...activeBuild.shaders, ...fileNames])].slice(0, 8);
-		input.value = '';
+	function errorBuildStatus(channel: BuildChannel, preset: PresetId, message: string): BuildStatus {
+		return {
+			channel,
+			preset,
+			phase: 'error',
+			primaryAction: 'blocked',
+			installDirectory: buildStatus.installDirectory,
+			installedReleaseId: null,
+			availableReleaseId: null,
+			message,
+			operationActive: false,
+			progress: {
+				currentFile: null,
+				downloadedBytes: 0,
+				totalBytes: 0,
+				speedBytesPerSecond: 0,
+				remainingBytes: 0,
+				diskFreeBytes: 0,
+				diskRequiredBytes: 0,
+			},
+		};
 	}
 
-	function addResourcePackFiles(event: Event) {
-		const input = event.currentTarget as HTMLInputElement;
-		const fileNames = Array.from(input.files ?? []).map((file) => file.name);
-
-		activeBuild.resourcePacks = [...new Set([...activeBuild.resourcePacks, ...fileNames])].slice(
-			0,
-			8,
+	function isCurrentBuildRequest(
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+	) {
+		return (
+			requestGeneration === buildStatusRequestGeneration &&
+			channel === activeChannel &&
+			preset === activeBuild.preset
 		);
-		input.value = '';
 	}
 
-	function removeShader(name: string) {
-		activeBuild.shaders = activeBuild.shaders.filter((item) => item !== name);
+	function applyAccessOverlay(localStatus: BuildStatus, channel: BuildChannel): BuildStatus {
+		if (!(authSession?.profile.entitlement.active ?? false)) {
+			return {
+				...localStatus,
+				phase: 'subscriptionRequired',
+				primaryAction: 'blocked',
+				message: 'Для запуска нужна активная подписка или подаренный доступ.',
+			};
+		}
+		if (channel === 'dev' && !hasDevAccess) {
+			return {
+				...localStatus,
+				phase: 'devForbidden',
+				primaryAction: 'blocked',
+				message: 'Dev-канал доступен только тестерам и разработчикам.',
+			};
+		}
+		return localStatus;
 	}
 
-	function removeResourcePack(name: string) {
-		activeBuild.resourcePacks = activeBuild.resourcePacks.filter((item) => item !== name);
+	async function handlePrimaryBuildAction() {
+		if (buildStatus.primaryAction === 'download' && !buildStatus.installDirectory) {
+			await chooseInstallDirectory();
+			return;
+		}
+		buildStatus = errorBuildStatus(
+			activeChannel,
+			activeBuild.preset,
+			'Операция ещё не подключена в этой dev-ветке лаунчера.',
+		);
 	}
 
 	function submitSupportRequest(event: SubmitEvent) {
@@ -596,13 +708,15 @@
 				<div class="workspace min-h-0 flex-1 overflow-y-auto px-6 py-6">
 					{#if activeSection === 'home'}
 						<HomeSection
-							{builds}
+							builds={visibleBuilds}
 							{activeBuild}
 							{selectedBuildId}
 							{feedItems}
 							{feedImages}
+							{buildStatus}
 							{selectBuild}
 							openSettings={() => (settingsVisible = true)}
+							primaryAction={handlePrimaryBuildAction}
 						/>
 					{/if}
 				</div>
@@ -611,21 +725,12 @@
 
 		{#if settingsVisible}
 			<SettingsWindow
-				{builds}
 				{activeBuild}
-				{selectedBuildId}
 				{presets}
+				installDirectory={buildStatus.installDirectory}
 				closeSettings={() => (settingsVisible = false)}
-				{selectBuild}
 				{setPreset}
-				{setRamFromInput}
-				{setJavaPath}
-				{useSuggestedJavaPath}
-				{toggleMod}
-				{addShaderFiles}
-				{addResourcePackFiles}
-				{removeShader}
-				{removeResourcePack}
+				{chooseInstallDirectory}
 			/>
 		{/if}
 
@@ -662,6 +767,9 @@
 				{nicknameSaving}
 				{nicknameSaveMessage}
 				{availableBuildsCount}
+				subscriptionActive={hasActiveSubscription}
+				{subscriptionName}
+				{hasDevAccess}
 				{saveLauncherNickname}
 				{logoutFromTelegram}
 				closeProfile={closeProfileWindow}

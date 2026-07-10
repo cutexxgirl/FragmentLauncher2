@@ -2,13 +2,20 @@
 	import {
 		ChevronLeft,
 		ChevronRight,
+		Download,
+		HardDrive,
+		LockKeyhole,
+		LoaderCircle,
 		Menu,
 		Package,
 		Play,
 		RefreshCw,
 		Settings,
+		ShieldCheck,
+		TriangleAlert,
 	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
+	import type { BuildStatus } from '$lib/launcher';
 	import type { BuildProfile, FeedCategory, FeedItem } from '$lib/launcher-ui';
 
 	type Props = {
@@ -17,8 +24,10 @@
 		selectedBuildId: string;
 		feedItems: FeedItem[];
 		feedImages: string[];
+		buildStatus: BuildStatus;
 		selectBuild: (buildId: string) => void;
 		openSettings: () => void;
+		primaryAction: () => void;
 	};
 
 	let {
@@ -27,8 +36,10 @@
 		selectedBuildId,
 		feedItems,
 		feedImages,
+		buildStatus,
 		selectBuild,
 		openSettings,
+		primaryAction,
 	}: Props = $props();
 
 	let activeCategory = $state<FeedCategory>('news');
@@ -39,7 +50,18 @@
 	let carouselImages = $derived(feedImages.slice(0, 8));
 	let imageCount = $derived(carouselImages.length);
 	let activeImage = $derived(carouselImages[activeImageIndex] ?? carouselImages[0] ?? '');
-	let buildReleaseName = $derived(activeBuild.id === 'fragment-origin' ? 'Claws & Bloom' : '');
+	let buildReleaseName = $derived(activeBuild.id === 'fragment-stable' ? 'Claws & Bloom' : '');
+	let actionUnavailable = $derived(
+		buildStatus.primaryAction === 'busy' || buildStatus.primaryAction === 'blocked',
+	);
+	let showStatusPopover = $derived(
+		buildStatus.operationActive ||
+			buildStatus.primaryAction === 'blocked' ||
+			buildStatus.primaryAction === 'busy',
+	);
+	let projectedFreeBytes = $derived(
+		Math.max(0, buildStatus.progress.diskFreeBytes - buildStatus.progress.diskRequiredBytes),
+	);
 
 	onMount(() => {
 		const timer = window.setInterval(() => {
@@ -66,6 +88,36 @@
 	function openSettingsWindow() {
 		buildMenuOpen = false;
 		openSettings();
+	}
+
+	function runPrimaryAction() {
+		if (actionUnavailable) return;
+		primaryAction();
+	}
+
+	function formatBytes(value: number) {
+		if (!Number.isFinite(value) || value <= 0) return '0 Б';
+		const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+		const unit = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+		const amount = value / 1024 ** unit;
+		return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+	}
+
+	function actionLabel() {
+		switch (buildStatus.primaryAction) {
+			case 'download':
+				return 'Скачать';
+			case 'update':
+				return 'Обновить';
+			case 'repair':
+				return 'Исправить';
+			case 'play':
+				return 'Играть';
+			case 'busy':
+				return 'Подождите';
+			default:
+				return 'Недоступно';
+		}
 	}
 </script>
 
@@ -138,10 +190,78 @@
 	</section>
 
 	<div class="home-actions">
-		<button type="button" class="play-button home-play">
-			<Play size={18} fill="currentColor" />
-			<span>Играть</span>
-		</button>
+		<div class="primary-action-wrap">
+			{#if showStatusPopover}
+				<div class="operation-status-popover" id="build-action-status" role="status">
+					<div class="operation-status-head">
+						<strong>{buildStatus.message}</strong>
+						{#if buildStatus.operationActive}
+							<span>{formatBytes(buildStatus.progress.speedBytesPerSecond)}/с</span>
+						{/if}
+					</div>
+					{#if buildStatus.operationActive}
+						<div
+							class="operation-progress-track"
+							role="progressbar"
+							aria-label="Прогресс загрузки сборки"
+							aria-valuemin="0"
+							aria-valuemax="100"
+							aria-valuenow={buildStatus.progress.totalBytes > 0
+								? Math.round(
+										Math.min(
+											100,
+											(buildStatus.progress.downloadedBytes / buildStatus.progress.totalBytes) * 100,
+										),
+									)
+								: 0}
+						>
+							<span
+								style={`width: ${buildStatus.progress.totalBytes > 0 ? Math.min(100, (buildStatus.progress.downloadedBytes / buildStatus.progress.totalBytes) * 100) : 0}%`}
+							></span>
+						</div>
+						<div class="operation-status-grid">
+							<span>Загружено</span>
+							<strong>{formatBytes(buildStatus.progress.downloadedBytes)}</strong>
+							<span>Осталось скачать</span>
+							<strong>{formatBytes(buildStatus.progress.remainingBytes)}</strong>
+							<span><HardDrive size={13} /> Требуется</span>
+							<strong>{formatBytes(buildStatus.progress.diskRequiredBytes)}</strong>
+							<span><HardDrive size={13} /> Будет свободно</span>
+							<strong>{formatBytes(projectedFreeBytes)}</strong>
+						</div>
+						{#if buildStatus.progress.currentFile}
+							<p class="operation-current-file">{buildStatus.progress.currentFile}</p>
+						{/if}
+					{/if}
+				</div>
+			{/if}
+
+			<button
+				type="button"
+				class="play-button home-play"
+				class:blocked={actionUnavailable}
+				aria-disabled={actionUnavailable}
+				aria-describedby={showStatusPopover ? 'build-action-status' : undefined}
+				onclick={runPrimaryAction}
+			>
+				{#if buildStatus.primaryAction === 'download'}
+					<Download size={18} />
+				{:else if buildStatus.primaryAction === 'update'}
+					<RefreshCw size={18} />
+				{:else if buildStatus.primaryAction === 'repair'}
+					<ShieldCheck size={18} />
+				{:else if buildStatus.primaryAction === 'busy'}
+					<LoaderCircle size={18} class="spin-icon" />
+				{:else if buildStatus.primaryAction === 'blocked' && buildStatus.phase === 'error'}
+					<TriangleAlert size={18} />
+				{:else if buildStatus.primaryAction === 'blocked'}
+					<LockKeyhole size={18} />
+				{:else}
+					<Play size={18} fill="currentColor" />
+				{/if}
+				<span>{actionLabel()}</span>
+			</button>
+		</div>
 
 		<div class="build-menu">
 			<button
@@ -173,9 +293,14 @@
 						<Settings size={16} />
 						<span>Настройки сборки</span>
 					</button>
-					<button type="button" class="menu-action">
+					<button
+						type="button"
+						class="menu-action"
+						disabled
+						title="Будет подключено вместе с TUF-клиентом"
+					>
 						<RefreshCw size={16} />
-						<span>Проверить файлы</span>
+						<span>Проверка файлов — следующий этап</span>
 					</button>
 				</div>
 			{/if}
