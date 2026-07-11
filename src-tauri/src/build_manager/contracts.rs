@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use unicode_normalization::UnicodeNormalization;
 
@@ -8,7 +8,7 @@ pub const JAVA_IMAGE_TYPE: &str = "jre";
 pub const JAVA_VM: &str = "hotspot";
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeLock {
     pub schema_version: u8,
     pub id: String,
@@ -18,7 +18,7 @@ pub struct RuntimeLock {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeJava {
     pub major: u8,
     pub architecture: String,
@@ -35,14 +35,14 @@ pub struct RuntimeJava {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeLicense {
     pub spdx: String,
     pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeArchive {
     pub url: String,
     pub checksum_url: String,
@@ -55,7 +55,7 @@ pub struct RuntimeArchive {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeFile {
     pub path: String,
     pub size: u64,
@@ -63,7 +63,7 @@ pub struct RuntimeFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeMinecraft {
     pub version: String,
     pub version_manifest_url: String,
@@ -72,7 +72,7 @@ pub struct RuntimeMinecraft {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct MutableSettingsFile {
     pub path: String,
     pub validator: MutableValidator,
@@ -83,7 +83,7 @@ pub struct MutableSettingsFile {
     pub fields: Vec<MutableSettingField>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum MutableValidator {
     #[serde(rename = "minecraft-options-v1")]
     MinecraftOptionsV1,
@@ -98,7 +98,7 @@ pub enum MutableValidator {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct MutableSettingField {
     pub setting_id: String,
     pub scope: SettingScope,
@@ -116,7 +116,7 @@ pub enum SettingScope {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SettingSelector {
     Exact { key: String },
     Prefix { prefix: String },
@@ -126,8 +126,7 @@ pub enum SettingSelector {
 #[serde(
     tag = "type",
     rename_all = "lowercase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub enum SettingValueRule {
     Boolean,
@@ -319,7 +318,7 @@ impl MutableSettingsFile {
     }
 }
 
-pub fn validate_manifest_path(path: &str) -> Result<(), String> {
+pub(super) fn validate_manifest_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.contains('\\')
         || path.starts_with('/')
@@ -356,7 +355,7 @@ fn is_reserved_windows_name(segment: &str) -> bool {
             && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
-fn is_sha256(value: &str) -> bool {
+pub(super) fn is_sha256(value: &str) -> bool {
     is_lower_hex(value, 64)
 }
 
@@ -367,7 +366,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn valid_java25_version(value: &str) -> bool {
+pub(super) fn valid_java25_version(value: &str) -> bool {
     let Some((feature, build)) = value.split_once('+') else {
         return false;
     };
@@ -383,7 +382,7 @@ fn numeric_component(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn valid_setting_id(value: &str) -> bool {
+pub(super) fn valid_setting_id(value: &str) -> bool {
     (3..=128).contains(&value.len())
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
@@ -557,9 +556,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_security_fields() {
+    fn accepts_unknown_optional_runtime_fields_but_rejects_unknown_schema() {
         let mut lock = runtime_lock();
+        lock["futureTopLevel"] = serde_json::json!({ "enabled": true });
+        lock["java"]["futureRuntimeMetadata"] = serde_json::json!("optional");
+        lock["java"]["license"]["noticeUrl"] = serde_json::json!("https://example.invalid");
         lock["java"]["archive"]["fallbackUrl"] = serde_json::json!("https://evil.invalid");
+        lock["java"]["files"][0]["mode"] = serde_json::json!("executable");
+        lock["minecraft"]["releaseTime"] = serde_json::json!("future metadata");
+        let bytes = serde_json::to_vec(&lock).expect("fixture must serialize");
+        assert!(RuntimeLock::parse_and_validate(&bytes).is_ok());
+
+        lock["schemaVersion"] = serde_json::json!(2);
         let bytes = serde_json::to_vec(&lock).expect("fixture must serialize");
         assert!(RuntimeLock::parse_and_validate(&bytes).is_err());
     }

@@ -1,10 +1,24 @@
 #[allow(dead_code)]
+mod cas;
+#[allow(dead_code)]
 mod contracts;
 #[allow(dead_code)]
 mod mutable;
 #[allow(dead_code)]
 mod neoforge;
+#[allow(dead_code)]
+mod release;
+#[allow(dead_code)]
+mod runtime;
+#[allow(dead_code)]
+mod settings_store;
+#[allow(dead_code)]
+mod spark_client;
 mod storage;
+#[allow(dead_code)]
+mod tuf;
+#[allow(dead_code)]
+mod tuf_transport;
 mod types;
 
 use std::{path::PathBuf, sync::RwLock};

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
@@ -219,11 +219,27 @@ fn claim_or_verify_directory(path: &Path) -> Result<OwnerMarker, String> {
 
 fn verify_owner_marker(path: &Path) -> Result<OwnerMarker, String> {
     let marker_path = path.join(OWNER_MARKER);
-    let marker: OwnerMarker = serde_json::from_slice(
-        &fs::read(&marker_path)
-            .map_err(|_| "Папка не принадлежит Fragment Launcher: отсутствует защитный маркер.")?,
-    )
-    .map_err(|_| "Защитный маркер папки Fragment повреждён.")?;
+    let mut file = open_regular_single_link(&marker_path, false).map_err(|_| {
+        "Папка не принадлежит Fragment Launcher: отсутствует безопасный защитный маркер."
+    })?;
+    let length = file
+        .metadata()
+        .map_err(|_| "Не удалось проверить защитный маркер Fragment.")?
+        .len();
+    const MAX_OWNER_MARKER_BYTES: u64 = 4096;
+    if length == 0 || length > MAX_OWNER_MARKER_BYTES {
+        return Err("Защитный маркер Fragment имеет небезопасный размер.".into());
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_OWNER_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Не удалось прочитать защитный маркер Fragment.")?;
+    if bytes.len() as u64 != length {
+        return Err("Защитный маркер Fragment изменился во время проверки.".into());
+    }
+    let marker: OwnerMarker =
+        serde_json::from_slice(&bytes).map_err(|_| "Защитный маркер папки Fragment повреждён.")?;
     if marker.schema_version != 1 || marker.owner != "fragment-launcher" {
         return Err("Защитный маркер папки Fragment не распознан.".into());
     }
@@ -237,6 +253,11 @@ fn ensure_managed_layout(path: &Path) -> Result<(), String> {
         "cache/objects",
         "runtime/java",
         "runtime/minecraft",
+        "staging",
+        "backups",
+        "state/settings/v1/stable",
+        "state/settings/v1/dev",
+        "state/journals",
     ] {
         let managed = path.join(relative);
         inspect_existing_ancestors(&managed)?;
@@ -277,7 +298,7 @@ fn probe_filesystem(path: &Path) -> Result<(), String> {
     result
 }
 
-fn inspect_existing_ancestors(path: &Path) -> Result<(), String> {
+pub(super) fn inspect_existing_ancestors(path: &Path) -> Result<(), String> {
     for ancestor in path.ancestors() {
         if !ancestor.exists() {
             continue;
@@ -295,8 +316,112 @@ fn inspect_existing_ancestors(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn open_regular_single_link(path: &Path, write: bool) -> Result<fs::File, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Cannot inspect managed file {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Managed file is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(write)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| format!("Cannot open managed file {}: {error}", path.display()))?
+    };
+    #[cfg(not(windows))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(path)
+        .map_err(|error| format!("Cannot open managed file {}: {error}", path.display()))?;
+
+    validate_regular_single_link_handle(&file, path)?;
+    Ok(file)
+}
+
+pub(super) fn open_or_create_regular_single_link(path: &Path) -> Result<fs::File, String> {
+    match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => {
+            validate_regular_single_link_handle(&file, path)?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            open_regular_single_link(path, true)
+        }
+        Err(error) => Err(format!(
+            "Cannot create managed file {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn validate_regular_single_link_handle(file: &fs::File, path: &Path) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Cannot inspect managed file handle: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Managed file handle is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        };
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        let handle = HANDLE(file.as_raw_handle().cast::<core::ffi::c_void>());
+        if handle.0.is_null() {
+            return Err(format!(
+                "Managed file handle is invalid: {}",
+                path.display()
+            ));
+        }
+        unsafe { GetFileInformationByHandle(handle, &mut information) }
+            .map_err(|error| format!("Cannot inspect managed file handle: {error}"))?;
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || information.nNumberOfLinks != 1
+        {
+            return Err(format!(
+                "Managed file is a reparse point or hard link: {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file
+            .metadata()
+            .map_err(|error| format!("Cannot inspect managed file: {error}"))?
+            .nlink()
+            != 1
+        {
+            return Err(format!("Managed file is a hard link: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
-fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
+pub(super) fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -368,7 +493,7 @@ fn reject_windows_network_path(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
         core::PCWSTR,
@@ -394,7 +519,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
     fs::rename(source, destination)
         .map_err(|error| format!("Не удалось атомарно применить настройки: {error}"))
 }

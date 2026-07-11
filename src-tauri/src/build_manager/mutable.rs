@@ -12,7 +12,7 @@ pub struct SanitizedSettings {
     pub reset_keys: Vec<String>,
 }
 
-type SettingValues = BTreeMap<String, String>;
+pub(super) type SettingValues = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -46,10 +46,71 @@ impl MutableSettingsState {
             return Err("Unsupported mutable settings state version".into());
         }
         for field in &policy.fields {
-            migrate_bucket(&mut self.profile, field);
-            for preset in self.presets.values_mut() {
-                migrate_bucket(preset, field);
+            match field.scope {
+                SettingScope::Profile => {
+                    migrate_bucket(&mut self.profile, field)?;
+                    for preset in self.presets.values_mut() {
+                        remove_field_identities(preset, field);
+                    }
+                }
+                SettingScope::Preset => {
+                    remove_field_identities(&mut self.profile, field);
+                    for preset in self.presets.values_mut() {
+                        migrate_bucket(preset, field)?;
+                    }
+                }
             }
+        }
+        Ok(())
+    }
+
+    pub fn migrate_all(&mut self, policies: &[MutableSettingsFile]) -> Result<(), String> {
+        if self.schema_version != settings_state_version() {
+            return Err("Unsupported mutable settings state version".into());
+        }
+        if self.profile.len() > 512
+            || self.presets.len() > 3
+            || self
+                .presets
+                .keys()
+                .any(|preset| !matches!(preset.as_str(), "low" | "medium" | "high"))
+        {
+            return Err("Mutable settings state exceeds structural limits".into());
+        }
+        let mut fields = BTreeMap::new();
+        for policy in policies {
+            policy.validate()?;
+            for field in &policy.fields {
+                if fields.insert(field.setting_id.clone(), field).is_some() {
+                    return Err("Duplicate settingId across mutable policies".into());
+                }
+            }
+            self.migrate(policy)?;
+        }
+
+        self.profile.retain(|setting_id, values| {
+            fields.get(setting_id).is_some_and(|field| {
+                field.scope == SettingScope::Profile && retain_valid_values(values, field)
+            })
+        });
+        for preset in self.presets.values_mut() {
+            if preset.len() > 512 {
+                return Err("Mutable preset settings exceed structural limits".into());
+            }
+            preset.retain(|setting_id, values| {
+                fields.get(setting_id).is_some_and(|field| {
+                    field.scope == SettingScope::Preset && retain_valid_values(values, field)
+                })
+            });
+        }
+        let pair_count = self
+            .profile
+            .values()
+            .chain(self.presets.values().flat_map(|preset| preset.values()))
+            .try_fold(0_usize, |total, values| total.checked_add(values.len()))
+            .ok_or_else(|| "Mutable settings state pair count overflowed".to_string())?;
+        if pair_count > 16_384 {
+            return Err("Mutable settings state contains too many values".into());
         }
         Ok(())
     }
@@ -353,16 +414,57 @@ fn serialize_options(
     Ok(serialized.into_bytes())
 }
 
-fn migrate_bucket(bucket: &mut BTreeMap<String, SettingValues>, field: &MutableSettingField) {
-    if bucket.contains_key(&field.setting_id) {
-        return;
-    }
+fn migrate_bucket(
+    bucket: &mut BTreeMap<String, SettingValues>,
+    field: &MutableSettingField,
+) -> Result<(), String> {
+    let current_exists = bucket.contains_key(&field.setting_id);
+    let mut migrated = None;
+    let mut alias_count = 0_usize;
     for old_id in &field.renamed_from {
         if let Some(values) = bucket.remove(old_id) {
-            bucket.insert(field.setting_id.clone(), values);
-            return;
+            alias_count += 1;
+            if migrated.is_none() {
+                migrated = Some(values);
+            }
         }
     }
+    if current_exists {
+        return Ok(());
+    }
+    if alias_count > 1 {
+        return Err(format!(
+            "Mutable settings contain ambiguous aliases for {}",
+            field.setting_id
+        ));
+    }
+    if let Some(values) = migrated {
+        bucket.insert(field.setting_id.clone(), values);
+    }
+    Ok(())
+}
+
+fn remove_field_identities(
+    bucket: &mut BTreeMap<String, SettingValues>,
+    field: &MutableSettingField,
+) {
+    bucket.remove(&field.setting_id);
+    for old_id in &field.renamed_from {
+        bucket.remove(old_id);
+    }
+}
+
+fn retain_valid_values(values: &mut SettingValues, field: &MutableSettingField) -> bool {
+    if values.len() > 8192 {
+        return false;
+    }
+    values.retain(|key, value| {
+        key.len() <= 8192
+            && value.len() <= 8192
+            && selector_matches(&field.selector, key)
+            && validate_value(value, &field.value)
+    });
+    !values.is_empty()
 }
 
 fn validate_preset_id(preset: &str) -> Result<(), String> {
@@ -573,6 +675,29 @@ mod tests {
         );
         assert!(state.presets["low"].contains_key("minecraft.video.render-distance"));
         assert!(!state.presets["low"].contains_key("minecraft.video.old-render-distance"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_renamed_setting_sources() {
+        let mut policy = policy();
+        let quality = policy
+            .fields
+            .iter_mut()
+            .find(|field| field.setting_id == "minecraft.video.render-distance")
+            .expect("quality field must exist");
+        quality.renamed_from = vec![
+            "minecraft.video.old-render-distance".into(),
+            "minecraft.video.legacy-render-distance".into(),
+        ];
+        let mut state = MutableSettingsState::new();
+        let preset = state.presets.entry("low".into()).or_default();
+        for old_id in &quality.renamed_from {
+            preset.insert(
+                old_id.clone(),
+                BTreeMap::from([("renderDistance".into(), "18".into())]),
+            );
+        }
+        assert!(state.migrate(&policy).is_err());
     }
 
     #[test]
