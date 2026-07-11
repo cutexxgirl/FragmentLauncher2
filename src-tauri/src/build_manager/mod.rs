@@ -1,4 +1,8 @@
 #[allow(dead_code)]
+mod contracts;
+#[allow(dead_code)]
+mod mutable;
+#[allow(dead_code)]
 mod neoforge;
 mod storage;
 mod types;

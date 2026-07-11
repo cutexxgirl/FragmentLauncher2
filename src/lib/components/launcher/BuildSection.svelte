@@ -76,7 +76,7 @@
 			<div class="flex items-center gap-3">
 				<Coffee size={20} class="text-accent" />
 				<div>
-					<p class="text-sm font-semibold">Управляемая Java 21</p>
+					<p class="text-sm font-semibold">Temurin Java 25.0.3</p>
 					<p class="text-xs text-muted">Лаунчер установит и проверит runtime сам.</p>
 				</div>
 			</div>

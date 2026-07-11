@@ -54,7 +54,7 @@ export const presets: Preset[] = [
 
 export const feedItems: FeedItem[] = [
 	{ id: 'spark2', category: 'news', date: '11/07', title: 'Spark2: защищённые обновления' },
-	{ id: 'neoforge', category: 'news', date: '11/07', title: 'NeoForge 21.1.235 и Java 21' },
+	{ id: 'neoforge', category: 'news', date: '11/07', title: 'NeoForge 21.1.235 и Temurin Java 25' },
 	{
 		id: 'quality-presets',
 		category: 'announcements',
