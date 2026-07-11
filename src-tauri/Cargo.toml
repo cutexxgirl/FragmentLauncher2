@@ -39,5 +39,5 @@ thiserror = "2"
 unicode-normalization = "0.1.25"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }

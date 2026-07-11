@@ -1,5 +1,10 @@
+pub mod auth;
 pub mod build_manager;
 
+use auth::{
+    AdmissionChannel, AuthError, AuthSessionManager, AuthSnapshot, LauncherAdmissionSnapshot,
+    TelegramLoginSnapshot, TelegramPollSnapshot,
+};
 use build_manager::{BuildChannel, BuildManager, BuildStatus, PresetId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,24 +25,41 @@ const TG_WS_PROXY_DOWNLOAD_URL: &str =
 const TG_WS_PROXY_SHA256: &str = "840f1c7dae30f492a305f8006256cc2e09426be104c14844cb9be44f966c178d";
 const TG_WS_PROXY_PORT: u16 = 1443;
 
-fn is_allowed_external_url(url: &str) -> bool {
-    url.starts_with("https://t.me/")
-        || url.starts_with("https://telegram.me/")
-        || url.starts_with("tg://")
-}
-
 #[cfg(target_os = "windows")]
 fn open_url_with_system(url: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    struct WideSecret(Vec<u16>);
+    impl Drop for WideSecret {
+        fn drop(&mut self) {
+            for unit in &mut self.0 {
+                // The TG proxy link contains a credential-like secret.
+                unsafe { std::ptr::write_volatile(unit, 0) };
+            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
-    Command::new("rundll32.exe")
-        .args(["url.dll,FileProtocolHandler", url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let target = WideSecret(url.encode_utf16().chain(std::iter::once(0)).collect());
+    // SAFETY: both UTF-16 strings are NUL-terminated and live for the call.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.0.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err("the system URL handler could not be opened".into())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -185,7 +207,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let digest = Sha256::digest(&bytes);
 
-    Ok(format!("{:x}", digest))
+    Ok(format!("{digest:x}"))
 }
 
 async fn download_tg_ws_proxy(proxy_path: &Path) -> Result<(), String> {
@@ -407,13 +429,62 @@ fn set_build_install_directory(
     manager.set_install_directory(PathBuf::from(path), channel, preset)
 }
 
-#[tauri::command]
-fn open_external_url(url: String) -> Result<(), String> {
-    if !is_allowed_external_url(&url) {
-        return Err("external URL is not allowed".into());
-    }
+fn map_auth_error(error: AuthError) -> String {
+    error.to_string()
+}
 
-    open_url_with_system(&url)
+#[tauri::command]
+async fn auth_restore(
+    manager: tauri::State<'_, AuthSessionManager>,
+) -> Result<AuthSnapshot, String> {
+    manager.restore().await.map_err(map_auth_error)
+}
+
+#[tauri::command]
+async fn auth_begin_login(
+    manager: tauri::State<'_, AuthSessionManager>,
+) -> Result<TelegramLoginSnapshot, String> {
+    manager.begin_login(None).await.map_err(map_auth_error)
+}
+
+#[tauri::command]
+async fn auth_poll_login(
+    manager: tauri::State<'_, AuthSessionManager>,
+) -> Result<TelegramPollSnapshot, String> {
+    manager.poll_login().await.map_err(map_auth_error)
+}
+
+#[tauri::command]
+async fn auth_refresh_profile(
+    manager: tauri::State<'_, AuthSessionManager>,
+) -> Result<AuthSnapshot, String> {
+    manager.refresh_profile().await.map_err(map_auth_error)
+}
+
+#[tauri::command]
+async fn auth_update_nickname(
+    manager: tauri::State<'_, AuthSessionManager>,
+    nickname: Option<String>,
+) -> Result<AuthSnapshot, String> {
+    manager
+        .update_nickname(nickname.as_deref())
+        .await
+        .map_err(map_auth_error)
+}
+
+#[tauri::command]
+async fn auth_logout(
+    manager: tauri::State<'_, AuthSessionManager>,
+) -> Result<AuthSnapshot, String> {
+    manager.logout().await.map_err(map_auth_error)
+}
+
+#[tauri::command]
+async fn auth_admission(
+    manager: tauri::State<'_, AuthSessionManager>,
+    channel: AdmissionChannel,
+) -> Result<LauncherAdmissionSnapshot, String> {
+    manager.admission(channel).await.map_err(map_auth_error)
 }
 
 #[tauri::command]
@@ -474,7 +545,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let config_path = app.path().app_local_data_dir()?.join("build-manager.json");
+            let app_data_dir = app.path().app_local_data_dir()?;
+            let auth = AuthSessionManager::production(app_data_dir.join("auth-refresh-v2.lock"))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            app.manage(auth);
+            let config_path = app_data_dir.join("build-manager.json");
             app.manage(BuildManager::new(config_path));
             if let Some(window) = app.get_webview_window("main") {
                 configure_windows_frame(&window)?;
@@ -494,7 +569,13 @@ pub fn run() {
             launcher_status,
             build_status,
             set_build_install_directory,
-            open_external_url,
+            auth_restore,
+            auth_begin_login,
+            auth_poll_login,
+            auth_refresh_profile,
+            auth_update_nickname,
+            auth_logout,
+            auth_admission,
             tg_ws_proxy_status,
             install_tg_ws_proxy
         ])

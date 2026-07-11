@@ -6,24 +6,22 @@
 	import { LogicalSize } from '@tauri-apps/api/dpi';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import {
-		clearStoredAuthSession,
-		createTelegramLoginChallenge,
-		getCurrentProfile,
-		loadStoredAuthSession,
-		logoutAuthSession,
-		pollTelegramLoginChallenge,
-		refreshAuthSession,
-		storeAuthSession,
-		updateLauncherNickname,
-		type LauncherAuthSession,
+		beginNativeTelegramLogin,
+		discardLegacyWebviewAuthSession,
+		logoutNativeAuth,
+		pollNativeTelegramLogin,
+		requestNativeAdmission,
+		restoreNativeAuth,
+		updateNativeNickname,
+		type AuthSnapshot,
+		type LauncherAdmissionReason,
 		type LauncherProfile,
-	} from '$lib/fragment-api';
+	} from '$lib/native-auth';
 	import {
 		getLauncherStatus,
 		getBuildStatus,
 		getTgWsProxyStatus,
 		installTgWsProxy,
-		openTelegramAppUrl,
 		setBuildInstallDirectory,
 		type BuildChannel,
 		type BuildStatus,
@@ -79,9 +77,8 @@
 	let anonymizeAnalytics = $state(true);
 	let includeDiagnosticsInSupport = $state(false);
 	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
-	let authSession = $state<LauncherAuthSession | null>(null);
+	let authSnapshot = $state<AuthSnapshot | null>(null);
 	let authState = $state<AuthState>('checking');
-	let telegramLoginLink = $state<string | null>(null);
 	let showTelegramHelpPill = $state(false);
 	let telegramHelpVisible = $state(false);
 	let tgWsProxyStatus = $state<TgWsProxyStatus | null>(null);
@@ -115,22 +112,24 @@
 
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
-	let userIsSignedIn = $derived(authState === 'signed-in' && authSession !== null);
+	let userIsSignedIn = $derived(
+		authState === 'signed-in' && authSnapshot?.authenticated === true && authSnapshot.profile !== null,
+	);
 	let appVisible = $derived(launcherVisible && userIsSignedIn);
 	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
 	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
 	let activeChannel = $derived<BuildChannel>(activeBuild.channel);
-	let hasActiveSubscription = $derived(authSession?.profile.entitlement.active ?? false);
+	let hasActiveSubscription = $derived(authSnapshot?.profile?.entitlement.active ?? false);
 	let subscriptionName = $derived(
 		({
 			none: 'Нет доступа',
 			novice: 'Новичок',
 			legend: 'Легенда',
 			spark: 'Искра',
-		})[authSession?.profile.entitlement.level ?? 'none'],
+		})[authSnapshot?.profile?.entitlement.level ?? 'none'],
 	);
 	let hasDevAccess = $derived(
-		authSession?.profile.launcherPermissions?.includes('launcher.channel.dev') ?? false,
+		authSnapshot?.profile?.launcherPermissions?.includes('launcher.channel.dev') ?? false,
 	);
 	let visibleBuilds = $derived(builds.filter((build) => build.channel === 'stable' || hasDevAccess));
 	let availableBuildsCount = $derived(
@@ -139,9 +138,9 @@
 				hasActiveSubscription && (build.channel === 'stable' || (build.channel === 'dev' && hasDevAccess)),
 		).length,
 	);
-	let telegramAccount = $derived(formatTelegramAccount(authSession?.profile));
-	let telegramAvatarUrl = $derived(resolveTelegramAvatarUrl(authSession?.profile));
-	let savedLauncherNick = $derived(authSession?.profile.launcherNick ?? '');
+	let telegramAccount = $derived(formatTelegramAccount(authSnapshot?.profile ?? undefined));
+	let telegramAvatarUrl = $derived(resolveTelegramAvatarUrl(authSnapshot?.profile ?? undefined));
+	let savedLauncherNick = $derived(authSnapshot?.profile?.launcherNick ?? '');
 	let nicknameDirty = $derived(normalizeLauncherNickname(nickname) !== savedLauncherNick);
 	let supportReady = $derived(
 		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
@@ -155,8 +154,8 @@
 
 	$effect(() => {
 		if (authState === 'signed-in') {
-			authSession?.profile.entitlement.active;
-			authSession?.profile.launcherPermissions;
+			authSnapshot?.profile?.entitlement.active;
+			authSnapshot?.profile?.launcherPermissions;
 			void refreshBuildStatus();
 		}
 	});
@@ -166,6 +165,7 @@
 	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
 
 	onMount(() => {
+		discardLegacyWebviewAuthSession();
 		if ('__TAURI_INTERNALS__' in window) {
 			appWindow = getCurrentWindow();
 			void configureFixedWindow();
@@ -237,58 +237,38 @@
 	}
 
 	async function restoreAuthSession() {
-		const storedSession = loadStoredAuthSession();
-		if (!storedSession) {
-			authState = 'signed-out';
-			return;
-		}
-
 		authState = 'checking';
 		try {
-			const profile = await getCurrentProfile(storedSession.accessToken);
-			authSession = { ...storedSession, profile };
-			storeAuthSession(authSession);
-			syncNicknameFromProfile(profile);
-			authState = 'signed-in';
-			resetTelegramHelpPill();
-			telegramHelpVisible = false;
-		} catch {
-			try {
-				const refreshed = await refreshAuthSession(storedSession.refreshToken);
-				authSession = refreshed;
-				storeAuthSession(refreshed);
-				syncNicknameFromProfile(refreshed.profile);
+			const restored = await restoreNativeAuth();
+			authSnapshot = restored;
+			if (restored.authenticated && restored.profile) {
+				syncNicknameFromProfile(restored.profile);
 				authState = 'signed-in';
 				resetTelegramHelpPill();
 				telegramHelpVisible = false;
-			} catch {
-				clearStoredAuthSession();
-				authSession = null;
+			} else {
 				authState = 'signed-out';
 			}
+		} catch (error) {
+			console.warn('Native auth restore failed', error);
+			authSnapshot = null;
+			authState = 'error';
 		}
 	}
 
 	async function loginWithTelegram() {
-		if (authState === 'waiting' && telegramLoginLink) {
-			await openTelegramAppUrl(telegramLoginLink);
-			if (!showTelegramHelpPill) {
-				scheduleTelegramHelpPill();
-			}
+		if (authState === 'checking' || authState === 'waiting') {
 			return;
 		}
 
 		stopLoginPolling();
-		telegramLoginLink = null;
 		showTelegramHelpPill = false;
 		authState = 'waiting';
 		scheduleTelegramHelpPill();
 
 		try {
-			const challenge = await createTelegramLoginChallenge('Fragment Launcher');
-			telegramLoginLink = challenge.telegramLink;
-			await openTelegramAppUrl(challenge.telegramLink);
-			void pollLoginChallenge(challenge.challengeId, challenge.pollToken, challenge.expiresAt);
+			const challenge = await beginNativeTelegramLogin();
+			void pollLoginChallenge(challenge.expiresAt);
 		} catch (error) {
 			console.warn('Telegram login failed', error);
 			stopTelegramHelpTimer();
@@ -297,7 +277,7 @@
 		}
 	}
 
-	async function pollLoginChallenge(challengeId: string, pollToken: string, expiresAt: string) {
+	async function pollLoginChallenge(expiresAt: string) {
 		if (authState !== 'waiting') {
 			return;
 		}
@@ -308,19 +288,15 @@
 		}
 
 		try {
-			const result = await pollTelegramLoginChallenge(challengeId, pollToken);
+			const result = await pollNativeTelegramLogin();
 			if (result.status === 'confirmed') {
-				authSession = {
-					tokenType: result.tokenType,
-					accessToken: result.accessToken,
-					refreshToken: result.refreshToken,
-					expiresIn: result.expiresIn,
-					profile: result.profile,
-				};
-				storeAuthSession(authSession);
-				syncNicknameFromProfile(authSession.profile);
+				authSnapshot = result.auth;
+				if (!result.auth.authenticated || !result.auth.profile) {
+					authState = 'signed-out';
+					return;
+				}
+				syncNicknameFromProfile(result.auth.profile);
 				authState = 'signed-in';
-				telegramLoginLink = null;
 				resetTelegramHelpPill();
 				telegramHelpVisible = false;
 				return;
@@ -341,30 +317,33 @@
 		}
 
 		loginPollTimer = window.setTimeout(() => {
-			void pollLoginChallenge(challengeId, pollToken, expiresAt);
+			void pollLoginChallenge(expiresAt);
 		}, 1800);
 	}
 
 	async function logoutFromTelegram() {
-		const session = authSession;
 		stopLoginPolling();
-		authSession = null;
-		authState = 'signed-out';
-		telegramLoginLink = null;
-		nickname = '';
-		nicknameSaveMessage = '';
-		resetTelegramHelpPill();
-		telegramHelpVisible = false;
-		settingsVisible = false;
-		launcherSettingsVisible = false;
-		supportVisible = false;
-		profileVisible = false;
-		statsVisible = false;
-		activeSection = 'home';
-		clearStoredAuthSession();
-
-		if (session) {
-			await logoutAuthSession(session.refreshToken).catch(() => undefined);
+		nicknameSaveMessage = 'Завершаем сессию…';
+		try {
+			const signedOut = await logoutNativeAuth();
+			if (signedOut.authenticated) {
+				throw new Error('Native auth did not confirm logout');
+			}
+			authSnapshot = null;
+			authState = 'signed-out';
+			nickname = '';
+			nicknameSaveMessage = '';
+			resetTelegramHelpPill();
+			telegramHelpVisible = false;
+			settingsVisible = false;
+			launcherSettingsVisible = false;
+			supportVisible = false;
+			profileVisible = false;
+			statsVisible = false;
+			activeSection = 'home';
+		} catch (error) {
+			console.warn('Native logout was not completed', error);
+			nicknameSaveMessage = 'Не удалось безопасно выйти. Повторите попытку.';
 		}
 	}
 
@@ -441,15 +420,15 @@
 	}
 
 	async function saveLauncherNickname() {
-		const session = authSession;
-		if (!session || nicknameSaving) {
+		const currentProfile = authSnapshot?.profile;
+		if (!currentProfile || nicknameSaving) {
 			return;
 		}
 
 		const nextNickname = normalizeLauncherNickname(nickname);
 		nickname = nextNickname;
 
-		if (nextNickname === (session.profile.launcherNick ?? '')) {
+		if (nextNickname === (currentProfile.launcherNick ?? '')) {
 			nicknameSaveMessage = '';
 			return;
 		}
@@ -458,9 +437,13 @@
 		nicknameSaveMessage = '';
 
 		try {
-			const profile = await updateLauncherNickname(session.accessToken, nextNickname || null);
-			authSession = { ...session, profile };
-			storeAuthSession(authSession);
+			const updated = await updateNativeNickname(nextNickname || null);
+			authSnapshot = updated;
+			if (!updated.authenticated || !updated.profile) {
+				authState = 'signed-out';
+				return;
+			}
+			const profile = updated.profile;
 			syncNicknameFromProfile(profile);
 			nicknameSaveMessage = profile.launcherNick ? 'Ник сохранён' : 'Ник очищен';
 		} catch (error) {
@@ -510,7 +493,7 @@
 		try {
 			const localStatus = await getBuildStatus(channel, preset);
 			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
-			buildStatus = applyAccessOverlay(localStatus, channel);
+			buildStatus = localStatus;
 		} catch (error) {
 			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
 			buildStatus = errorBuildStatus(
@@ -530,7 +513,7 @@
 			const preset = activeBuild.preset;
 			const localStatus = await setBuildInstallDirectory(selected, channel, preset);
 			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
-			buildStatus = applyAccessOverlay(localStatus, channel);
+			buildStatus = localStatus;
 		} catch (error) {
 			buildStatus = errorBuildStatus(
 				activeChannel,
@@ -575,29 +558,52 @@
 		);
 	}
 
-	function applyAccessOverlay(localStatus: BuildStatus, channel: BuildChannel): BuildStatus {
-		if (!(authSession?.profile.entitlement.active ?? false)) {
-			return {
-				...localStatus,
-				phase: 'subscriptionRequired',
-				primaryAction: 'blocked',
-				message: 'Для запуска нужна активная подписка или подаренный доступ.',
-			};
-		}
-		if (channel === 'dev' && !hasDevAccess) {
-			return {
-				...localStatus,
-				phase: 'devForbidden',
-				primaryAction: 'blocked',
-				message: 'Dev-канал доступен только тестерам и разработчикам.',
-			};
-		}
-		return localStatus;
-	}
-
 	async function handlePrimaryBuildAction() {
 		if (buildStatus.primaryAction === 'download' && !buildStatus.installDirectory) {
 			await chooseInstallDirectory();
+			return;
+		}
+		if (buildStatus.primaryAction === 'play') {
+			const requestGeneration = ++buildStatusRequestGeneration;
+			const channel = activeChannel;
+			const preset = activeBuild.preset;
+			buildStatus = {
+				...buildStatus,
+				phase: 'authorizing',
+				primaryAction: 'busy',
+				message: 'Проверяем право на запуск через FragmentApi…',
+				operationActive: true,
+			};
+			try {
+				const admission = await requestNativeAdmission(channel);
+				if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+				if (!admission.allowed) {
+					if (admission.reason === 'invalid_session') {
+						authSnapshot = null;
+						authState = 'signed-out';
+					}
+					buildStatus = admissionDeniedBuildStatus(channel, preset, admission.reason);
+					return;
+				}
+				if (admission.profile) {
+					authSnapshot = { authenticated: true, profile: admission.profile };
+				}
+				buildStatus = errorBuildStatus(
+					channel,
+					preset,
+					'FragmentApi подтвердил доступ, но запуск Java пока не подключён.',
+				);
+			} catch (error) {
+				if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+				buildStatus = {
+					...errorBuildStatus(
+						channel,
+						preset,
+						error instanceof Error ? error.message : 'FragmentApi не подтвердил право на запуск.',
+					),
+					phase: 'authUnavailable',
+				};
+			}
 			return;
 		}
 		buildStatus = errorBuildStatus(
@@ -605,6 +611,40 @@
 			activeBuild.preset,
 			'Операция ещё не подключена в этой dev-ветке лаунчера.',
 		);
+	}
+
+	function admissionDeniedBuildStatus(
+		channel: BuildChannel,
+		preset: PresetId,
+		reason: LauncherAdmissionReason | null,
+	): BuildStatus {
+		const denied = (phase: BuildStatus['phase'], message: string) => ({
+			...errorBuildStatus(channel, preset, message),
+			phase,
+		});
+		switch (reason) {
+			case 'subscription_required':
+				return denied(
+					'subscriptionRequired',
+					'Для запуска нужна активная подписка либо подаренный доступ.',
+				);
+			case 'dev_access_required':
+				return denied('devForbidden', 'Dev-сборку могут запускать только тестеры и разработчики.');
+			case 'launcher_nickname_required':
+				return denied('error', 'Перед запуском укажите игровой ник в профиле лаунчера.');
+			case 'account_banned':
+				return denied('error', 'Для этого аккаунта запуск Fragment запрещён.');
+			case 'invalid_session':
+				return denied('authUnavailable', 'Сессия завершена. Войдите через Telegram снова.');
+			case 'entitlement_verification_unavailable':
+			case 'launcher_admission_busy':
+			case 'launcher_admission_unavailable':
+			default:
+				return denied(
+					'authUnavailable',
+					'Не удалось подтвердить право на запуск через FragmentApi. Попробуйте ещё раз.',
+				);
+		}
 	}
 
 	function submitSupportRequest(event: SubmitEvent) {
@@ -631,14 +671,14 @@
 
 	function formatTelegramAccount(profile: LauncherProfile | undefined) {
 		if (!profile) {
-			return 'Не подключён';
+			return 'Telegram не подключён';
 		}
 
 		if (profile.username) {
 			return `@${profile.username}`;
 		}
 
-		return profile.telegramId ? `ID ${profile.telegramId}` : 'Telegram подключён';
+		return profile.telegramId ? `ID ${profile.telegramId}` : 'Telegram подключён, имя не указано';
 	}
 
 	function resolveTelegramAvatarUrl(profile: LauncherProfile | undefined) {

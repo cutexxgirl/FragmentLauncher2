@@ -23,7 +23,7 @@
 		closeWindow,
 	}: Props = $props();
 
-	let isChecking = $derived(authState === 'checking');
+	let loginBusy = $derived(authState === 'checking' || authState === 'waiting');
 </script>
 
 <section class="auth-gate" aria-label="Авторизация">
@@ -65,7 +65,7 @@
 		<button
 			type="button"
 			class="primary-button auth-login-button"
-			disabled={isChecking}
+			disabled={loginBusy}
 			onclick={loginWithTelegram}
 		>
 			Войти через Telegram
