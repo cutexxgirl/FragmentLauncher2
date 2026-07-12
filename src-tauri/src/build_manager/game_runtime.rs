@@ -1,10 +1,12 @@
 use super::{
     contracts::{
         domain_digest, GameRuntimeLock, GameRuntimeSource, NormalizedProcessorArgument,
-        UpstreamProcessorStep,
+        RuntimeLock, UpstreamProcessorStep,
     },
+    game_runtime_invocation::PreparedProcessorInvocation,
     managed_fs::{GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath},
     process_supervisor::{spawn as spawn_process, ProcessSpec},
+    runtime::{revalidate_runtime_installation, RuntimeInstallation},
     storage::is_windows_reparse_point,
 };
 use serde::Serialize;
@@ -117,13 +119,13 @@ pub(super) struct JavaProcessOutput {
     pub(super) transcript_sha256: String,
 }
 
-pub(super) struct JavaProcessRequest<'a> {
-    pub(super) executable: &'a Path,
-    pub(super) arguments: &'a [OsString],
-    pub(super) cwd: &'a Path,
-    pub(super) environment: &'a [(OsString, OsString)],
-    pub(super) limits: JavaProcessLimits,
-    pub(super) cancelled: Arc<AtomicBool>,
+struct JavaProcessRequest<'a> {
+    executable: &'a Path,
+    arguments: &'a [OsString],
+    cwd: &'a Path,
+    environment: &'a [(OsString, OsString)],
+    limits: JavaProcessLimits,
+    cancelled: Arc<AtomicBool>,
 }
 
 pub(super) fn reconstruct_executable_processor_steps(
@@ -558,9 +560,31 @@ fn validate_output_inventory(
     Ok(())
 }
 
-pub(super) fn run_java_process(
-    request: JavaProcessRequest<'_>,
+/// The only production entrypoint into the raw process supervisor. The invocation is
+/// unforgeable outside its module and lifetime-bound to a live materialized workspace. The Java
+/// tree is completely revalidated as the final filesystem operation before `CreateProcessW`.
+pub(super) fn run_prepared_java_process(
+    invocation: &PreparedProcessorInvocation,
+    runtime_lock: &RuntimeLock,
+    runtime: &RuntimeInstallation,
+    limits: JavaProcessLimits,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<JavaProcessOutput, String> {
+    let verified = revalidate_runtime_installation(runtime, runtime_lock)?;
+    if invocation.executable() != verified.java_console() {
+        return Err("Prepared processor executable is not the revalidated Java console".into());
+    }
+    run_java_process(JavaProcessRequest {
+        executable: invocation.executable(),
+        arguments: invocation.arguments(),
+        cwd: invocation.cwd(),
+        environment: invocation.environment(),
+        limits,
+        cancelled,
+    })
+}
+
+fn run_java_process(request: JavaProcessRequest<'_>) -> Result<JavaProcessOutput, String> {
     validate_process_request(&request)?;
     if request.cancelled.load(Ordering::Acquire) {
         return Err("NeoForge processor execution was cancelled".into());

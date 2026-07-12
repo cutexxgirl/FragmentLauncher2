@@ -26,11 +26,50 @@ const MAX_STAGING_CANDIDATES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RuntimeInstallation {
-    pub(super) generation: PathBuf,
-    pub(super) image: PathBuf,
-    pub(super) java: PathBuf,
-    pub(super) java_console: PathBuf,
-    pub(super) runtime_lock_sha256: String,
+    generation: PathBuf,
+    image: PathBuf,
+    java: PathBuf,
+    java_console: PathBuf,
+    runtime_lock_sha256: String,
+}
+
+impl RuntimeInstallation {
+    pub(super) fn generation(&self) -> &Path {
+        &self.generation
+    }
+
+    pub(super) fn image(&self) -> &Path {
+        &self.image
+    }
+
+    pub(super) fn java(&self) -> &Path {
+        &self.java
+    }
+
+    pub(super) fn java_console(&self) -> &Path {
+        &self.java_console
+    }
+
+    pub(super) fn runtime_lock_sha256(&self) -> &str {
+        &self.runtime_lock_sha256
+    }
+
+    #[cfg(test)]
+    pub(super) fn synthetic(
+        generation: PathBuf,
+        image: PathBuf,
+        java: PathBuf,
+        java_console: PathBuf,
+        runtime_lock_sha256: String,
+    ) -> Self {
+        Self {
+            generation,
+            image,
+            java,
+            java_console,
+            runtime_lock_sha256,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

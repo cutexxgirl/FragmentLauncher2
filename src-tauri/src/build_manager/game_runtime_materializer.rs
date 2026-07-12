@@ -32,7 +32,10 @@ const MAX_INPUT_TREE_ENTRIES: usize = 256;
 const MAX_INSTALLER_ZIP_ENTRIES: usize = 4_096;
 const MAX_INSTALLER_DECLARED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_STATE_MARKER_BYTES: usize = 256 * 1024;
+const MAX_SCRATCH_ENTRIES: usize = 512;
+const MAX_SCRATCH_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const STATE_MARKER_PATH: &str = "materialized-input-state-v2.json";
+const USER_HOME_PATH: &str = "state/user-home";
 const WORKSPACE_LAYOUT: [&str; 4] = ["inputs", "outputs", "temp", "state"];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -125,7 +128,10 @@ pub(super) struct ProcessorWorkspace {
     temp: PathBuf,
     state: PathBuf,
     input_state_sha256: String,
+    state_marker_bytes: Vec<u8>,
+    state_marker: ImmutableManagedFile,
     input_lease: ProcessorInputLease,
+    home_guard: Option<GuardedDirectoryChain>,
     _workspace_guard: GuardedDirectoryChain,
     _layout_guards: Vec<GuardedDirectoryChain>,
 }
@@ -163,6 +169,44 @@ impl ProcessorWorkspace {
             );
         }
         Ok(audit)
+    }
+
+    /// Creates and leases the only writable home directory accepted by the invocation builder.
+    /// This must run while the workspace is still fresh, before any processor is spawned.
+    pub(super) fn prepare_execution_scratch(&mut self) -> Result<(), String> {
+        self.revalidate_inputs()?;
+        validate_empty_workspace_directory(&self.root, "outputs")?;
+        validate_empty_workspace_directory(&self.root, "temp")?;
+        let home = RelativeManagedPath::new(USER_HOME_PATH)
+            .expect("static processor user-home path is valid");
+        if self.home_guard.is_none() {
+            self.home_guard = Some(
+                ensure_directory_chain(&self.root, &home)
+                    .map_err(|error| format!("Cannot create processor user-home: {error}"))?,
+            );
+        }
+        validate_empty_workspace_directory(&self.state, "user-home")?;
+        self.revalidate_execution_scratch()?;
+        self.revalidate_inputs()?;
+        Ok(())
+    }
+
+    /// Revalidates the writable workspace namespace without making any mutation. Outputs are
+    /// audited separately against the per-step signed write-set.
+    pub(super) fn revalidate_execution_scratch(&mut self) -> Result<(), String> {
+        if self.home_guard.is_none() {
+            return Err("Processor user-home has not been prepared".into());
+        }
+        let marker = self
+            .state_marker
+            .read_bounded(MAX_STATE_MARKER_BYTES as u64)
+            .map_err(|error| format!("Cannot revalidate processor state marker: {error}"))?;
+        if marker != self.state_marker_bytes {
+            return Err("Processor input-state marker changed during execution".into());
+        }
+        validate_workspace_top_level(&self.root)?;
+        validate_safe_scratch_tree(&self.temp, "processor temp")?;
+        validate_execution_state_directory(&self.root, &self.state_marker_bytes)
     }
 }
 
@@ -245,6 +289,17 @@ pub(super) fn materialize_processor_workspace(
     )?;
     validate_workspace_layout(&root, &marker_bytes)?;
     input_lease.revalidate()?;
+    let marker_relative = RelativeManagedPath::new(STATE_MARKER_PATH)
+        .expect("static processor state marker path is valid");
+    let mut state_marker = ImmutableManagedFile::open(&state, &marker_relative)
+        .map_err(|error| format!("Processor input-state marker is unsafe: {error}"))?;
+    if state_marker
+        .read_bounded(MAX_STATE_MARKER_BYTES as u64)
+        .map_err(|error| format!("Cannot lease processor input-state marker: {error}"))?
+        != marker_bytes
+    {
+        return Err("Processor input-state marker changed before it was leased".into());
+    }
 
     // The input lease now owns stronger read-only snapshot guards for `inputs`. Retain ordinary
     // guarded handles for the three directories which the executor is allowed to write.
@@ -256,7 +311,10 @@ pub(super) fn materialize_processor_workspace(
         temp,
         state,
         input_state_sha256,
+        state_marker_bytes: marker_bytes,
+        state_marker,
         input_lease,
+        home_guard: None,
         _workspace_guard: workspace_guard,
         _layout_guards: initial_layout_guards,
     })
@@ -1125,6 +1183,13 @@ fn relative_manifest_path(root: &Path, absolute: &Path) -> Result<String, String
 }
 
 fn validate_workspace_layout(root: &Path, expected_marker_bytes: &[u8]) -> Result<(), String> {
+    validate_workspace_top_level(root)?;
+    validate_empty_workspace_directory(root, "outputs")?;
+    validate_empty_workspace_directory(root, "temp")?;
+    validate_state_workspace_directory(root, expected_marker_bytes)
+}
+
+fn validate_workspace_top_level(root: &Path) -> Result<(), String> {
     let expected = WORKSPACE_LAYOUT.into_iter().collect::<BTreeSet<_>>();
     let mut observed = BTreeSet::new();
     for entry in fs::read_dir(root)
@@ -1150,9 +1215,6 @@ fn validate_workspace_layout(root: &Path, expected_marker_bytes: &[u8]) -> Resul
     if observed.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected {
         return Err("Processor workspace top-level layout is incomplete".into());
     }
-    validate_empty_workspace_directory(root, "outputs")?;
-    validate_empty_workspace_directory(root, "temp")?;
-    validate_state_workspace_directory(root, expected_marker_bytes)?;
     Ok(())
 }
 
@@ -1171,6 +1233,83 @@ fn validate_empty_workspace_directory(root: &Path, component: &str) -> Result<()
         return Err(format!(
             "Fresh processor workspace {component} directory is not empty"
         ));
+    }
+    Ok(())
+}
+
+fn validate_safe_scratch_tree(root: &Path, label: &str) -> Result<(), String> {
+    let root_guard = GuardedDirectoryChain::root_snapshot(root)
+        .map_err(|error| format!("{label} root is unsafe: {error}"))?;
+    let mut entries = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut collision_keys = BTreeSet::new();
+    scan_safe_scratch_directory(
+        root_guard.root_path(),
+        root_guard.root_path(),
+        label,
+        &mut entries,
+        &mut total_bytes,
+        &mut collision_keys,
+    )
+}
+
+fn scan_safe_scratch_directory(
+    root: &Path,
+    directory: &Path,
+    label: &str,
+    entries: &mut usize,
+    total_bytes: &mut u64,
+    collision_keys: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for entry in
+        fs::read_dir(directory).map_err(|error| format!("Cannot enumerate {label}: {error}"))?
+    {
+        *entries = entries
+            .checked_add(1)
+            .ok_or_else(|| format!("{label} entry counter overflowed"))?;
+        if *entries > MAX_SCRATCH_ENTRIES {
+            return Err(format!("{label} exceeds its entry limit"));
+        }
+        let entry = entry.map_err(|error| format!("Cannot inspect {label}: {error}"))?;
+        let absolute = entry.path();
+        let metadata = fs::symlink_metadata(&absolute)
+            .map_err(|error| format!("Cannot inspect {label} metadata: {error}"))?;
+        if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+            return Err(format!("Link/reparse point is forbidden in {label}"));
+        }
+        let relative = relative_manifest_path(root, &absolute)?;
+        let managed = RelativeManagedPath::new(&relative)
+            .map_err(|error| format!("{label} path is unsafe: {error}"))?;
+        if !collision_keys.insert(managed.collision_key().to_owned()) {
+            return Err(format!("{label} contains a Windows path collision"));
+        }
+        if metadata.is_dir() {
+            let guard = GuardedDirectoryChain::open_snapshot(root, &managed)
+                .map_err(|error| format!("{label} directory is unsafe: {error}"))?;
+            let stable = guard.leaf().path().to_path_buf();
+            scan_safe_scratch_directory(
+                root,
+                &stable,
+                label,
+                entries,
+                total_bytes,
+                collision_keys,
+            )?;
+        } else if metadata.is_file() {
+            let mut file = ImmutableManagedFile::open(root, &managed)
+                .map_err(|error| format!("{label} file is unsafe: {error}"))?;
+            let size = file.info().size;
+            *total_bytes = total_bytes
+                .checked_add(size)
+                .ok_or_else(|| format!("{label} byte total overflowed"))?;
+            if *total_bytes > MAX_SCRATCH_TOTAL_BYTES {
+                return Err(format!("{label} exceeds its byte limit"));
+            }
+            file.sha256(size)
+                .map_err(|error| format!("Cannot stabilize {label} file: {error}"))?;
+        } else {
+            return Err(format!("Special file is forbidden in {label}"));
+        }
     }
     Ok(())
 }
@@ -1209,6 +1348,49 @@ fn validate_state_workspace_directory(
     if bytes != expected_marker_bytes {
         return Err("Processor input-state marker bytes changed after commit".into());
     }
+    Ok(())
+}
+
+fn validate_execution_state_directory(
+    root: &Path,
+    expected_marker_bytes: &[u8],
+) -> Result<(), String> {
+    let state_relative =
+        RelativeManagedPath::new("state").expect("static processor state path is valid");
+    let state_guard = GuardedDirectoryChain::open_snapshot(root, &state_relative)
+        .map_err(|error| format!("Processor workspace state is unsafe: {error}"))?;
+    let state_root = state_guard.leaf().path();
+    let mut names = fs::read_dir(state_root)
+        .map_err(|error| format!("Cannot enumerate processor execution state: {error}"))?
+        .map(|entry| {
+            entry
+                .map_err(|error| format!("Cannot inspect processor execution state: {error}"))?
+                .file_name()
+                .into_string()
+                .map_err(|_| "Processor execution state name is not UTF-8".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    if names != [STATE_MARKER_PATH.to_owned(), "user-home".to_owned()] {
+        return Err("Processor execution state contains unexpected entries".into());
+    }
+
+    let marker_relative = RelativeManagedPath::new(STATE_MARKER_PATH)
+        .expect("static processor state marker path is valid");
+    let mut marker = ImmutableManagedFile::open(state_root, &marker_relative)
+        .map_err(|error| format!("Processor input-state marker is unsafe: {error}"))?;
+    let bytes = marker
+        .read_bounded(MAX_STATE_MARKER_BYTES as u64)
+        .map_err(|error| format!("Cannot verify processor input-state marker: {error}"))?;
+    if bytes != expected_marker_bytes {
+        return Err("Processor input-state marker changed during execution".into());
+    }
+
+    let home_relative = RelativeManagedPath::new("user-home")
+        .expect("static processor user-home component is valid");
+    let home_guard = GuardedDirectoryChain::open_snapshot(state_root, &home_relative)
+        .map_err(|error| format!("Processor user-home is unsafe: {error}"))?;
+    validate_safe_scratch_tree(home_guard.leaf().path(), "processor user-home")?;
     Ok(())
 }
 
@@ -1470,6 +1652,37 @@ mod tests {
         fs::remove_file(root.join("state/unexpected.json")).unwrap();
         fs::write(root.join("state").join(STATE_MARKER_PATH), b"{ }").unwrap();
         assert!(validate_workspace_layout(&root, b"{}").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execution_scratch_allows_bounded_files_but_rejects_links_and_state_drift() {
+        let root = temp_root("execution-scratch");
+        for component in WORKSPACE_LAYOUT {
+            fs::create_dir_all(root.join(component)).unwrap();
+        }
+        fs::write(root.join("state").join(STATE_MARKER_PATH), b"marker").unwrap();
+        ensure_directory_chain(&root, &RelativeManagedPath::new(USER_HOME_PATH).unwrap()).unwrap();
+        validate_workspace_top_level(&root).unwrap();
+        validate_execution_state_directory(&root, b"marker").unwrap();
+
+        fs::write(root.join("state/user-home/unexpected"), b"x").unwrap();
+        validate_execution_state_directory(&root, b"marker").unwrap();
+        fs::hard_link(
+            root.join("state/user-home/unexpected"),
+            root.join("state/user-home/alias"),
+        )
+        .unwrap();
+        assert!(validate_execution_state_directory(&root, b"marker").is_err());
+        fs::remove_file(root.join("state/user-home/alias")).unwrap();
+        fs::remove_file(root.join("state/user-home/unexpected")).unwrap();
+
+        fs::write(root.join("state/unexpected"), b"x").unwrap();
+        assert!(validate_execution_state_directory(&root, b"marker").is_err());
+        fs::remove_file(root.join("state/unexpected")).unwrap();
+
+        fs::write(root.join("state").join(STATE_MARKER_PATH), b"changed").unwrap();
+        assert!(validate_execution_state_directory(&root, b"marker").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

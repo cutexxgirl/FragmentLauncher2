@@ -5,12 +5,14 @@ use super::{
         ProcessorMaterializationAccess, ProcessorMaterializationId, RuntimeLock,
     },
     game_runtime::{reconstruct_executable_processor_steps, ExecutableProcessorStep},
+    game_runtime_materializer::ProcessorWorkspace,
     managed_fs::RelativeManagedPath,
     runtime::RuntimeInstallation,
 };
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    marker::PhantomData,
     path::{Component, Path, PathBuf},
 };
 
@@ -34,7 +36,7 @@ pub(super) struct ProcessorWorkspaceLayout {
 }
 
 impl ProcessorWorkspaceLayout {
-    pub(super) fn new(root: &Path) -> Result<Self, String> {
+    fn new(root: &Path) -> Result<Self, String> {
         validate_absolute_lexical_path(root, "processor workspace root")?;
         let root = root.to_path_buf();
         let inputs = root.join("inputs");
@@ -59,6 +61,20 @@ impl ProcessorWorkspaceLayout {
             state,
             home,
         })
+    }
+
+    fn from_materialized(workspace: &ProcessorWorkspace) -> Result<Self, String> {
+        let layout = Self::new(workspace.root())?;
+        if layout.inputs != workspace.inputs()
+            || layout.outputs != workspace.outputs()
+            || layout.temp != workspace.temp()
+            || layout.state != workspace.state()
+        {
+            return Err(
+                "Materialized processor workspace paths are internally inconsistent".into(),
+            );
+        }
+        Ok(layout)
     }
 
     pub(super) fn root(&self) -> &Path {
@@ -91,7 +107,7 @@ impl ProcessorWorkspaceLayout {
 /// There is deliberately no constructor and no mutable accessor. The executable is always the
 /// console entrypoint from a verified `RuntimeInstallation`; arguments, cwd and environment can
 /// only be produced by `prepare_processor_invocations`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct PreparedProcessorInvocation {
     execution_index: u8,
     upstream_index: u8,
@@ -138,12 +154,13 @@ impl PreparedProcessorInvocation {
 }
 
 /// Exactly five invocations, in the signed executable-plan order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PreparedProcessorPlan {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PreparedProcessorPlan<'workspace> {
     invocations: [PreparedProcessorInvocation; 5],
+    _workspace: PhantomData<&'workspace ProcessorWorkspace>,
 }
 
-impl PreparedProcessorPlan {
+impl PreparedProcessorPlan<'_> {
     pub(super) fn invocations(&self) -> &[PreparedProcessorInvocation; 5] {
         &self.invocations
     }
@@ -153,32 +170,37 @@ impl PreparedProcessorPlan {
 ///
 /// Both locks are revalidated, the processor receipt is bound to the exact installed Temurin
 /// runtime, and `SystemRoot` is obtained from the Windows API rather than inherited environment.
-pub(super) fn prepare_processor_invocations(
+pub(super) fn prepare_processor_invocations<'workspace>(
     game_lock: &GameRuntimeLock,
     runtime_lock: &RuntimeLock,
     runtime: &RuntimeInstallation,
-    workspace: &ProcessorWorkspaceLayout,
-) -> Result<PreparedProcessorPlan, String> {
+    workspace: &'workspace ProcessorWorkspace,
+) -> Result<PreparedProcessorPlan<'workspace>, String> {
+    let layout = ProcessorWorkspaceLayout::from_materialized(workspace)?;
     let system_root = trusted_windows_directory()?;
-    prepare_processor_invocations_with_system_root(
+    let invocations = build_processor_invocations_with_system_root(
         game_lock,
         runtime_lock,
         runtime,
-        workspace,
+        &layout,
         &system_root,
-    )
+    )?;
+    Ok(PreparedProcessorPlan {
+        invocations,
+        _workspace: PhantomData,
+    })
 }
 
-fn prepare_processor_invocations_with_system_root(
+fn build_processor_invocations_with_system_root(
     game_lock: &GameRuntimeLock,
     runtime_lock: &RuntimeLock,
     runtime: &RuntimeInstallation,
     workspace: &ProcessorWorkspaceLayout,
     system_root: &Path,
-) -> Result<PreparedProcessorPlan, String> {
+) -> Result<[PreparedProcessorInvocation; 5], String> {
     game_lock.validate()?;
     runtime_lock.validate()?;
-    validate_runtime_installation(game_lock, runtime_lock, runtime)?;
+    bind_runtime_contract(game_lock, runtime_lock, runtime)?;
     validate_absolute_lexical_path(system_root, "trusted Windows directory")?;
 
     let bindings = ProcessorPathBindings::from_lock(game_lock, workspace)?;
@@ -218,7 +240,7 @@ fn prepare_processor_invocations_with_system_root(
             execution_index: step.execution_index,
             upstream_index: step.upstream_index,
             id: step.id.clone(),
-            executable: runtime.java_console.clone(),
+            executable: runtime.java_console().to_path_buf(),
             arguments,
             cwd: workspace.root.clone(),
             environment: environment.clone(),
@@ -229,41 +251,41 @@ fn prepare_processor_invocations_with_system_root(
     let invocations: [PreparedProcessorInvocation; 5] = invocations
         .try_into()
         .map_err(|_| "NeoForge invocation count changed during preparation".to_string())?;
-    Ok(PreparedProcessorPlan { invocations })
+    Ok(invocations)
 }
 
-fn validate_runtime_installation(
+fn bind_runtime_contract(
     game_lock: &GameRuntimeLock,
     runtime_lock: &RuntimeLock,
     runtime: &RuntimeInstallation,
 ) -> Result<(), String> {
     for (path, label) in [
-        (&runtime.generation, "Java generation"),
-        (&runtime.image, "Java image"),
-        (&runtime.java, "Java GUI entrypoint"),
-        (&runtime.java_console, "Java console entrypoint"),
+        (runtime.generation(), "Java generation"),
+        (runtime.image(), "Java image"),
+        (runtime.java(), "Java GUI entrypoint"),
+        (runtime.java_console(), "Java console entrypoint"),
     ] {
         validate_absolute_lexical_path(path, label)?;
     }
-    if runtime.image != runtime.generation.join("image") {
+    if runtime.image() != runtime.generation().join("image") {
         return Err("Verified Java image is not inside its generation".into());
     }
     let expected_java = resolve_managed(
-        &runtime.image,
+        runtime.image(),
         &runtime_lock.java.executable,
         "Java GUI entrypoint",
     )?;
     let expected_java_console = resolve_managed(
-        &runtime.image,
+        runtime.image(),
         &runtime_lock.java.console_executable,
         "Java console entrypoint",
     )?;
-    if runtime.java != expected_java || runtime.java_console != expected_java_console {
+    if runtime.java() != expected_java || runtime.java_console() != expected_java_console {
         return Err("RuntimeInstallation entrypoints disagree with the runtime lock".into());
     }
     let extracted_tree_sha256 = runtime_lock.extracted_tree_sha256()?;
     game_lock.verification.offline_processors.bind_java_runtime(
-        &runtime.runtime_lock_sha256,
+        runtime.runtime_lock_sha256(),
         &runtime_lock.java.archive.sha256,
         &extracted_tree_sha256,
         &runtime_lock.java.version,
@@ -313,7 +335,7 @@ fn fixed_jvm_prefix(
     workspace: &ProcessorWorkspaceLayout,
 ) -> Vec<OsString> {
     vec![
-        path_property("java.home", &runtime.image),
+        path_property("java.home", runtime.image()),
         path_property("user.home", &workspace.home),
         path_property("java.io.tmpdir", &workspace.temp),
         OsString::from("-Duser.language=en"),
@@ -329,14 +351,14 @@ fn fixed_environment(
     system_root: &Path,
 ) -> Result<Vec<(OsString, OsString)>, String> {
     let java_bin = runtime
-        .java_console
+        .java_console()
         .parent()
         .ok_or_else(|| "Java console entrypoint has no parent directory".to_string())?;
 
     let environment = vec![
         (
             OsString::from("JAVA_HOME"),
-            runtime.image.as_os_str().to_owned(),
+            runtime.image().as_os_str().to_owned(),
         ),
         (OsString::from("PATH"), java_bin.as_os_str().to_owned()),
         (
@@ -744,13 +766,13 @@ mod tests {
             .join("processor-invocation-golden");
         let generation = base.join("java-generation");
         let image = generation.join("image");
-        let runtime = RuntimeInstallation {
+        let runtime = RuntimeInstallation::synthetic(
             generation,
-            java: image.join("bin/javaw.exe"),
-            java_console: image.join("bin/java.exe"),
-            image,
+            image.clone(),
+            image.join("bin/javaw.exe"),
+            image.join("bin/java.exe"),
             runtime_lock_sha256,
-        };
+        );
         let workspace = ProcessorWorkspaceLayout::new(&base.join("workspace")).unwrap();
         let system_root = base.join("trusted-windows");
         (game_lock, runtime_lock, runtime, workspace, system_root)
@@ -847,7 +869,7 @@ mod tests {
     #[test]
     fn canonical_fixture_prepares_exact_five_golden_invocations() {
         let (game_lock, runtime_lock, runtime, workspace, system_root) = fixture_context();
-        let plan = prepare_processor_invocations_with_system_root(
+        let plan = build_processor_invocations_with_system_root(
             &game_lock,
             &runtime_lock,
             &runtime,
@@ -865,13 +887,13 @@ mod tests {
         let prefix = fixed_jvm_prefix(&runtime, &workspace);
         assert_eq!(prefix.len(), JVM_PREFIX_ARGUMENT_COUNT);
 
-        for (position, invocation) in plan.invocations().iter().enumerate() {
+        for (position, invocation) in plan.iter().enumerate() {
             let upstream_index = EXECUTABLE_UPSTREAM_INDICES[position];
             assert_eq!(invocation.execution_index(), position as u8);
             assert_eq!(invocation.upstream_index(), upstream_index);
             assert_eq!(invocation.id(), expected_ids[position]);
             assert_ne!(invocation.upstream_index(), 4);
-            assert_eq!(invocation.executable(), runtime.java_console);
+            assert_eq!(invocation.executable(), runtime.java_console());
             assert_eq!(invocation.cwd(), workspace.root());
 
             let arguments = invocation.arguments();
@@ -907,7 +929,7 @@ mod tests {
     #[test]
     fn canonical_fixture_has_exact_fixed_environment_and_write_sets() {
         let (game_lock, runtime_lock, runtime, workspace, system_root) = fixture_context();
-        let plan = prepare_processor_invocations_with_system_root(
+        let plan = build_processor_invocations_with_system_root(
             &game_lock,
             &runtime_lock,
             &runtime,
@@ -916,7 +938,7 @@ mod tests {
         )
         .unwrap();
         let expected_environment = fixed_environment(&runtime, &workspace, &system_root).unwrap();
-        for invocation in plan.invocations() {
+        for invocation in &plan {
             assert_eq!(invocation.environment(), expected_environment);
         }
         assert_eq!(
@@ -945,16 +967,16 @@ mod tests {
                 .1
                 .as_os_str(),
             runtime
-                .java_console
+                .java_console()
                 .parent()
                 .expect("java console parent")
                 .as_os_str()
         );
-        assert_eq!(plan.invocations()[0].expected_written_paths().len(), 1);
-        assert_eq!(plan.invocations()[1].expected_written_paths().len(), 1);
-        assert_eq!(plan.invocations()[2].expected_written_paths().len(), 4);
-        assert_eq!(plan.invocations()[3].expected_written_paths().len(), 1);
-        assert_eq!(plan.invocations()[4].expected_written_paths().len(), 1);
+        assert_eq!(plan[0].expected_written_paths().len(), 1);
+        assert_eq!(plan[1].expected_written_paths().len(), 1);
+        assert_eq!(plan[2].expected_written_paths().len(), 4);
+        assert_eq!(plan[3].expected_written_paths().len(), 1);
+        assert_eq!(plan[4].expected_written_paths().len(), 1);
     }
 
     #[test]
@@ -990,24 +1012,36 @@ mod tests {
 
     #[test]
     fn preparation_rejects_forged_java_console_and_unbound_runtime() {
-        let (game_lock, runtime_lock, mut runtime, workspace, system_root) = fixture_context();
-        runtime.java_console = runtime.image.join("bin/evil.exe");
-        assert!(prepare_processor_invocations_with_system_root(
+        let (game_lock, runtime_lock, runtime, workspace, system_root) = fixture_context();
+        let forged = RuntimeInstallation::synthetic(
+            runtime.generation().to_path_buf(),
+            runtime.image().to_path_buf(),
+            runtime.java().to_path_buf(),
+            runtime.image().join("bin/evil.exe"),
+            runtime.runtime_lock_sha256().to_owned(),
+        );
+        assert!(build_processor_invocations_with_system_root(
             &game_lock,
             &runtime_lock,
-            &runtime,
+            &forged,
             &workspace,
             &system_root,
         )
         .unwrap_err()
         .contains("entrypoints disagree"));
 
-        let (game_lock, runtime_lock, mut runtime, workspace, system_root) = fixture_context();
-        runtime.runtime_lock_sha256 = "e".repeat(64);
-        assert!(prepare_processor_invocations_with_system_root(
+        let (game_lock, runtime_lock, runtime, workspace, system_root) = fixture_context();
+        let unbound = RuntimeInstallation::synthetic(
+            runtime.generation().to_path_buf(),
+            runtime.image().to_path_buf(),
+            runtime.java().to_path_buf(),
+            runtime.java_console().to_path_buf(),
+            "e".repeat(64),
+        );
+        assert!(build_processor_invocations_with_system_root(
             &game_lock,
             &runtime_lock,
-            &runtime,
+            &unbound,
             &workspace,
             &system_root,
         )

@@ -2454,6 +2454,23 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn snapshot_directory_guard_allows_new_children_but_denies_directory_replacement() {
+        let root = temp_root("snapshot-child-create");
+        fs::create_dir_all(root.join("outputs/nested")).unwrap();
+        let guard = GuardedDirectoryChain::open_snapshot(
+            &root,
+            &RelativeManagedPath::new("outputs/nested").unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("outputs/nested/new.bin"), b"new")
+            .expect("a processor must be able to create a signed child under a leased directory");
+        assert!(fs::rename(root.join("outputs/nested"), root.join("outputs/moved")).is_err());
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn final_directory_symlink_is_rejected_when_symlinks_are_available() {
         use std::os::windows::fs::symlink_dir;
         let root = temp_root("directory-link");
