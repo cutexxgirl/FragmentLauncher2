@@ -1,12 +1,13 @@
 use super::{
     instance_state::InstanceOperationLock,
-    journal::{JournalMutation, ReconcilePlanV2},
+    journal::{JournalMutation, JournalPointerV2, ReconcilePlanV2},
     managed_fs::{
         ensure_directory_chain, move_managed_node_no_replace, ExclusiveManagedFile, FileIdentity,
         GuardedDirectoryChain, ImmutableManagedFile, ManagedNodeKind, RelativeManagedPath,
     },
     planner::StagingFileProofV2,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fmt::Debug,
@@ -316,6 +317,67 @@ pub(super) struct ReconcileExecutionReportV2 {
     pub mutations: Vec<MutationExecutionV2>,
 }
 
+/// A non-cloneable proof emitted only after the complete reverse mutation loop succeeded. The
+/// journal consumes it before recording a rolled-back continuation.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct RollbackCompletionAuthorizationV2 {
+    install_id: uuid::Uuid,
+    channel: super::types::BuildChannel,
+    operation_id: uuid::Uuid,
+    plan_sha256: String,
+}
+
+#[derive(Debug)]
+pub(super) struct RollbackExecutionResultV2 {
+    pub(super) report: ReconcileExecutionReportV2,
+    completion: RollbackCompletionAuthorizationV2,
+}
+
+impl RollbackExecutionResultV2 {
+    pub(super) fn into_completion(self) -> RollbackCompletionAuthorizationV2 {
+        self.completion
+    }
+}
+
+impl RollbackCompletionAuthorizationV2 {
+    fn from_completed_plan(plan: &ReconcilePlanV2) -> Result<Self, String> {
+        let canonical = plan.canonical_bytes()?;
+        Ok(Self {
+            install_id: plan.install_id,
+            channel: plan.channel,
+            operation_id: plan.operation_id,
+            plan_sha256: format!("{:x}", Sha256::digest(canonical)),
+        })
+    }
+
+    pub(super) fn validate_for(
+        &self,
+        pointer: &JournalPointerV2,
+        plan: &ReconcilePlanV2,
+    ) -> Result<(), String> {
+        if self.install_id != plan.install_id
+            || self.channel != plan.channel
+            || self.operation_id != plan.operation_id
+            || pointer.install_id != self.install_id
+            || pointer.channel != self.channel
+            || pointer.operation_id != self.operation_id
+            || pointer.plan_sha256 != self.plan_sha256
+        {
+            return Err("Rollback completion belongs to another reconcile operation".into());
+        }
+        let canonical = plan.canonical_bytes()?;
+        if format!("{:x}", Sha256::digest(canonical)) != self.plan_sha256 {
+            return Err("Rollback completion plan digest changed".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_completed_plan_test(plan: &ReconcilePlanV2) -> Self {
+        Self::from_completed_plan(plan).expect("test rollback plan must be canonical")
+    }
+}
+
 impl ReconcileExecutionReportV2 {
     pub fn applied_count(&self) -> usize {
         self.mutations
@@ -397,7 +459,8 @@ impl ReconcileOperationPathsV2 {
     }
 
     /// These operation-owned artifacts are deliberately retained by roll-forward and rollback.
-    /// Cleanup may start only after `journal::clear_pending` has durably published its tombstone.
+    /// Cleanup may start only after an explicit journal completion API has durably published its
+    /// outcome-bound tombstone and immutable completion history.
     pub fn retained_artifacts(
         &self,
         plan: &ReconcilePlanV2,
@@ -528,7 +591,7 @@ pub(super) fn rollback_v2<F: ReconcileFileSystemV2>(
     plan: &ReconcilePlanV2,
     operation_lock: &InstanceOperationLock,
     filesystem: &mut F,
-) -> Result<ReconcileExecutionReportV2, ReconcileExecutorErrorV2> {
+) -> Result<RollbackExecutionResultV2, ReconcileExecutorErrorV2> {
     rollback_with_checkpoint_v2(plan, operation_lock, filesystem, |_| Ok(()))
 }
 
@@ -537,7 +600,7 @@ pub(super) fn rollback_with_checkpoint_v2<F, C>(
     operation_lock: &InstanceOperationLock,
     filesystem: &mut F,
     mut checkpoint: C,
-) -> Result<ReconcileExecutionReportV2, ReconcileExecutorErrorV2>
+) -> Result<RollbackExecutionResultV2, ReconcileExecutorErrorV2>
 where
     F: ReconcileFileSystemV2,
     C: FnMut(&MutationExecutionV2) -> Result<(), String>,
@@ -590,7 +653,9 @@ where
         report.mutations.push(execution.clone());
         checkpoint(&execution).map_err(ReconcileExecutorErrorV2::Interrupted)?;
     }
-    Ok(report)
+    let completion = RollbackCompletionAuthorizationV2::from_completed_plan(plan)
+        .map_err(ReconcileExecutorErrorV2::InvalidPlan)?;
+    Ok(RollbackExecutionResultV2 { report, completion })
 }
 
 fn validate_plan(plan: &ReconcilePlanV2) -> Result<(), ReconcileExecutorErrorV2> {

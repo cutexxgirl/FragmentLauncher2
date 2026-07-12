@@ -7,6 +7,7 @@ use super::{
     tuf::TrustedRelease,
     types::{BuildChannel, PresetId},
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use uuid::{Uuid, Version};
@@ -117,14 +118,120 @@ pub(super) enum RecoveryRequiredReasonV2 {
     MarkerDiverged,
     TargetNoLongerCurrentAfterCommit,
     FinalAuditRequired,
-    FinalAuditFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A non-serializable, operation-bound capability emitted only when the active marker is the
+/// exact plan target but the mandatory final audit failed. The journal consumes this capability
+/// to create a repair-only supersede outcome; ordinary callers cannot turn an arbitrary pending
+/// operation into a repair continuation.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct RepairSupersedeAuthorizationV2 {
+    install_id: Uuid,
+    channel: BuildChannel,
+    operation_id: Uuid,
+    plan_sha256: String,
+}
+
+/// A non-serializable capability proving that recovery observed the exact committed target and
+/// that its final immutable/mutable audit matched the plan.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct FinalizeCommitAuthorizationV2 {
+    install_id: Uuid,
+    channel: BuildChannel,
+    operation_id: Uuid,
+    plan_sha256: String,
+}
+
+impl RepairSupersedeAuthorizationV2 {
+    fn for_failed_final_audit(plan: &ReconcilePlanV2, canonical_plan: &[u8]) -> Self {
+        Self {
+            install_id: plan.install_id,
+            channel: plan.channel,
+            operation_id: plan.operation_id,
+            plan_sha256: format!("{:x}", Sha256::digest(canonical_plan)),
+        }
+    }
+
+    pub(super) fn validate_for(
+        &self,
+        pointer: &super::journal::JournalPointerV2,
+        plan: &ReconcilePlanV2,
+    ) -> Result<(), String> {
+        if self.install_id != plan.install_id
+            || self.channel != plan.channel
+            || self.operation_id != plan.operation_id
+            || pointer.install_id != self.install_id
+            || pointer.channel != self.channel
+            || pointer.operation_id != self.operation_id
+            || pointer.plan_sha256 != self.plan_sha256
+        {
+            return Err(
+                "Repair supersede authorization belongs to another reconcile operation".into(),
+            );
+        }
+        let canonical = plan.canonical_bytes()?;
+        if format!("{:x}", Sha256::digest(canonical)) != self.plan_sha256 {
+            return Err("Repair supersede authorization plan digest changed".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_failed_final_audit_test(plan: &ReconcilePlanV2) -> Self {
+        let canonical = plan
+            .canonical_bytes()
+            .expect("test supersede plan must be canonical");
+        Self::for_failed_final_audit(plan, &canonical)
+    }
+}
+
+impl FinalizeCommitAuthorizationV2 {
+    fn for_exact_final_audit(plan: &ReconcilePlanV2, canonical_plan: &[u8]) -> Self {
+        Self {
+            install_id: plan.install_id,
+            channel: plan.channel,
+            operation_id: plan.operation_id,
+            plan_sha256: format!("{:x}", Sha256::digest(canonical_plan)),
+        }
+    }
+
+    pub(super) fn validate_for(
+        &self,
+        pointer: &super::journal::JournalPointerV2,
+        plan: &ReconcilePlanV2,
+    ) -> Result<(), String> {
+        if self.install_id != plan.install_id
+            || self.channel != plan.channel
+            || self.operation_id != plan.operation_id
+            || pointer.install_id != self.install_id
+            || pointer.channel != self.channel
+            || pointer.operation_id != self.operation_id
+            || pointer.plan_sha256 != self.plan_sha256
+        {
+            return Err("Commit authorization belongs to another reconcile operation".into());
+        }
+        let canonical = plan.canonical_bytes()?;
+        if format!("{:x}", Sha256::digest(canonical)) != self.plan_sha256 {
+            return Err("Commit authorization plan digest changed".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_exact_final_audit_test(plan: &ReconcilePlanV2) -> Self {
+        let canonical = plan
+            .canonical_bytes()
+            .expect("test commit plan must be canonical");
+        Self::for_exact_final_audit(plan, &canonical)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum RecoveryDecisionV2 {
     RollForward,
-    FinalizeCommittedTarget,
+    FinalizeCommittedTarget(FinalizeCommitAuthorizationV2),
     RollbackRequired(RollbackReasonV2),
+    SupersedeForRepair(RepairSupersedeAuthorizationV2),
     RecoveryRequired(RecoveryRequiredReasonV2),
 }
 
@@ -321,6 +428,12 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
 }
 
 pub(super) fn decide_recovery(request: RecoveryRequestV2<'_>) -> RecoveryDecisionV2 {
+    let canonical_plan = match request.plan.canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return RecoveryDecisionV2::RecoveryRequired(RecoveryRequiredReasonV2::InvalidPlan)
+        }
+    };
     if request
         .plan
         .validate(request.plan.install_id, request.plan.channel)
@@ -354,9 +467,16 @@ pub(super) fn decide_recovery(request: RecoveryRequestV2<'_>) -> RecoveryDecisio
             );
         };
         return if final_audit_matches_plan(request.plan, audit, request.final_mutable_files) {
-            RecoveryDecisionV2::FinalizeCommittedTarget
+            RecoveryDecisionV2::FinalizeCommittedTarget(
+                FinalizeCommitAuthorizationV2::for_exact_final_audit(request.plan, &canonical_plan),
+            )
         } else {
-            RecoveryDecisionV2::RecoveryRequired(RecoveryRequiredReasonV2::FinalAuditFailed)
+            RecoveryDecisionV2::SupersedeForRepair(
+                RepairSupersedeAuthorizationV2::for_failed_final_audit(
+                    request.plan,
+                    &canonical_plan,
+                ),
+            )
         };
     }
 
@@ -1421,7 +1541,7 @@ mod tests {
         .unwrap()
         .plan
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             decide_recovery(RecoveryRequestV2 {
                 plan: &plan,
                 active_marker: Some(&plan.target),
@@ -1431,10 +1551,10 @@ mod tests {
                 final_mutable_files: &[],
             }),
             RecoveryDecisionV2::RecoveryRequired(RecoveryRequiredReasonV2::FinalAuditRequired)
-        );
+        ));
         let final_audit = ready_audit();
         let final_mutable = mutable(true);
-        assert_eq!(
+        assert!(matches!(
             decide_recovery(RecoveryRequestV2 {
                 plan: &plan,
                 active_marker: Some(&plan.target),
@@ -1443,8 +1563,19 @@ mod tests {
                 final_audit: Some(&final_audit),
                 final_mutable_files: &final_mutable,
             }),
-            RecoveryDecisionV2::FinalizeCommittedTarget
-        );
+            RecoveryDecisionV2::FinalizeCommittedTarget(_)
+        ));
+        assert!(matches!(
+            decide_recovery(RecoveryRequestV2 {
+                plan: &plan,
+                active_marker: Some(&plan.target),
+                fresh_release: &trusted,
+                staging_files: &[],
+                final_audit: Some(&audit),
+                final_mutable_files: &mutable_before,
+            }),
+            RecoveryDecisionV2::SupersedeForRepair(_)
+        ));
     }
 
     #[test]

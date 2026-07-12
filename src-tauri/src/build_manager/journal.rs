@@ -1,10 +1,12 @@
 use super::{
     contracts::{is_sha256, validate_manifest_path},
-    instance_state::{ActiveInstanceV2, InstanceOperationLock},
+    instance_state::{ActiveInstanceV2, InstanceOperationLock, InstanceStateStore},
     managed_fs::{
         atomic_write_small, ensure_directory_chain, ExclusiveManagedFile, ImmutableManagedFile,
         ManagedFsError, RelativeManagedPath,
     },
+    planner::{FinalizeCommitAuthorizationV2, RepairSupersedeAuthorizationV2},
+    reconcile_executor::RollbackCompletionAuthorizationV2,
     release::FilePolicy,
     types::BuildChannel,
 };
@@ -49,9 +51,24 @@ struct JournalTombstoneV2 {
     schema_version: u8,
     install_id: Uuid,
     channel: BuildChannel,
-    cleared_operation_id: Uuid,
-    cleared_pointer_sha256: String,
-    cleared_target: ActiveInstanceV2,
+    completed_pointer: JournalPointerV2,
+    completed_pointer_sha256: String,
+    outcome: JournalCompletionOutcomeV2,
+    continuation: Option<ActiveInstanceV2>,
+}
+
+/// The durable outcome of one reconcile operation.
+///
+/// `continuation` is independently bound to the immutable plan before a tombstone is accepted:
+/// committed and superseded operations continue from the exact target, while a rollback
+/// continues from the exact optional base. Keeping these cases distinct prevents a rolled-back
+/// first install (`base = None`) from being mistaken for a committed generation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum JournalCompletionOutcomeV2 {
+    CommittedTarget,
+    RolledBackToBase,
+    SupersededForRepair,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -556,18 +573,31 @@ pub fn publish_pending(
         )?,
         Some(existing) => {
             match parse_journal_slot(&existing, expected_install_id, expected_channel)? {
+                JournalSlotV2::Pending(existing_pointer)
+                    if existing_pointer == *pointer && existing == bytes =>
+                {
+                    // Exact retry after a crash or an unobserved successful publication.
+                }
                 JournalSlotV2::Pending(_) => {
                     return Err(
                         "A pending reconcile journal already exists for this channel".into(),
                     )
                 }
                 JournalSlotV2::Cleared(tombstone) => {
-                    if tombstone.cleared_operation_id == pointer.operation_id {
-                        return Err("A cleared reconcile operation ID cannot be reused".into());
+                    validate_persisted_completion(
+                        install_root,
+                        expected_install_id,
+                        expected_channel,
+                        operation_lock,
+                        &tombstone,
+                        &existing,
+                    )?;
+                    if tombstone.completed_pointer.operation_id == pointer.operation_id {
+                        return Err("A completed reconcile operation ID cannot be reused".into());
                     }
-                    if plan.base.as_ref() != Some(&tombstone.cleared_target) {
+                    if plan.base != tombstone.continuation {
                         return Err(
-                            "A new reconcile operation must continue from the exact cleared target"
+                            "A new reconcile operation must continue from the exact completed state"
                                 .into(),
                         );
                     }
@@ -611,7 +641,17 @@ pub fn detect_pending(
             None => return Ok(None),
         };
     match parse_journal_slot(&bytes, expected_install_id, expected_channel)? {
-        JournalSlotV2::Cleared(_) => Ok(None),
+        JournalSlotV2::Cleared(tombstone) => {
+            validate_persisted_completion(
+                install_root,
+                expected_install_id,
+                expected_channel,
+                operation_lock,
+                &tombstone,
+                &bytes,
+            )?;
+            Ok(None)
+        }
         JournalSlotV2::Pending(pointer) => {
             let paths = JournalPaths::new(expected_channel, &pointer)?;
             let plan = load_plan(
@@ -626,15 +666,249 @@ pub fn detect_pending(
     }
 }
 
-/// Replaces only the exact pending pointer supplied by the recovery caller with a strict,
-/// operation-bound tombstone. The per-channel operation lock prevents a second legitimate writer
-/// between comparison and handle-based replacement. Immutable plan files are retained.
-pub fn clear_pending(
+/// Completes an operation only after the caller has observed its exact committed target.
+pub fn complete_pending_committed(
     install_root: &Path,
     expected_install_id: Uuid,
     expected_channel: BuildChannel,
     operation_lock: &InstanceOperationLock,
     expected: &JournalPointerV2,
+    authorization: FinalizeCommitAuthorizationV2,
+) -> Result<bool, String> {
+    let plan = load_authorized_plan(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        expected,
+    )?;
+    authorization.validate_for(expected, &plan)?;
+    complete_pending(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        expected,
+        JournalCompletionOutcomeV2::CommittedTarget,
+    )
+}
+
+/// Completes a rollback only from the exact optional plan base. `None` is meaningful: it is the
+/// continuation state after rolling back a first install which never had an active generation.
+pub fn complete_pending_rolled_back(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    expected: &JournalPointerV2,
+    authorization: RollbackCompletionAuthorizationV2,
+) -> Result<bool, String> {
+    let plan = load_authorized_plan(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        expected,
+    )?;
+    authorization.validate_for(expected, &plan)?;
+    complete_pending(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        expected,
+        JournalCompletionOutcomeV2::RolledBackToBase,
+    )
+}
+
+fn load_authorized_plan(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    expected: &JournalPointerV2,
+) -> Result<ReconcilePlanV2, String> {
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Invalid reconcile operation lock: {error}"))?;
+    expected.validate(expected_install_id, expected_channel)?;
+    let paths = JournalPaths::new(expected_channel, expected)?;
+    load_plan(
+        install_root,
+        &paths.plan,
+        expected,
+        expected_install_id,
+        expected_channel,
+    )
+}
+
+/// Atomically replaces a failed committed operation with one exact repair operation. The
+/// authorization is emitted only by the recovery planner after it observed the exact active
+/// target and a failed final audit. Supersede history is durable before `pending.json` changes,
+/// and `pending.json` is replaced directly with the repair pointer, so no idle/ready state is
+/// observable between the two operations.
+#[allow(clippy::too_many_arguments)]
+pub fn supersede_pending_with_repair(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    failed_pointer: &JournalPointerV2,
+    authorization: RepairSupersedeAuthorizationV2,
+    repair_plan: &ReconcilePlanV2,
+) -> Result<JournalPointerV2, String> {
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Invalid reconcile operation lock: {error}"))?;
+    failed_pointer.validate(expected_install_id, expected_channel)?;
+    let failed_paths = JournalPaths::new(expected_channel, failed_pointer)?;
+    let failed_plan = load_plan(
+        install_root,
+        &failed_paths.plan,
+        failed_pointer,
+        expected_install_id,
+        expected_channel,
+    )?;
+    authorization.validate_for(failed_pointer, &failed_plan)?;
+    let active = InstanceStateStore::new(install_root, expected_install_id)
+        .load_locked(operation_lock)
+        .map_err(|error| format!("Cannot verify active state for repair supersede: {error}"))?;
+    if active.as_ref() != Some(&failed_plan.target) {
+        return Err("Repair supersede target is not the exact active marker".into());
+    }
+    validate_superseding_repair(&failed_plan, repair_plan)?;
+
+    let repair_pointer = write_immutable_plan(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        repair_plan,
+    )?;
+    let failed_pointer_bytes = serialize_bounded(
+        failed_pointer,
+        MAX_POINTER_BYTES as usize,
+        "failed journal pointer",
+    )?;
+    let completion = JournalTombstoneV2 {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        install_id: expected_install_id,
+        channel: expected_channel,
+        completed_pointer: failed_pointer.clone(),
+        completed_pointer_sha256: format!("{:x}", Sha256::digest(&failed_pointer_bytes)),
+        outcome: JournalCompletionOutcomeV2::SupersededForRepair,
+        continuation: Some(failed_plan.target.clone()),
+    };
+    completion.validate(expected_install_id, expected_channel)?;
+    validate_completion_binding(
+        &failed_plan,
+        completion.outcome,
+        completion.continuation.as_ref(),
+    )?;
+    let completion_bytes = serialize_bounded(
+        &completion,
+        MAX_POINTER_BYTES as usize,
+        "journal completion",
+    )?;
+    let repair_pointer_bytes = serialize_bounded(
+        &repair_pointer,
+        MAX_POINTER_BYTES as usize,
+        "repair journal pointer",
+    )?;
+    let current = read_bounded(
+        install_root,
+        &failed_paths.pending,
+        MAX_POINTER_BYTES,
+        "journal slot",
+    )?;
+    match parse_journal_slot(&current, expected_install_id, expected_channel)? {
+        JournalSlotV2::Pending(pointer)
+            if pointer == *failed_pointer && current == failed_pointer_bytes => {}
+        JournalSlotV2::Pending(pointer)
+            if pointer == repair_pointer && current == repair_pointer_bytes =>
+        {
+            validate_completion_history(
+                install_root,
+                expected_install_id,
+                expected_channel,
+                &completion,
+                &completion_bytes,
+            )?;
+            return Ok(repair_pointer);
+        }
+        _ => {
+            return Err(
+                "Pending journal is neither the failed operation nor its exact repair replacement"
+                    .into(),
+            )
+        }
+    }
+
+    failed_paths.prepare(install_root)?;
+    publish_immutable_file(
+        install_root,
+        &failed_paths.temporary,
+        &failed_paths.completion,
+        &completion_bytes,
+        true,
+    )?;
+    validate_completion_history(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        &completion,
+        &completion_bytes,
+    )?;
+    atomic_write_small(
+        install_root,
+        failed_paths.pending.clone(),
+        &repair_pointer_bytes,
+        MAX_POINTER_BYTES as usize,
+    )
+    .map_err(|error| format!("Cannot atomically supersede journal with repair: {error}"))?;
+    let persisted = read_bounded(
+        install_root,
+        &failed_paths.pending,
+        MAX_POINTER_BYTES,
+        "repair journal pointer",
+    )?;
+    if persisted != repair_pointer_bytes {
+        return Err("Superseding repair pointer changed during verification".into());
+    }
+    Ok(repair_pointer)
+}
+
+fn validate_superseding_repair(
+    failed: &ReconcilePlanV2,
+    repair: &ReconcilePlanV2,
+) -> Result<(), String> {
+    repair.validate(failed.install_id, failed.channel)?;
+    if repair.operation_id == failed.operation_id
+        || repair.kind != OperationKind::Repair
+        || repair.base.as_ref() != Some(&failed.target)
+        || repair.strict_roots != failed.strict_roots
+        || repair.preserved_paths != failed.preserved_paths
+        || repair.desired_files != failed.desired_files
+        || repair.mutations.is_empty()
+    {
+        return Err(
+            "Superseding operation is not the exact bounded repair of the failed target".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Replaces only the exact pending pointer with an outcome-bound tombstone. The immutable
+/// completion record is published first, so a crash can leave either the old pending pointer or a
+/// tombstone backed by durable history, never a history-free continuation.
+#[allow(clippy::too_many_arguments)]
+fn complete_pending(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    expected: &JournalPointerV2,
+    outcome: JournalCompletionOutcomeV2,
 ) -> Result<bool, String> {
     operation_lock
         .validate_scope(install_root, expected_install_id, expected_channel)
@@ -648,22 +922,60 @@ pub fn clear_pending(
         expected_install_id,
         expected_channel,
     )?;
+    if outcome == JournalCompletionOutcomeV2::SupersededForRepair {
+        return Err("A repair supersede cannot be published as an idle tombstone".into());
+    }
+    let active = InstanceStateStore::new(install_root, expected_install_id)
+        .load_locked(operation_lock)
+        .map_err(|error| format!("Cannot verify active state for journal completion: {error}"))?;
+    let continuation = match outcome {
+        JournalCompletionOutcomeV2::CommittedTarget => {
+            if active.as_ref() != Some(&cleared_plan.target) {
+                return Err("Committed journal target is not the exact active marker".into());
+            }
+            active
+        }
+        JournalCompletionOutcomeV2::RolledBackToBase => {
+            if active != cleared_plan.base {
+                return Err("Rolled-back journal base is not the exact active marker".into());
+            }
+            active
+        }
+        JournalCompletionOutcomeV2::SupersededForRepair => unreachable!("rejected above"),
+    };
+    validate_completion_binding(&cleared_plan, outcome, continuation.as_ref())?;
     let pending = journal_pending_path(expected_channel)?;
     let expected_bytes =
         serialize_bounded(expected, MAX_POINTER_BYTES as usize, "journal pointer")?;
+    let tombstone = JournalTombstoneV2 {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        install_id: expected_install_id,
+        channel: expected_channel,
+        completed_pointer: expected.clone(),
+        completed_pointer_sha256: format!("{:x}", Sha256::digest(&expected_bytes)),
+        outcome,
+        continuation,
+    };
+    tombstone.validate(expected_install_id, expected_channel)?;
+    let tombstone_bytes =
+        serialize_bounded(&tombstone, MAX_POINTER_BYTES as usize, "journal tombstone")?;
     let current =
         match read_optional_bounded(install_root, &pending, MAX_POINTER_BYTES, "journal slot")? {
             Some(bytes) => bytes,
             None => return Ok(false),
         };
     match parse_journal_slot(&current, expected_install_id, expected_channel)? {
-        JournalSlotV2::Cleared(tombstone) => {
-            let expected_sha256 = format!("{:x}", Sha256::digest(&expected_bytes));
-            if tombstone.cleared_operation_id != expected.operation_id
-                || tombstone.cleared_pointer_sha256 != expected_sha256
-                || tombstone.cleared_target != cleared_plan.target
-            {
-                return Err("Journal tombstone belongs to another cleared pointer".into());
+        JournalSlotV2::Cleared(existing) => {
+            validate_persisted_completion(
+                install_root,
+                expected_install_id,
+                expected_channel,
+                operation_lock,
+                &existing,
+                &current,
+            )?;
+            if *existing != tombstone {
+                return Err("Journal operation was completed with another outcome".into());
             }
             return Ok(false);
         }
@@ -673,16 +985,23 @@ pub fn clear_pending(
         }
     }
 
-    let tombstone = JournalTombstoneV2 {
-        schema_version: JOURNAL_SCHEMA_VERSION,
-        install_id: expected_install_id,
-        channel: expected_channel,
-        cleared_operation_id: expected.operation_id,
-        cleared_pointer_sha256: format!("{:x}", Sha256::digest(&expected_bytes)),
-        cleared_target: cleared_plan.target,
-    };
-    let tombstone_bytes =
-        serialize_bounded(&tombstone, MAX_POINTER_BYTES as usize, "journal tombstone")?;
+    paths.prepare(install_root)?;
+    publish_immutable_file(
+        install_root,
+        &paths.temporary,
+        &paths.completion,
+        &tombstone_bytes,
+        true,
+    )?;
+    let history = read_bounded(
+        install_root,
+        &paths.completion,
+        MAX_POINTER_BYTES,
+        "journal completion history",
+    )?;
+    if history != tombstone_bytes {
+        return Err("Persisted journal completion history changed during verification".into());
+    }
     atomic_write_small(
         install_root,
         pending.clone(),
@@ -699,6 +1018,14 @@ pub fn clear_pending(
     if persisted != tombstone_bytes {
         return Err("Journal tombstone changed during verification".into());
     }
+    validate_persisted_completion(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        &tombstone,
+        &persisted,
+    )?;
     Ok(true)
 }
 
@@ -735,19 +1062,127 @@ impl JournalTombstoneV2 {
         }
         validate_identity(
             self.install_id,
-            self.cleared_operation_id,
+            self.completed_pointer.operation_id,
             self.channel,
             expected_install_id,
             expected_channel,
         )?;
-        if !is_sha256(&self.cleared_pointer_sha256) {
+        self.completed_pointer
+            .validate(expected_install_id, expected_channel)?;
+        if self.completed_pointer.install_id != self.install_id
+            || self.completed_pointer.channel != self.channel
+        {
+            return Err("Reconcile journal tombstone pointer scope is inconsistent".into());
+        }
+        let pointer_bytes = serialize_bounded(
+            &self.completed_pointer,
+            MAX_POINTER_BYTES as usize,
+            "completed journal pointer",
+        )?;
+        if !is_sha256(&self.completed_pointer_sha256)
+            || self.completed_pointer_sha256 != format!("{:x}", Sha256::digest(pointer_bytes))
+        {
             return Err("Reconcile journal tombstone has an invalid pointer SHA-256".into());
         }
-        self.cleared_target
-            .validate(expected_install_id, expected_channel)
-            .map_err(|error| format!("Invalid cleared reconcile target: {error}"))?;
+        if let Some(continuation) = &self.continuation {
+            continuation
+                .validate(expected_install_id, expected_channel)
+                .map_err(|error| format!("Invalid completed reconcile continuation: {error}"))?;
+        }
+        if self.outcome != JournalCompletionOutcomeV2::RolledBackToBase
+            && self.continuation.is_none()
+        {
+            return Err("Committed and superseded operations require a continuation target".into());
+        }
         Ok(())
     }
+}
+
+fn validate_completion_binding(
+    plan: &ReconcilePlanV2,
+    outcome: JournalCompletionOutcomeV2,
+    continuation: Option<&ActiveInstanceV2>,
+) -> Result<(), String> {
+    let expected = match outcome {
+        JournalCompletionOutcomeV2::CommittedTarget
+        | JournalCompletionOutcomeV2::SupersededForRepair => Some(&plan.target),
+        JournalCompletionOutcomeV2::RolledBackToBase => plan.base.as_ref(),
+    };
+    if continuation != expected {
+        return Err(match outcome {
+            JournalCompletionOutcomeV2::CommittedTarget => {
+                "Committed journal outcome does not match the exact plan target"
+            }
+            JournalCompletionOutcomeV2::RolledBackToBase => {
+                "Rolled-back journal outcome does not match the exact optional plan base"
+            }
+            JournalCompletionOutcomeV2::SupersededForRepair => {
+                "Superseded journal outcome does not match the exact active plan target"
+            }
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_persisted_completion(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    tombstone: &JournalTombstoneV2,
+    pending_bytes: &[u8],
+) -> Result<ReconcilePlanV2, String> {
+    if tombstone.outcome == JournalCompletionOutcomeV2::SupersededForRepair {
+        return Err("A repair supersede completion cannot occupy the pending journal slot".into());
+    }
+    let plan = validate_completion_history(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        tombstone,
+        pending_bytes,
+    )?;
+    let active = InstanceStateStore::new(install_root, expected_install_id)
+        .load_locked(operation_lock)
+        .map_err(|error| format!("Cannot verify completed journal continuation: {error}"))?;
+    if active != tombstone.continuation {
+        return Err("Journal completion continuation is not the exact active marker".into());
+    }
+    Ok(plan)
+}
+
+fn validate_completion_history(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    tombstone: &JournalTombstoneV2,
+    expected_bytes: &[u8],
+) -> Result<ReconcilePlanV2, String> {
+    tombstone.validate(expected_install_id, expected_channel)?;
+    let canonical = serialize_bounded(tombstone, MAX_POINTER_BYTES as usize, "journal tombstone")?;
+    if expected_bytes != canonical {
+        return Err("Reconcile journal tombstone is not the exact canonical completion".into());
+    }
+    let paths = JournalPaths::new(expected_channel, &tombstone.completed_pointer)?;
+    let plan = load_plan(
+        install_root,
+        &paths.plan,
+        &tombstone.completed_pointer,
+        expected_install_id,
+        expected_channel,
+    )?;
+    validate_completion_binding(&plan, tombstone.outcome, tombstone.continuation.as_ref())?;
+    let history = read_bounded(
+        install_root,
+        &paths.completion,
+        MAX_POINTER_BYTES,
+        "journal completion history",
+    )?;
+    if history != canonical {
+        return Err("Journal tombstone has no exact immutable completion history".into());
+    }
+    Ok(plan)
 }
 
 fn parse_journal_slot(
@@ -1028,8 +1463,10 @@ fn journal_pending_path(channel: BuildChannel) -> Result<RelativeManagedPath, St
 struct JournalPaths {
     channel_root: RelativeManagedPath,
     plans: RelativeManagedPath,
+    completions: RelativeManagedPath,
     temporary: RelativeManagedPath,
     plan: RelativeManagedPath,
+    completion: RelativeManagedPath,
     pending: RelativeManagedPath,
 }
 
@@ -1041,6 +1478,9 @@ impl JournalPaths {
         let plans = channel_root
             .join_component("plans")
             .map_err(|error| format!("Cannot derive journal plans directory: {error}"))?;
+        let completions = channel_root
+            .join_component("completions")
+            .map_err(|error| format!("Cannot derive journal completions directory: {error}"))?;
         let temporary = channel_root
             .join_component("temporary")
             .map_err(|error| format!("Cannot derive journal temporary directory: {error}"))?;
@@ -1050,20 +1490,33 @@ impl JournalPaths {
                 pointer.operation_id, pointer.plan_sha256
             ))
             .map_err(|error| format!("Cannot derive immutable journal plan path: {error}"))?;
+        let completion = completions
+            .join_component(&format!(
+                "{}-{}.json",
+                pointer.operation_id, pointer.plan_sha256
+            ))
+            .map_err(|error| format!("Cannot derive immutable journal completion path: {error}"))?;
         let pending = channel_root
             .join_component("pending.json")
             .map_err(|error| format!("Cannot derive pending journal path: {error}"))?;
         Ok(Self {
             channel_root,
             plans,
+            completions,
             temporary,
             plan,
+            completion,
             pending,
         })
     }
 
     fn prepare(&self, install_root: &Path) -> Result<(), String> {
-        for directory in [&self.channel_root, &self.plans, &self.temporary] {
+        for directory in [
+            &self.channel_root,
+            &self.plans,
+            &self.completions,
+            &self.temporary,
+        ] {
             ensure_directory_chain(install_root, directory)
                 .map_err(|error| format!("Cannot prepare reconcile journal directory: {error}"))?;
         }
@@ -1185,6 +1638,28 @@ mod tests {
                     executable: false,
                 },
             ],
+        }
+    }
+
+    fn repair_after(plan: &ReconcilePlanV2) -> ReconcilePlanV2 {
+        let mut target = plan.target.clone();
+        target.generation = target
+            .generation
+            .checked_add(1)
+            .expect("fixture generation");
+        ReconcilePlanV2 {
+            schema_version: 2,
+            install_id: plan.install_id,
+            operation_id: Uuid::new_v4(),
+            channel: plan.channel,
+            kind: OperationKind::Repair,
+            base: Some(plan.target.clone()),
+            target,
+            strict_roots: plan.strict_roots.clone(),
+            preserved_paths: plan.preserved_paths.clone(),
+            desired_files: plan.desired_files.clone(),
+            disk_budget: plan.disk_budget.clone(),
+            mutations: plan.mutations.clone(),
         }
     }
 
@@ -1408,6 +1883,14 @@ mod tests {
             &stable_pointer,
         )
         .expect("publish stable pointer");
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &stable_lock,
+            &stable_pointer,
+        )
+        .expect("exact pending publication retry is idempotent");
 
         assert!(
             detect_pending(&root, install_id, BuildChannel::Dev, &dev_lock)
@@ -1435,12 +1918,13 @@ mod tests {
 
         let mut wrong = stable_pointer.clone();
         wrong.operation_id = Uuid::new_v4();
-        assert!(clear_pending(
+        assert!(complete_pending_committed(
             &root,
             install_id,
             BuildChannel::Stable,
             &stable_lock,
-            &wrong
+            &wrong,
+            FinalizeCommitAuthorizationV2::for_exact_final_audit_test(&stable_plan),
         )
         .is_err());
         assert!(
@@ -1448,13 +1932,26 @@ mod tests {
                 .expect("pointer restored")
                 .is_some()
         );
-
-        assert!(clear_pending(
+        assert!(complete_pending_committed(
             &root,
             install_id,
             BuildChannel::Stable,
             &stable_lock,
-            &stable_pointer
+            &stable_pointer,
+            FinalizeCommitAuthorizationV2::for_exact_final_audit_test(&stable_plan),
+        )
+        .is_err());
+
+        state
+            .save_locked(&stable_lock, &stable_plan.target)
+            .expect("commit exact stable target marker");
+        assert!(complete_pending_committed(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &stable_lock,
+            &stable_pointer,
+            FinalizeCommitAuthorizationV2::for_exact_final_audit_test(&stable_plan),
         )
         .expect("clear stable pointer"));
         assert!(
@@ -1462,12 +1959,13 @@ mod tests {
                 .expect("stable detection after clear")
                 .is_none()
         );
-        assert!(!clear_pending(
+        assert!(!complete_pending_committed(
             &root,
             install_id,
             BuildChannel::Stable,
             &stable_lock,
-            &stable_pointer
+            &stable_pointer,
+            FinalizeCommitAuthorizationV2::for_exact_final_audit_test(&stable_plan),
         )
         .expect("idempotent clear"));
         assert!(publish_pending(
@@ -1569,6 +2067,318 @@ mod tests {
         assert_eq!(next_pending.plan, next_plan);
         drop(dev_lock);
         drop(stable_lock);
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rolled_back_completion_continues_from_exact_optional_base() {
+        let root = temp_root("rollback-continuations");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+
+        let first_install = install_plan(install_id, BuildChannel::Stable);
+        let first_pointer = write_immutable_plan(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &first_install,
+        )
+        .unwrap();
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &first_pointer,
+        )
+        .unwrap();
+        let mut foreign_rollback = first_install.clone();
+        foreign_rollback.operation_id = Uuid::new_v4();
+        assert!(complete_pending_rolled_back(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &first_pointer,
+            RollbackCompletionAuthorizationV2::for_completed_plan_test(&foreign_rollback),
+        )
+        .is_err());
+        assert!(complete_pending_rolled_back(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &first_pointer,
+            RollbackCompletionAuthorizationV2::for_completed_plan_test(&first_install),
+        )
+        .unwrap());
+        assert!(
+            detect_pending(&root, install_id, BuildChannel::Stable, &lock)
+                .unwrap()
+                .is_none()
+        );
+
+        let wrong_after_none = repair_after(&first_install);
+        let wrong_pointer = write_immutable_plan(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &wrong_after_none,
+        )
+        .unwrap();
+        assert!(publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &wrong_pointer,
+        )
+        .is_err());
+
+        let mut retried_install = first_install.clone();
+        retried_install.operation_id = Uuid::new_v4();
+        let retry_pointer = write_immutable_plan(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &retried_install,
+        )
+        .unwrap();
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &retry_pointer,
+        )
+        .unwrap();
+
+        state.save_locked(&lock, &retried_install.target).unwrap();
+        let repair = repair_after(&retried_install);
+        let repair_pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &repair).unwrap();
+        // The retried install is still pending; complete it before publishing the repair.
+        complete_pending_committed(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &retry_pointer,
+            FinalizeCommitAuthorizationV2::for_exact_final_audit_test(&retried_install),
+        )
+        .unwrap();
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &repair_pointer,
+        )
+        .unwrap();
+        assert!(complete_pending_rolled_back(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &repair_pointer,
+            RollbackCompletionAuthorizationV2::for_completed_plan_test(&repair),
+        )
+        .unwrap());
+
+        let mut exact_base_retry = repair.clone();
+        exact_base_retry.operation_id = Uuid::new_v4();
+        let exact_pointer = write_immutable_plan(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &exact_base_retry,
+        )
+        .unwrap();
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &exact_pointer,
+        )
+        .unwrap();
+
+        drop(lock);
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_commit_is_atomically_replaced_by_exact_repair_and_retry_is_idempotent() {
+        let root = temp_root("supersede-repair");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        let failed = install_plan(install_id, BuildChannel::Stable);
+        let failed_pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &failed).unwrap();
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+        )
+        .unwrap();
+        let repair = repair_after(&failed);
+
+        assert!(supersede_pending_with_repair(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            RepairSupersedeAuthorizationV2::for_failed_final_audit_test(&failed),
+            &repair,
+        )
+        .is_err());
+        state.save_locked(&lock, &failed.target).unwrap();
+
+        let mut altered = repair_after(&failed);
+        altered.strict_roots = vec!["config".into()];
+        assert!(supersede_pending_with_repair(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            RepairSupersedeAuthorizationV2::for_failed_final_audit_test(&failed),
+            &altered,
+        )
+        .is_err());
+
+        // Crash boundary: immutable supersede history may be durable while the old pointer is
+        // still pending. Retrying must reuse that exact history and perform the direct swap.
+        let failed_paths = JournalPaths::new(BuildChannel::Stable, &failed_pointer).unwrap();
+        let failed_pointer_bytes = serialize_bounded(
+            &failed_pointer,
+            MAX_POINTER_BYTES as usize,
+            "failed pointer",
+        )
+        .unwrap();
+        let prewritten = JournalTombstoneV2 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            install_id,
+            channel: BuildChannel::Stable,
+            completed_pointer: failed_pointer.clone(),
+            completed_pointer_sha256: format!("{:x}", Sha256::digest(&failed_pointer_bytes)),
+            outcome: JournalCompletionOutcomeV2::SupersededForRepair,
+            continuation: Some(failed.target.clone()),
+        };
+        let prewritten_bytes = serialize_bounded(
+            &prewritten,
+            MAX_POINTER_BYTES as usize,
+            "prewritten completion",
+        )
+        .unwrap();
+        publish_immutable_file(
+            &root,
+            &failed_paths.temporary,
+            &failed_paths.completion,
+            &prewritten_bytes,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(failed_paths.pending.join_to(&root)).unwrap(),
+            failed_pointer_bytes
+        );
+
+        let repair_pointer = supersede_pending_with_repair(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            RepairSupersedeAuthorizationV2::for_failed_final_audit_test(&failed),
+            &repair,
+        )
+        .unwrap();
+        let detected = detect_pending(&root, install_id, BuildChannel::Stable, &lock)
+            .unwrap()
+            .expect("supersede must never expose an idle journal");
+        assert_eq!(detected.pointer, repair_pointer);
+        assert_eq!(detected.plan, repair);
+
+        assert_eq!(
+            supersede_pending_with_repair(
+                &root,
+                install_id,
+                BuildChannel::Stable,
+                &lock,
+                &failed_pointer,
+                RepairSupersedeAuthorizationV2::for_failed_final_audit_test(&failed),
+                &repair,
+            )
+            .unwrap(),
+            repair_pointer
+        );
+
+        let mut third = repair_after(&failed);
+        third.operation_id = Uuid::new_v4();
+        assert!(supersede_pending_with_repair(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            RepairSupersedeAuthorizationV2::for_failed_final_audit_test(&failed),
+            &third,
+        )
+        .is_err());
+
+        drop(lock);
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forged_completion_outcome_cannot_override_the_active_marker() {
+        let root = temp_root("forged-outcome");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        let plan = install_plan(install_id, BuildChannel::Stable);
+        let pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &plan).unwrap();
+        publish_pending(&root, install_id, BuildChannel::Stable, &lock, &pointer).unwrap();
+        state.save_locked(&lock, &plan.target).unwrap();
+        complete_pending_committed(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &pointer,
+            FinalizeCommitAuthorizationV2::for_exact_final_audit_test(&plan),
+        )
+        .unwrap();
+
+        let paths = JournalPaths::new(BuildChannel::Stable, &pointer).unwrap();
+        let mut forged: JournalTombstoneV2 =
+            serde_json::from_slice(&fs::read(paths.pending.join_to(&root)).unwrap()).unwrap();
+        forged.outcome = JournalCompletionOutcomeV2::RolledBackToBase;
+        forged.continuation = None;
+        let forged_bytes =
+            serialize_bounded(&forged, MAX_POINTER_BYTES as usize, "forged completion").unwrap();
+        fs::write(paths.pending.join_to(&root), &forged_bytes).unwrap();
+        fs::write(paths.completion.join_to(&root), &forged_bytes).unwrap();
+        assert!(detect_pending(&root, install_id, BuildChannel::Stable, &lock).is_err());
+
+        drop(lock);
         drop(state);
         let _ = fs::remove_dir_all(root);
     }
