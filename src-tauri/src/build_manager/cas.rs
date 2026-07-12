@@ -1,21 +1,21 @@
 use super::{
-    managed_fs::RelativeManagedPath,
-    spark_client::{is_retryable_status, retry_after, SparkClient, SparkClientError},
-    storage::{
-        inspect_existing_ancestors, open_or_create_regular_single_link, open_regular_single_link,
+    managed_fs::{
+        ensure_directory_chain, open_or_create_lock_file, FileIdentity, GuardedDirectoryChain,
+        ImmutableManagedFile, ManagedFsError, ManagedLockFile, RelativeManagedPath,
+        ResumableCommitOutcome, ResumableManagedFile,
     },
+    spark_client::{is_retryable_status, retry_after, SparkClient, SparkClientError},
+    storage::OwnedCasRoot,
     types::{BuildChannel, PresetId},
 };
 use fs2::FileExt;
 use futures_util::StreamExt;
 use reqwest::{header, Response, StatusCode};
-use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    fmt,
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const MAX_PLAN_ATTEMPTS: u8 = 9;
 const MAX_TRANSIENT_RETRIES: u8 = 4;
@@ -39,22 +39,114 @@ pub struct ExpectedObject {
     pub size: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VerifiedCasObject {
-    pub path: PathBuf,
-    pub sha256: String,
-    pub size: u64,
-    pub resumed_bytes: u64,
+    binding_nonce: Uuid,
+    install_id: Uuid,
+    install_root_identity: FileIdentity,
+    objects_root_identity: FileIdentity,
+    sha256: String,
+    size: u64,
+    resumed_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct CasDownloader {
-    cache_root: PathBuf,
+pub struct CasDownloader<'root> {
+    cache_root: &'root OwnedCasRoot,
     spark: SparkClient,
 }
 
-impl CasDownloader {
-    pub fn new(cache_root: PathBuf, spark: SparkClient) -> Self {
+#[derive(Debug)]
+pub(super) enum CasError {
+    Failed(String),
+    AppliedButDurabilityUnconfirmed { destination: String, detail: String },
+}
+
+impl fmt::Display for CasError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(message) => formatter.write_str(message),
+            Self::AppliedButDurabilityUnconfirmed {
+                destination,
+                detail,
+            } => write!(
+                formatter,
+                "cas_durability_unconfirmed: CAS activation reached {destination}, but durability is unconfirmed: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CasError {}
+
+impl From<String> for CasError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for CasError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+type CasResult<T> = Result<T, CasError>;
+
+fn managed_error(context: &str, error: ManagedFsError) -> CasError {
+    match error {
+        ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination,
+            detail,
+        } => CasError::AppliedButDurabilityUnconfirmed {
+            destination: destination.display().to_string(),
+            detail: format!("{context}: {detail}"),
+        },
+        other => CasError::Failed(format!("{context}: {other}")),
+    }
+}
+
+impl VerifiedCasObject {
+    pub(super) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(super) fn resumed_bytes(&self) -> u64 {
+        self.resumed_bytes
+    }
+
+    pub(super) fn open(&self, root: &OwnedCasRoot) -> CasResult<ImmutableManagedFile> {
+        root.revalidate().map_err(CasError::Failed)?;
+        let (binding_nonce, install_id, install_identity, objects_identity) = root.binding();
+        if binding_nonce != self.binding_nonce
+            || install_id != self.install_id
+            || install_identity != &self.install_root_identity
+            || objects_identity != &self.objects_root_identity
+        {
+            return Err(CasError::Failed(
+                "Verified CAS object belongs to another owned CAS root".into(),
+            ));
+        }
+        let relative = cas_object_relative_path(&self.sha256).map_err(CasError::Failed)?;
+        let mut file = ImmutableManagedFile::open(root.managed_root(), &relative)
+            .map_err(|error| managed_error("Cannot lease verified CAS object", error))?;
+        let digest = file
+            .sha256(self.size)
+            .map_err(|error| managed_error("Cannot re-audit verified CAS object", error))?;
+        if digest.size != self.size || digest.sha256 != self.sha256 {
+            return Err(CasError::Failed(
+                "Verified CAS object changed after download".into(),
+            ));
+        }
+        Ok(file)
+    }
+}
+
+impl<'root> CasDownloader<'root> {
+    pub fn new(cache_root: &'root OwnedCasRoot, spark: SparkClient) -> Self {
         Self { cache_root, spark }
     }
 
@@ -65,20 +157,23 @@ impl CasDownloader {
         release_id: &str,
         expected: &ExpectedObject,
         bearer_token: &str,
-    ) -> Result<VerifiedCasObject, String> {
-        validate_expected(expected)?;
-        let paths = CasPaths::new(&self.cache_root, &expected.sha256)?;
-        paths.prepare()?;
-        let lock = acquire_object_lock(&paths.lock).await?;
+    ) -> CasResult<VerifiedCasObject> {
+        validate_expected(expected).map_err(CasError::Failed)?;
+        self.cache_root.revalidate().map_err(CasError::Failed)?;
+        let paths = CasPaths::new(&expected.sha256).map_err(CasError::Failed)?;
+        let guards = paths.prepare(self.cache_root)?;
+        let lock = acquire_object_lock(self.cache_root, &paths.lock).await?;
+        guards.revalidate()?;
         let result = self
             .ensure_object_locked(channel, preset, release_id, expected, bearer_token, &paths)
             .await;
-        let unlock = FileExt::unlock(&lock)
+        let unlock = FileExt::unlock(lock.file())
             .map_err(|error| format!("Cannot unlock CAS object {}: {error}", expected.sha256));
+        drop(guards);
         match (result, unlock) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(CasError::Failed(error)),
         }
     }
 
@@ -90,26 +185,44 @@ impl CasDownloader {
         expected: &ExpectedObject,
         bearer_token: &str,
         paths: &CasPaths,
-    ) -> Result<VerifiedCasObject, String> {
-        if paths.final_path.exists() {
-            match verify_file(&paths.final_path, expected) {
-                Ok(()) => {
-                    return Ok(VerifiedCasObject {
-                        path: paths.final_path.clone(),
-                        sha256: expected.sha256.clone(),
-                        size: expected.size,
-                        resumed_bytes: expected.size,
-                    })
-                }
-                Err(error) => {
-                    open_regular_single_link(&paths.final_path, false).map_err(|_| error)?;
-                    fs::remove_file(&paths.final_path)
-                        .map_err(|remove| format!("Cannot remove corrupt CAS object: {remove}"))?;
-                }
+    ) -> CasResult<VerifiedCasObject> {
+        match audit_existing_final(self.cache_root, expected, expected.size)? {
+            ExistingFinal::Missing => {}
+            ExistingFinal::Verified(_) => {
+                discard_stale_partial(self.cache_root, paths, expected.size)?;
+                return match audit_existing_final(self.cache_root, expected, expected.size)? {
+                    ExistingFinal::Verified(object) => Ok(object),
+                    ExistingFinal::Missing | ExistingFinal::Corrupt => Err(CasError::Failed(
+                        "Cached CAS object changed during stale-partial cleanup".into(),
+                    )),
+                };
+            }
+            ExistingFinal::Corrupt => {
+                super::managed_fs::quarantine_node(
+                    self.cache_root.managed_root(),
+                    paths.final_path.clone(),
+                    &paths.quarantine,
+                )
+                .map_err(|error| managed_error("Cannot quarantine corrupt CAS object", error))?;
+                self.cache_root.revalidate().map_err(CasError::Failed)?;
             }
         }
 
-        let mut original_partial = prepare_partial(&paths.partial, expected.size)?;
+        let mut partial = ResumableManagedFile::open_or_create(
+            self.cache_root.managed_root(),
+            paths.partial.clone(),
+            expected.size,
+        )
+        .map_err(|error| managed_error("Cannot open CAS partial", error))?;
+        let mut original_partial = partial
+            .len()
+            .map_err(|error| managed_error("Cannot inspect CAS partial", error))?;
+        if original_partial > expected.size {
+            partial
+                .truncate_zero()
+                .map_err(|error| managed_error("Cannot reset oversized CAS partial", error))?;
+            original_partial = 0;
+        }
         let mut object_auth_replans = 0_u8;
         let mut range_resets = 0_u8;
         let mut clean_retries = 0_u8;
@@ -120,9 +233,10 @@ impl CasDownloader {
                 return Err("CAS object download retry limit was reached".into());
             }
             plan_attempts += 1;
-            let offset = fs::metadata(&paths.partial)
-                .map_err(|error| format!("Cannot inspect CAS partial: {error}"))?
-                .len();
+            self.cache_root.revalidate().map_err(CasError::Failed)?;
+            let offset = partial
+                .len()
+                .map_err(|error| managed_error("Cannot inspect CAS partial", error))?;
             let plan = match self
                 .spark
                 .download_plan(
@@ -139,18 +253,18 @@ impl CasDownloader {
                     transient_retries.wait(retry_after).await?;
                     continue;
                 }
-                Err(error) => return Err(map_spark_error(error)),
+                Err(error) => return Err(map_spark_error(error).into()),
             };
             let object = plan
                 .get(&expected.sha256)
-                .ok_or_else(|| "Spark omitted the requested CAS object".to_string())?;
+                .ok_or_else(|| CasError::Failed("Spark omitted the requested CAS object".into()))?;
             let response = match self.spark.object_response(object, offset).await {
                 Ok(response) => response,
                 Err(SparkClientError::Retryable { retry_after, .. }) => {
                     transient_retries.wait(retry_after).await?;
                     continue;
                 }
-                Err(error) => return Err(map_spark_error(error)),
+                Err(error) => return Err(map_spark_error(error).into()),
             };
             let status = response.status();
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -170,16 +284,18 @@ impl CasDownloader {
                 continue;
             }
             if status == StatusCode::RANGE_NOT_SATISFIABLE {
-                if offset == expected.size && verify_file(&paths.partial, expected).is_ok() {
-                    activate_partial(paths, expected)?;
-                    return Ok(VerifiedCasObject {
-                        path: paths.final_path.clone(),
-                        sha256: expected.sha256.clone(),
-                        size: expected.size,
-                        resumed_bytes: original_partial,
-                    });
+                if offset == expected.size && partial_matches(&mut partial, expected)? {
+                    return activate_partial(
+                        self.cache_root,
+                        paths,
+                        expected,
+                        partial,
+                        original_partial,
+                    );
                 }
-                truncate_partial(&paths.partial)?;
+                partial
+                    .truncate_zero()
+                    .map_err(|error| managed_error("Cannot reset rejected CAS partial", error))?;
                 original_partial = 0;
                 range_resets += 1;
                 if range_resets > MAX_RANGE_RESETS {
@@ -188,12 +304,15 @@ impl CasDownloader {
                 continue;
             }
 
-            let write_offset = validate_download_response(&response, offset, expected.size)?;
+            let write_offset = validate_download_response(&response, offset, expected.size)
+                .map_err(CasError::Failed)?;
             if write_offset == 0 && offset > 0 {
-                truncate_partial(&paths.partial)?;
+                partial
+                    .truncate_zero()
+                    .map_err(|error| managed_error("Cannot restart CAS partial", error))?;
                 original_partial = 0;
             }
-            match stream_response(response, &paths.partial, write_offset, expected.size).await {
+            match stream_response(response, &mut partial, write_offset, expected.size).await {
                 Ok(()) => {}
                 Err(StreamResponseError::Retryable) => {
                     transient_retries.wait(None).await?;
@@ -201,9 +320,9 @@ impl CasDownloader {
                 }
                 Err(StreamResponseError::Fatal(error)) => return Err(error),
             }
-            let length = fs::metadata(&paths.partial)
-                .map_err(|error| format!("Cannot inspect downloaded CAS partial: {error}"))?
-                .len();
+            let length = partial
+                .len()
+                .map_err(|error| managed_error("Cannot inspect downloaded CAS partial", error))?;
             if length < expected.size {
                 transient_retries.wait(None).await?;
                 continue;
@@ -211,28 +330,32 @@ impl CasDownloader {
             if length > expected.size {
                 return Err("Spark object stream exceeded the signed size".into());
             }
-            match verify_file(&paths.partial, expected) {
-                Ok(()) => {
-                    activate_partial(paths, expected)?;
-                    return Ok(VerifiedCasObject {
-                        path: paths.final_path.clone(),
-                        sha256: expected.sha256.clone(),
-                        size: expected.size,
-                        resumed_bytes: original_partial,
-                    });
+            match partial_matches(&mut partial, expected) {
+                Ok(true) => {
+                    return activate_partial(
+                        self.cache_root,
+                        paths,
+                        expected,
+                        partial,
+                        original_partial,
+                    );
                 }
-                Err(error) if clean_retries < MAX_CLEAN_RETRIES => {
-                    let _ = error;
-                    truncate_partial(&paths.partial)?;
+                Ok(false) if clean_retries < MAX_CLEAN_RETRIES => {
+                    partial.truncate_zero().map_err(|error| {
+                        managed_error("Cannot reset corrupt CAS partial", error)
+                    })?;
                     original_partial = 0;
                     clean_retries += 1;
                 }
-                Err(error) => {
-                    let _ = fs::remove_file(&paths.partial);
-                    return Err(format!(
-                        "CAS object failed SHA-256 after a clean retry: {error}"
+                Ok(false) => {
+                    partial.discard().map_err(|error| {
+                        managed_error("Cannot discard corrupt CAS partial", error)
+                    })?;
+                    return Err(CasError::Failed(
+                        "CAS object failed SHA-256 after a clean retry".into(),
                     ));
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -244,7 +367,7 @@ struct RetryBudget {
 }
 
 impl RetryBudget {
-    async fn wait(&mut self, retry_after: Option<Duration>) -> Result<(), String> {
+    async fn wait(&mut self, retry_after: Option<Duration>) -> CasResult<()> {
         if self.used >= MAX_TRANSIENT_RETRIES {
             return Err("Spark temporary failure retry limit was reached".into());
         }
@@ -264,86 +387,97 @@ impl RetryBudget {
 }
 
 struct CasPaths {
-    directory: PathBuf,
-    final_path: PathBuf,
-    partial: PathBuf,
-    lock: PathBuf,
+    directory: RelativeManagedPath,
+    final_path: RelativeManagedPath,
+    partial: RelativeManagedPath,
+    lock: RelativeManagedPath,
+    locks: RelativeManagedPath,
+    quarantine: RelativeManagedPath,
 }
 
 impl CasPaths {
-    fn new(root: &Path, sha256: &str) -> Result<Self, String> {
-        let relative = cas_object_relative_path(sha256)?;
-        let directory = root.join("sha256").join(&sha256[..2]);
+    fn new(sha256: &str) -> Result<Self, String> {
+        let final_path = cas_object_relative_path(sha256)?;
+        let directory = RelativeManagedPath::new(&format!("sha256/{}", &sha256[..2]))
+            .map_err(|error| format!("Cannot construct CAS shard path: {error}"))?;
+        let partial = directory
+            .join_component(&format!(".{sha256}.part"))
+            .map_err(|error| format!("Cannot construct CAS partial path: {error}"))?;
+        let locks =
+            RelativeManagedPath::new("locks").expect("the static CAS lock directory is valid");
+        let lock = locks
+            .join_component(&format!("{sha256}.lock"))
+            .map_err(|error| format!("Cannot construct CAS lock path: {error}"))?;
         Ok(Self {
-            final_path: relative.join_to(root),
-            partial: directory.join(format!(".{sha256}.part")),
-            lock: root.join("locks").join(format!("{sha256}.lock")),
+            final_path,
+            partial,
+            lock,
+            locks,
+            quarantine: RelativeManagedPath::new("quarantine")
+                .expect("the static CAS quarantine directory is valid"),
             directory,
         })
     }
 
-    fn prepare(&self) -> Result<(), String> {
-        inspect_existing_ancestors(&self.directory)?;
-        fs::create_dir_all(&self.directory)
-            .map_err(|error| format!("Cannot create CAS object directory: {error}"))?;
-        if let Some(lock_root) = self.lock.parent() {
-            inspect_existing_ancestors(lock_root)?;
-            fs::create_dir_all(lock_root)
-                .map_err(|error| format!("Cannot create CAS lock directory: {error}"))?;
-            inspect_existing_ancestors(lock_root)?;
-        }
-        inspect_existing_ancestors(&self.directory)
+    fn prepare(&self, root: &OwnedCasRoot) -> CasResult<PreparedCasPaths> {
+        root.revalidate().map_err(CasError::Failed)?;
+        let directory = ensure_directory_chain(root.managed_root(), &self.directory)
+            .map_err(|error| managed_error("Cannot prepare CAS shard directory", error))?;
+        let locks = ensure_directory_chain(root.managed_root(), &self.locks)
+            .map_err(|error| managed_error("Cannot prepare CAS lock directory", error))?;
+        let quarantine = ensure_directory_chain(root.managed_root(), &self.quarantine)
+            .map_err(|error| managed_error("Cannot prepare CAS quarantine directory", error))?;
+        root.revalidate().map_err(CasError::Failed)?;
+        Ok(PreparedCasPaths {
+            _directory: directory,
+            _locks: locks,
+            _quarantine: quarantine,
+        })
     }
 }
 
-async fn acquire_object_lock(path: &Path) -> Result<File, String> {
-    let file = open_or_create_regular_single_link(path)
-        .map_err(|error| format!("Cannot open CAS object lock: {error}"))?;
+struct PreparedCasPaths {
+    _directory: GuardedDirectoryChain,
+    _locks: GuardedDirectoryChain,
+    _quarantine: GuardedDirectoryChain,
+}
+
+impl PreparedCasPaths {
+    fn revalidate(&self) -> CasResult<()> {
+        self._directory
+            .revalidate()
+            .map_err(|error| managed_error("CAS shard directory changed", error))?;
+        self._locks
+            .revalidate()
+            .map_err(|error| managed_error("CAS lock directory changed", error))?;
+        self._quarantine
+            .revalidate()
+            .map_err(|error| managed_error("CAS quarantine directory changed", error))
+    }
+}
+
+async fn acquire_object_lock(
+    root: &OwnedCasRoot,
+    path: &RelativeManagedPath,
+) -> CasResult<ManagedLockFile> {
+    root.revalidate().map_err(CasError::Failed)?;
+    let file = open_or_create_lock_file(root.managed_root(), path)
+        .map_err(|error| managed_error("Cannot open CAS object lock", error))?;
     let started = Instant::now();
     loop {
-        match file.try_lock_exclusive() {
+        match file.file().try_lock_exclusive() {
             Ok(()) => return Ok(file),
             Err(error) if started.elapsed() < Duration::from_secs(10) => {
                 let _ = error;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Err(error) => return Err(format!("CAS object is locked by another process: {error}")),
+            Err(error) => {
+                return Err(CasError::Failed(format!(
+                    "CAS object is locked by another process: {error}"
+                )))
+            }
         }
     }
-}
-
-fn prepare_partial(path: &Path, expected_size: u64) -> Result<u64, String> {
-    if !path.exists() {
-        OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| format!("Cannot create CAS partial: {error}"))?;
-        return Ok(0);
-    }
-    let file = open_regular_single_link(path, true)?;
-    let length = file
-        .metadata()
-        .map_err(|error| format!("Cannot inspect CAS partial: {error}"))?
-        .len();
-    if length > expected_size {
-        file.set_len(0)
-            .map_err(|error| format!("Cannot reset oversized CAS partial: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("Cannot flush reset CAS partial: {error}"))?;
-        Ok(0)
-    } else {
-        Ok(length)
-    }
-}
-
-fn truncate_partial(path: &Path) -> Result<(), String> {
-    let file = open_regular_single_link(path, true)?;
-    file.set_len(0)
-        .map_err(|error| format!("Cannot truncate CAS partial: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("Cannot flush CAS partial: {error}"))
 }
 
 fn validate_download_response(
@@ -391,99 +525,186 @@ fn validate_download_response(
 
 async fn stream_response(
     response: Response,
-    path: &Path,
+    partial: &mut ResumableManagedFile,
     write_offset: u64,
     expected_size: u64,
 ) -> Result<(), StreamResponseError> {
-    let mut file = open_regular_single_link(path, true)?;
-    file.seek(SeekFrom::Start(write_offset))
-        .map_err(|error| format!("Cannot seek CAS partial: {error}"))?;
     let mut written = write_offset;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(_) => {
-                file.sync_all().map_err(|error| {
-                    StreamResponseError::Fatal(format!(
-                        "Cannot flush interrupted CAS partial: {error}"
+                partial.sync_all().map_err(|error| {
+                    StreamResponseError::Fatal(managed_error(
+                        "Cannot flush interrupted CAS partial",
+                        error,
                     ))
                 })?;
                 return Err(StreamResponseError::Retryable);
             }
         };
         written = written.checked_add(chunk.len() as u64).ok_or_else(|| {
-            StreamResponseError::Fatal("CAS object byte counter overflowed".into())
+            StreamResponseError::Fatal(CasError::Failed(
+                "CAS object byte counter overflowed".into(),
+            ))
         })?;
         if written > expected_size {
-            return Err(StreamResponseError::Fatal(
+            return Err(StreamResponseError::Fatal(CasError::Failed(
                 "Spark object stream exceeded the signed size".into(),
-            ));
+            )));
         }
-        file.write_all(&chunk).map_err(|error| {
-            StreamResponseError::Fatal(format!("Cannot write CAS partial: {error}"))
-        })?;
+        partial
+            .write_all_at(written - chunk.len() as u64, &chunk)
+            .map_err(|error| {
+                StreamResponseError::Fatal(managed_error("Cannot write CAS partial", error))
+            })?;
     }
-    file.sync_all().map_err(|error| {
-        StreamResponseError::Fatal(format!("Cannot flush CAS partial: {error}"))
+    partial.sync_all().map_err(|error| {
+        StreamResponseError::Fatal(managed_error("Cannot flush CAS partial", error))
     })?;
     Ok(())
 }
 
 enum StreamResponseError {
     Retryable,
-    Fatal(String),
+    Fatal(CasError),
 }
 
-impl From<String> for StreamResponseError {
-    fn from(error: String) -> Self {
-        Self::Fatal(error)
+enum ExistingFinal {
+    Missing,
+    Corrupt,
+    Verified(VerifiedCasObject),
+}
+
+fn audit_existing_final(
+    root: &OwnedCasRoot,
+    expected: &ExpectedObject,
+    resumed_bytes: u64,
+) -> CasResult<ExistingFinal> {
+    root.revalidate().map_err(CasError::Failed)?;
+    let relative = cas_object_relative_path(&expected.sha256).map_err(CasError::Failed)?;
+    let mut file = match ImmutableManagedFile::open(root.managed_root(), &relative) {
+        Ok(file) => file,
+        Err(ManagedFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExistingFinal::Missing)
+        }
+        Err(error) => return Err(managed_error("Cannot inspect canonical CAS object", error)),
+    };
+    if file.info().size != expected.size {
+        return Ok(ExistingFinal::Corrupt);
+    }
+    let digest = file
+        .sha256(expected.size)
+        .map_err(|error| managed_error("Cannot hash canonical CAS object", error))?;
+    if digest.size != expected.size || digest.sha256 != expected.sha256 {
+        return Ok(ExistingFinal::Corrupt);
+    }
+    let (binding_nonce, install_id, install_identity, objects_identity) = root.binding();
+    Ok(ExistingFinal::Verified(VerifiedCasObject {
+        binding_nonce,
+        install_id,
+        install_root_identity: install_identity.clone(),
+        objects_root_identity: objects_identity.clone(),
+        sha256: expected.sha256.clone(),
+        size: expected.size,
+        resumed_bytes,
+    }))
+}
+
+pub(super) fn verify_existing_object(
+    root: &OwnedCasRoot,
+    expected: &ExpectedObject,
+    resumed_bytes: u64,
+) -> CasResult<VerifiedCasObject> {
+    validate_expected(expected).map_err(CasError::Failed)?;
+    match audit_existing_final(root, expected, resumed_bytes)? {
+        ExistingFinal::Verified(object) => Ok(object),
+        ExistingFinal::Missing => Err(CasError::Failed("Canonical CAS object is missing".into())),
+        ExistingFinal::Corrupt => Err(CasError::Failed(
+            "Canonical CAS object does not match its signed digest".into(),
+        )),
     }
 }
 
-fn verify_file(path: &Path, expected: &ExpectedObject) -> Result<(), String> {
-    let mut file = open_regular_single_link(path, false)?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("Cannot inspect CAS file: {error}"))?;
-    if metadata.len() != expected.size {
-        return Err(format!(
-            "CAS size mismatch: {}/{}",
-            metadata.len(),
-            expected.size
+fn partial_matches(
+    partial: &mut ResumableManagedFile,
+    expected: &ExpectedObject,
+) -> CasResult<bool> {
+    let digest = partial
+        .sha256(expected.size)
+        .map_err(|error| managed_error("Cannot hash CAS partial", error))?;
+    Ok(digest.size == expected.size && digest.sha256 == expected.sha256)
+}
+
+fn discard_stale_partial(
+    root: &OwnedCasRoot,
+    paths: &CasPaths,
+    expected_size: u64,
+) -> CasResult<()> {
+    let Some(partial) = ResumableManagedFile::open_existing(
+        root.managed_root(),
+        paths.partial.clone(),
+        expected_size,
+    )
+    .map_err(|error| managed_error("Cannot inspect stale CAS partial", error))?
+    else {
+        return Ok(());
+    };
+    partial
+        .discard()
+        .map_err(|error| managed_error("Cannot discard stale CAS partial", error))
+}
+
+fn activate_partial(
+    root: &OwnedCasRoot,
+    paths: &CasPaths,
+    expected: &ExpectedObject,
+    mut partial: ResumableManagedFile,
+    resumed_bytes: u64,
+) -> CasResult<VerifiedCasObject> {
+    if !partial_matches(&mut partial, expected)? {
+        return Err(CasError::Failed(
+            "CAS partial changed before activation".into(),
         ));
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("Cannot rewind CAS file: {error}"))?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("Cannot hash CAS file: {error}"))?;
-        if read == 0 {
-            break;
+    root.revalidate().map_err(CasError::Failed)?;
+    match partial
+        .commit_no_replace(paths.final_path.clone())
+        .map_err(|error| managed_error("Cannot atomically activate CAS object", error))?
+    {
+        ResumableCommitOutcome::Committed(committed) => {
+            if committed.size != expected.size {
+                return Err(CasError::AppliedButDurabilityUnconfirmed {
+                    destination: committed.destination.as_str().to_owned(),
+                    detail: "committed CAS object has an unexpected size".into(),
+                });
+            }
         }
-        hash.update(&buffer[..read]);
+        ResumableCommitOutcome::DestinationExists(mut duplicate) => {
+            let ExistingFinal::Verified(_) = audit_existing_final(root, expected, resumed_bytes)?
+            else {
+                return Err(CasError::Failed(
+                    "Concurrent CAS winner is absent or does not match the signed object".into(),
+                ));
+            };
+            if !partial_matches(&mut duplicate, expected)? {
+                return Err(CasError::Failed(
+                    "CAS partial changed while accepting a concurrent winner".into(),
+                ));
+            }
+            duplicate.discard().map_err(|error| {
+                managed_error("Cannot discard duplicate exact CAS partial", error)
+            })?;
+        }
     }
-    let actual = format!("{:x}", hash.finalize());
-    if actual != expected.sha256 {
-        return Err(format!("CAS SHA-256 mismatch: {actual}"));
+    root.revalidate().map_err(CasError::Failed)?;
+    match audit_existing_final(root, expected, resumed_bytes)? {
+        ExistingFinal::Verified(object) => Ok(object),
+        ExistingFinal::Missing | ExistingFinal::Corrupt => Err(CasError::Failed(
+            "Activated CAS object failed its final exact audit".into(),
+        )),
     }
-    Ok(())
-}
-
-fn activate_partial(paths: &CasPaths, expected: &ExpectedObject) -> Result<(), String> {
-    verify_file(&paths.partial, expected)?;
-    if paths.final_path.exists() {
-        verify_file(&paths.final_path, expected)?;
-        fs::remove_file(&paths.partial)
-            .map_err(|error| format!("Cannot remove duplicate CAS partial: {error}"))?;
-        return Ok(());
-    }
-    fs::rename(&paths.partial, &paths.final_path)
-        .map_err(|error| format!("Cannot atomically activate CAS object: {error}"))?;
-    verify_file(&paths.final_path, expected)
 }
 
 fn validate_expected(expected: &ExpectedObject) -> Result<(), String> {
@@ -523,8 +744,14 @@ fn map_spark_error(error: SparkClientError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_manager::storage::select_install_directory;
+    use sha2::{Digest, Sha256};
     use std::{
+        fs,
+        fs::OpenOptions,
+        io::{Read, Write},
         net::{TcpListener, TcpStream},
+        path::PathBuf,
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -548,6 +775,33 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    fn owned_root(label: &str) -> (PathBuf, OwnedCasRoot) {
+        let install = temp_root(label);
+        let owned = select_install_directory(&install)
+            .expect("claim test install")
+            .into_owned_cas_root();
+        (install, owned)
+    }
+
+    fn absolute(root: &OwnedCasRoot, relative: &RelativeManagedPath) -> PathBuf {
+        relative.join_to(root.managed_root())
+    }
+
+    fn read_verified(root: &OwnedCasRoot, object: &VerifiedCasObject) -> Vec<u8> {
+        object
+            .open(root)
+            .expect("open verified object")
+            .read_bounded(object.size())
+            .expect("read verified object")
+    }
+
+    fn write_partial(root: &OwnedCasRoot, hash: &str, bytes: &[u8]) {
+        let paths = CasPaths::new(hash).expect("CAS paths");
+        let guards = paths.prepare(root).expect("prepare CAS paths");
+        fs::write(absolute(root, &paths.partial), bytes).expect("write partial");
+        drop(guards);
     }
 
     fn spawn_server(
@@ -644,19 +898,20 @@ mod tests {
 
     #[test]
     fn verifies_cached_objects_and_rejects_same_size_corruption() {
-        let root = temp_root("verify");
-        fs::create_dir_all(&root).unwrap();
+        let (install, root) = owned_root("verify");
         let bytes = b"trusted-object";
         let expected = ExpectedObject {
             sha256: format!("{:x}", Sha256::digest(bytes)),
             size: bytes.len() as u64,
         };
-        let path = root.join("object");
+        let path = absolute(&root, &cas_object_relative_path(&expected.sha256).unwrap());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, bytes).unwrap();
-        assert!(verify_file(&path, &expected).is_ok());
+        assert!(verify_existing_object(&root, &expected, 0).is_ok());
         fs::write(&path, b"tampered-objec").unwrap();
-        assert!(verify_file(&path, &expected).is_err());
-        let _ = fs::remove_dir_all(root);
+        assert!(verify_existing_object(&root, &expected, 0).is_err());
+        drop(root);
+        let _ = fs::remove_dir_all(install);
     }
 
     #[test]
@@ -670,12 +925,9 @@ mod tests {
     #[test]
     fn object_paths_are_content_addressed_and_sharded() {
         let hash = "ab".repeat(32);
-        let paths = CasPaths::new(Path::new("cache"), &hash).unwrap();
-        assert_eq!(paths.final_path, Path::new("cache/sha256/ab").join(&hash));
-        assert_eq!(
-            paths.partial,
-            Path::new("cache/sha256/ab").join(format!(".{hash}.part"))
-        );
+        let paths = CasPaths::new(&hash).unwrap();
+        assert_eq!(paths.final_path.as_str(), format!("sha256/ab/{hash}"));
+        assert_eq!(paths.partial.as_str(), format!("sha256/ab/.{hash}.part"));
         assert_eq!(
             cas_object_relative_path(&hash).unwrap().as_str(),
             format!("sha256/ab/{hash}")
@@ -735,8 +987,8 @@ mod tests {
         ];
 
         let server = spawn_server(listener, responses);
-        let root = temp_root("transient-replan");
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("transient-replan");
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let result = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -750,9 +1002,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(fs::read(result.path).unwrap(), bytes);
+        assert_eq!(read_verified(&root, &result), bytes);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -796,8 +1050,8 @@ mod tests {
             },
         ];
         let server = spawn_server(listener, responses);
-        let root = temp_root("body-replan");
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("body-replan");
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let result = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -811,10 +1065,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.resumed_bytes, 0);
-        assert_eq!(fs::read(result.path).unwrap(), bytes);
+        assert_eq!(result.resumed_bytes(), 0);
+        assert_eq!(read_verified(&root, &result), bytes);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -860,11 +1116,9 @@ mod tests {
             },
         ];
         let server = spawn_server(listener, responses);
-        let root = temp_root("range-reset");
-        let paths = CasPaths::new(&root, &hash).unwrap();
-        paths.prepare().unwrap();
-        fs::write(&paths.partial, vec![b'x'; bytes.len()]).unwrap();
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("range-reset");
+        write_partial(&root, &hash, &vec![b'x'; bytes.len()]);
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let result = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -878,10 +1132,66 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.resumed_bytes, 0);
-        assert_eq!(fs::read(result.path).unwrap(), bytes);
+        assert_eq!(result.resumed_bytes(), 0);
+        assert_eq!(read_verified(&root, &result), bytes);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_partial_is_truncated_on_the_same_safe_handle() {
+        let bytes = b"trusted-object";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}/");
+        let object_path = format!(
+            "/api/spark2/v1/objects/{hash}?token={}",
+            "signed-object-token-".repeat(3)
+        );
+        let server = spawn_server(
+            listener,
+            vec![
+                ScriptedResponse {
+                    expected_path: "/api/spark2/v1/download-plan".into(),
+                    expected_range: None,
+                    status: "200 OK",
+                    headers: vec![("Content-Type", "application/json")],
+                    body: plan_body(&origin, &hash),
+                },
+                ScriptedResponse {
+                    expected_path: object_path,
+                    expected_range: Some(None),
+                    status: "200 OK",
+                    headers: vec![],
+                    body: bytes.to_vec(),
+                },
+            ],
+        );
+        let (install, root) = owned_root("oversized-partial");
+        write_partial(&root, &hash, &[b'x'; 32]);
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
+        let result = downloader
+            .ensure_object(
+                BuildChannel::Stable,
+                PresetId::Medium,
+                RELEASE_ID,
+                &ExpectedObject {
+                    sha256: hash,
+                    size: bytes.len() as u64,
+                },
+                BEARER,
+            )
+            .await
+            .expect("oversized partial resets");
+        assert_eq!(result.resumed_bytes(), 0);
+        assert_eq!(read_verified(&root, &result), bytes);
+        server.join().unwrap();
+        drop(downloader);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -910,11 +1220,9 @@ mod tests {
             },
         ];
         let server = spawn_server(listener, responses);
-        let root = temp_root("exact-206");
-        let paths = CasPaths::new(&root, &hash).unwrap();
-        paths.prepare().unwrap();
-        fs::write(&paths.partial, &bytes[..split]).unwrap();
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("exact-206");
+        write_partial(&root, &hash, &bytes[..split]);
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let result = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -928,10 +1236,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.resumed_bytes, split as u64);
-        assert_eq!(fs::read(result.path).unwrap(), bytes);
+        assert_eq!(result.resumed_bytes(), split as u64);
+        assert_eq!(read_verified(&root, &result), bytes);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -960,11 +1270,9 @@ mod tests {
             },
         ];
         let server = spawn_server(listener, responses);
-        let root = temp_root("full-200-reset");
-        let paths = CasPaths::new(&root, &hash).unwrap();
-        paths.prepare().unwrap();
-        fs::write(&paths.partial, &bytes[..split]).unwrap();
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("full-200-reset");
+        write_partial(&root, &hash, &bytes[..split]);
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let result = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -978,10 +1286,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.resumed_bytes, 0);
-        assert_eq!(fs::read(result.path).unwrap(), bytes);
+        assert_eq!(result.resumed_bytes(), 0);
+        assert_eq!(read_verified(&root, &result), bytes);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1001,8 +1311,8 @@ mod tests {
                 body: Vec::new(),
             }],
         );
-        let root = temp_root("terminal-entitlement");
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("terminal-entitlement");
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let error = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -1016,9 +1326,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.starts_with("access_forbidden:"));
+        assert!(error.to_string().starts_with("access_forbidden:"));
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1050,8 +1362,8 @@ mod tests {
             listener,
             vec![plan(), forbidden_object(), plan(), forbidden_object()],
         );
-        let root = temp_root("bounded-object-auth");
-        let downloader = CasDownloader::new(root.clone(), SparkClient::new_for_test(&origin));
+        let (install, root) = owned_root("bounded-object-auth");
+        let downloader = CasDownloader::new(&root, SparkClient::new_for_test(&origin));
         let error = downloader
             .ensure_object(
                 BuildChannel::Stable,
@@ -1065,8 +1377,193 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(error, "Spark object authorization expired repeatedly");
+        assert_eq!(
+            error.to_string(),
+            "Spark object authorization expired repeatedly"
+        );
         server.join().unwrap();
-        let _ = fs::remove_dir_all(root);
+        drop(downloader);
+        drop(root);
+        let _ = fs::remove_dir_all(install);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hardlinked_partial_and_lock_are_rejected_before_network_access() {
+        for target in ["partial", "lock"] {
+            let (install, root) = owned_root(&format!("hardlink-{target}"));
+            let bytes = b"hardlink-fixture";
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            let paths = CasPaths::new(&hash).unwrap();
+            let guards = paths.prepare(&root).unwrap();
+            let target_path = match target {
+                "partial" => {
+                    let path = absolute(&root, &paths.partial);
+                    fs::write(&path, &bytes[..4]).unwrap();
+                    path
+                }
+                "lock" => absolute(&root, &paths.lock),
+                _ => unreachable!(),
+            };
+            if target == "lock" {
+                fs::write(&target_path, b"").unwrap();
+            }
+            let alias = install.join(format!("{target}-alias"));
+            if fs::hard_link(&target_path, &alias).is_ok() {
+                let downloader =
+                    CasDownloader::new(&root, SparkClient::new_for_test("http://127.0.0.1:9/"));
+                let error = downloader
+                    .ensure_object(
+                        BuildChannel::Stable,
+                        PresetId::Medium,
+                        RELEASE_ID,
+                        &ExpectedObject {
+                            sha256: hash,
+                            size: bytes.len() as u64,
+                        },
+                        BEARER,
+                    )
+                    .await
+                    .expect_err("hardlinked managed node must fail closed");
+                assert!(error.to_string().contains("single-link"));
+                drop(downloader);
+            }
+            drop(guards);
+            drop(root);
+            fs::remove_dir_all(install).unwrap();
+        }
+    }
+
+    #[test]
+    fn linked_partial_is_never_followed() {
+        let (install, root) = owned_root("linked-partial");
+        let hash = "cd".repeat(32);
+        let paths = CasPaths::new(&hash).unwrap();
+        let guards = paths.prepare(&root).unwrap();
+        let target = install.join("outside-partial-target");
+        fs::write(&target, b"do-not-touch").unwrap();
+        let partial_path = absolute(&root, &paths.partial);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &partial_path).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &partial_path).is_ok();
+        #[cfg(all(not(unix), not(windows)))]
+        let linked = false;
+        if linked {
+            assert!(ResumableManagedFile::open_or_create(
+                root.managed_root(),
+                paths.partial.clone(),
+                1024,
+            )
+            .is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"do-not-touch");
+        }
+        drop(guards);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[test]
+    fn held_resumable_handle_denies_writer_and_parent_rename_on_windows() {
+        let (install, root) = owned_root("held-partial");
+        let hash = "ab".repeat(32);
+        let paths = CasPaths::new(&hash).unwrap();
+        let guards = paths.prepare(&root).unwrap();
+        let partial =
+            ResumableManagedFile::open_or_create(root.managed_root(), paths.partial.clone(), 1024)
+                .unwrap();
+        let partial_path = absolute(&root, &paths.partial);
+        let shard = absolute(&root, &paths.directory);
+        let moved = root.managed_root().join("sha256/moved-ab");
+        #[cfg(windows)]
+        {
+            assert!(OpenOptions::new().write(true).open(&partial_path).is_err());
+            assert!(fs::rename(&shard, &moved).is_err());
+            assert_eq!(partial.len().unwrap(), 0);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (&partial_path, &shard, &moved);
+            assert_eq!(partial.len().unwrap(), 0);
+        }
+        drop(partial);
+        drop(guards);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[test]
+    fn exact_concurrent_winner_is_reaudited_and_duplicate_partial_is_removed() {
+        let (install, root) = owned_root("exact-winner");
+        let bytes = b"exact-concurrent-winner";
+        let expected = ExpectedObject {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        };
+        let paths = CasPaths::new(&expected.sha256).unwrap();
+        let guards = paths.prepare(&root).unwrap();
+        fs::write(absolute(&root, &paths.final_path), bytes).unwrap();
+        fs::write(absolute(&root, &paths.partial), bytes).unwrap();
+        let partial = ResumableManagedFile::open_or_create(
+            root.managed_root(),
+            paths.partial.clone(),
+            expected.size,
+        )
+        .unwrap();
+        let verified = activate_partial(&root, &paths, &expected, partial, 7)
+            .expect("accept exact no-replace winner");
+        assert_eq!(verified.resumed_bytes(), 7);
+        assert_eq!(read_verified(&root, &verified), bytes);
+        assert!(fs::symlink_metadata(absolute(&root, &paths.partial)).is_err());
+        drop(guards);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_exact_final_discards_crash_leftover_partial_without_network() {
+        let (install, root) = owned_root("cached-final-stale-partial");
+        let bytes = b"already-complete-object";
+        let expected = ExpectedObject {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        };
+        let paths = CasPaths::new(&expected.sha256).unwrap();
+        let guards = paths.prepare(&root).unwrap();
+        fs::write(absolute(&root, &paths.final_path), bytes).unwrap();
+        fs::write(absolute(&root, &paths.partial), b"stale").unwrap();
+        drop(guards);
+        let downloader =
+            CasDownloader::new(&root, SparkClient::new_for_test("http://127.0.0.1:9/"));
+        let verified = downloader
+            .ensure_object(
+                BuildChannel::Stable,
+                PresetId::Medium,
+                RELEASE_ID,
+                &expected,
+                BEARER,
+            )
+            .await
+            .expect("cached object should not use network");
+        assert_eq!(read_verified(&root, &verified), bytes);
+        assert!(fs::symlink_metadata(absolute(&root, &paths.partial)).is_err());
+        drop(downloader);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[test]
+    fn durability_unknown_is_a_distinct_terminal_cas_error() {
+        let error = managed_error(
+            "final CAS parent flush",
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: PathBuf::from("cache/objects/sha256/ab/object"),
+                detail: "injected directory sync failure".into(),
+            },
+        );
+        assert!(matches!(
+            &error,
+            CasError::AppliedButDurabilityUnconfirmed { .. }
+        ));
+        assert!(error.to_string().starts_with("cas_durability_unconfirmed:"));
     }
 }

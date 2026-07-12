@@ -1,3 +1,6 @@
+use super::managed_fs::{
+    FileIdentity, GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath,
+};
 use fs2::{available_space, FileExt};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,9 +27,120 @@ pub struct LoadedConfig {
 }
 
 pub struct ValidatedInstallDirectory {
-    pub path: PathBuf,
-    pub free_bytes: u64,
-    pub install_id: Uuid,
+    path: PathBuf,
+    free_bytes: u64,
+    install_id: Uuid,
+    // The production coordinator consumes this lease in the next isolated integration slice.
+    #[allow(dead_code)]
+    cas_root: OwnedCasRoot,
+}
+
+/// A non-cloneable lease for the single CAS namespace owned by a validated Fragment install.
+/// Its location is fixed to `<install>/cache/objects`; callers can never supply a CAS root.
+pub(super) struct OwnedCasRoot {
+    binding_nonce: Uuid,
+    install_id: Uuid,
+    install_root: PathBuf,
+    objects_root: PathBuf,
+    owner_marker: ImmutableManagedFile,
+    owner_marker_bytes: Vec<u8>,
+    objects_chain: GuardedDirectoryChain,
+}
+
+impl ValidatedInstallDirectory {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn free_bytes(&self) -> u64 {
+        self.free_bytes
+    }
+
+    pub fn install_id(&self) -> Uuid {
+        self.install_id
+    }
+
+    /// Consumes the fresh validation token so one validation cannot be rebound to multiple roots.
+    #[allow(dead_code)]
+    pub(super) fn into_owned_cas_root(self) -> OwnedCasRoot {
+        self.cas_root
+    }
+}
+
+impl OwnedCasRoot {
+    fn bind(install_root: &Path, expected_install_id: Uuid) -> Result<Self, String> {
+        let objects_relative =
+            RelativeManagedPath::new("cache/objects").expect("the static CAS root path is valid");
+        let objects_chain = GuardedDirectoryChain::open(install_root, &objects_relative)
+            .map_err(|error| format!("Cannot bind the owned CAS directory: {error}"))?;
+        objects_chain
+            .revalidate()
+            .map_err(|error| format!("Cannot revalidate the owned CAS directory: {error}"))?;
+
+        let marker_relative =
+            RelativeManagedPath::new(OWNER_MARKER).expect("the static owner marker path is valid");
+        let owner_marker = ImmutableManagedFile::open(objects_chain.root_path(), &marker_relative)
+            .map_err(|error| format!("Cannot lease the Fragment owner marker: {error}"))?;
+        let marker_bytes = owner_marker
+            .read_bounded_shared(4096)
+            .map_err(|error| format!("Cannot read the leased Fragment owner marker: {error}"))?;
+        let marker: OwnerMarker = serde_json::from_slice(&marker_bytes)
+            .map_err(|_| "The leased Fragment owner marker is corrupt".to_string())?;
+        if marker.schema_version != 1
+            || marker.owner != "fragment-launcher"
+            || marker.install_id != expected_install_id
+        {
+            return Err(
+                "The leased Fragment owner marker does not match the validated install".into(),
+            );
+        }
+
+        Ok(Self {
+            binding_nonce: Uuid::new_v4(),
+            install_id: expected_install_id,
+            install_root: objects_chain.root_path().to_path_buf(),
+            objects_root: objects_chain.leaf().path().to_path_buf(),
+            owner_marker,
+            owner_marker_bytes: marker_bytes,
+            objects_chain,
+        })
+    }
+
+    pub(super) fn managed_root(&self) -> &Path {
+        &self.objects_root
+    }
+
+    pub(super) fn binding(&self) -> (Uuid, Uuid, &FileIdentity, &FileIdentity) {
+        (
+            self.binding_nonce,
+            self.install_id,
+            self.objects_chain.root_identity(),
+            &self.objects_chain.leaf().info().identity,
+        )
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), String> {
+        self.objects_chain
+            .revalidate()
+            .map_err(|error| format!("Owned CAS directory changed: {error}"))?;
+        self.owner_marker
+            .revalidate()
+            .map_err(|error| format!("Owned Fragment marker changed: {error}"))?;
+        if self
+            .owner_marker
+            .read_bounded_shared(4096)
+            .map_err(|error| format!("Cannot re-read the owned Fragment marker: {error}"))?
+            != self.owner_marker_bytes
+        {
+            return Err("Owned Fragment marker bytes changed".into());
+        }
+        if self.objects_chain.root_path() != self.install_root
+            || self.objects_chain.leaf().path() != self.objects_root
+        {
+            return Err("Owned CAS binding changed".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,14 +195,16 @@ fn validate_install_directory(
     ensure_managed_layout(&canonical)?;
     inspect_existing_ancestors(&canonical.join("instances"))?;
     inspect_existing_ancestors(&canonical.join("cache"))?;
-    probe_filesystem(&canonical)?;
+    let cas_root = OwnedCasRoot::bind(&canonical, marker.install_id)?;
+    probe_filesystem(&cas_root.install_root)?;
 
-    let free_bytes = available_space(&canonical)
+    let free_bytes = available_space(&cas_root.install_root)
         .map_err(|error| format!("Не удалось определить свободное место: {error}"))?;
     Ok(ValidatedInstallDirectory {
-        path: canonical,
+        path: cas_root.install_root.clone(),
         free_bytes,
         install_id: marker.install_id,
+        cas_root,
     })
 }
 
@@ -527,7 +643,11 @@ pub(super) fn replace_file(source: &Path, destination: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::Arc,
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn refuses_to_claim_a_non_empty_directory() {
@@ -555,8 +675,84 @@ mod tests {
                 .as_nanos()
         ));
         let selected = select_install_directory(&root).expect("claim empty directory");
-        assert!(validate_owned_install_directory(&root, selected.install_id).is_ok());
+        assert!(validate_owned_install_directory(&root, selected.install_id()).is_ok());
         assert!(validate_owned_install_directory(&root, Uuid::new_v4()).is_err());
+        drop(selected);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_cas_marker_revalidation_is_cursor_independent() {
+        let root = std::env::temp_dir().join(format!(
+            "fragment-storage-cas-concurrency-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let owned = Arc::new(
+            select_install_directory(&root)
+                .expect("claim empty directory")
+                .into_owned_cas_root(),
+        );
+        let threads = (0..8)
+            .map(|_| {
+                let owned = Arc::clone(&owned);
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        owned.revalidate().expect("concurrent root revalidation");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("revalidation thread");
+        }
+        drop(owned);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_cas_root_is_exactly_the_install_objects_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "fragment-storage-exact-cas-root-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let validated = select_install_directory(&root).expect("claim empty directory");
+        let expected = validated.path().join("cache/objects");
+        let owned = validated.into_owned_cas_root();
+        assert_eq!(owned.managed_root(), expected);
+        assert_ne!(owned.managed_root(), root.join("cache"));
+        assert_ne!(owned.managed_root(), root.join("objects"));
+        drop(owned);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_cas_root_denies_or_detects_install_root_substitution() {
+        let root = std::env::temp_dir().join(format!(
+            "fragment-storage-root-substitution-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let moved = root.with_extension("moved");
+        let owned = select_install_directory(&root)
+            .expect("claim empty directory")
+            .into_owned_cas_root();
+        match fs::rename(&root, &moved) {
+            Err(_) => owned.revalidate().expect("guarded root remains valid"),
+            Ok(()) => {
+                fs::create_dir(&root).expect("create substituted lexical root");
+                assert!(owned.revalidate().is_err());
+            }
+        }
+        drop(owned);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&moved);
     }
 }

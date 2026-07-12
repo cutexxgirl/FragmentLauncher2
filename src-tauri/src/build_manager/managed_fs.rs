@@ -469,6 +469,25 @@ impl GuardedDirectoryChain {
             .last()
             .expect("a guarded chain always contains its root")
     }
+
+    /// Re-proves that every lexical directory still resolves to the exact handle-bound identity.
+    /// This is needed on platforms where an open directory handle does not itself deny renames.
+    pub(super) fn revalidate(&self) -> ManagedFsResult<()> {
+        for directory in &self.directories {
+            verify_handle_path(&directory._handle, &directory.path)?;
+            let current = node_info(&directory._handle, &directory.path)?;
+            current.require_real_directory(&directory.path)?;
+            if current.identity != directory.info.identity
+                || current.case_sensitive_directory != directory.info.case_sensitive_directory
+            {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed directory identity changed: {}",
+                    directory.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn ensure_directory_chain(
@@ -526,6 +545,20 @@ impl ImmutableManagedFile {
         &self.info
     }
 
+    pub(super) fn revalidate(&self) -> ManagedFsResult<()> {
+        self._parent_chain.revalidate()?;
+        verify_handle_path(&self.file, &self.path)?;
+        let current = node_info(&self.file, &self.path)?;
+        current.require_regular_single_link(&self.path)?;
+        if current.identity != self.info.identity || current.size != self.info.size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Immutable managed file identity changed: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn read_bounded(&mut self, limit: u64) -> ManagedFsResult<Vec<u8>> {
         if self.info.size > limit || self.info.size > usize::MAX as u64 {
             return Err(ManagedFsError::UnsafeNode(format!(
@@ -541,6 +574,38 @@ impl ImmutableManagedFile {
             .take(limit.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|error| ManagedFsError::io("Cannot read managed file", &self.path, error))?;
+        if bytes.len() as u64 != self.info.size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed file size changed while it was read: {}",
+                self.path.display()
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Cursor-independent bounded read for immutable leases shared across concurrent operations.
+    pub(super) fn read_bounded_shared(&self, limit: u64) -> ManagedFsResult<Vec<u8>> {
+        if self.info.size > limit || self.info.size > usize::MAX as u64 {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed file exceeds the read limit: {}",
+                self.path.display()
+            )));
+        }
+        let mut bytes = vec![0_u8; self.info.size as usize];
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let read = positional_read(
+                &self.file,
+                &mut bytes[offset..],
+                u64::try_from(offset).expect("bounded file offset fits u64"),
+            )
+            .map_err(|error| ManagedFsError::io("Cannot read managed file", &self.path, error))?;
+            if read == 0 {
+                break;
+            }
+            offset += read;
+        }
+        bytes.truncate(offset);
         if bytes.len() as u64 != self.info.size {
             return Err(ManagedFsError::UnsafeNode(format!(
                 "Managed file size changed while it was read: {}",
@@ -796,6 +861,368 @@ pub(super) struct ExclusiveManagedFile {
     file: File,
     info: NodeInfo,
     parent_chain: GuardedDirectoryChain,
+}
+
+/// One identity-stable writable file used for resumable CAS downloads.
+///
+/// The same no-follow, single-link handle is retained across resume inspection, every write,
+/// hashing, fsync, and the final handle-based rename. Its guarded parent chain prevents a shard
+/// directory from being redirected while the object is in flight.
+pub(super) struct ResumableManagedFile {
+    root: PathBuf,
+    relative: RelativeManagedPath,
+    path: PathBuf,
+    file: File,
+    info: NodeInfo,
+    max_size: u64,
+    parent_chain: GuardedDirectoryChain,
+}
+
+pub(super) enum ResumableCommitOutcome {
+    Committed(CommittedManagedFile),
+    DestinationExists(ResumableManagedFile),
+}
+
+impl ResumableManagedFile {
+    pub(super) fn open_or_create(
+        root: &Path,
+        relative: RelativeManagedPath,
+        max_size: u64,
+    ) -> ManagedFsResult<Self> {
+        let parent_chain = GuardedDirectoryChain::open_parent(root, &relative)?;
+        let stable_root = parent_chain.root_path().to_path_buf();
+        let path = relative.join_to(&stable_root);
+        let mut opened = None;
+        for _ in 0..3 {
+            match open_resumable_file_nofollow(&path, true) {
+                Ok(file) => {
+                    opened = Some((file, true));
+                    break;
+                }
+                Err(ManagedFsError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    match open_resumable_file_nofollow(&path, false) {
+                        Ok(file) => {
+                            opened = Some((file, false));
+                            break;
+                        }
+                        Err(ManagedFsError::Io { source, .. })
+                            if source.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let (file, created) = opened.ok_or_else(|| {
+            ManagedFsError::Conflict(format!(
+                "Managed resumable file changed repeatedly while opening: {}",
+                path.display()
+            ))
+        })?;
+        let info = node_info(&file, &path)?;
+        info.require_regular_single_link(&path)?;
+        verify_handle_path(&file, &path)?;
+        if info.identity.volume_serial_number
+            != parent_chain.leaf().info.identity.volume_serial_number
+        {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file crossed a volume boundary: {}",
+                path.display()
+            )));
+        }
+        if created {
+            file.sync_all().map_err(|error| {
+                ManagedFsError::io("Cannot flush new managed resumable file", &path, error)
+            })?;
+            parent_chain.leaf().sync_directory().map_err(|error| {
+                ManagedFsError::AppliedButDurabilityUnconfirmed {
+                    destination: path.clone(),
+                    detail: format!("new resumable file parent flush failed: {error}"),
+                }
+            })?;
+        }
+        Ok(Self {
+            root: stable_root,
+            relative,
+            path,
+            file,
+            info,
+            max_size,
+            parent_chain,
+        })
+    }
+
+    pub(super) fn open_existing(
+        root: &Path,
+        relative: RelativeManagedPath,
+        max_size: u64,
+    ) -> ManagedFsResult<Option<Self>> {
+        let parent_chain = GuardedDirectoryChain::open_parent(root, &relative)?;
+        let stable_root = parent_chain.root_path().to_path_buf();
+        let path = relative.join_to(&stable_root);
+        let file = match open_resumable_file_nofollow(&path, false) {
+            Ok(file) => file,
+            Err(ManagedFsError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let info = node_info(&file, &path)?;
+        info.require_regular_single_link(&path)?;
+        verify_handle_path(&file, &path)?;
+        if info.identity.volume_serial_number
+            != parent_chain.leaf().info.identity.volume_serial_number
+        {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file crossed a volume boundary: {}",
+                path.display()
+            )));
+        }
+        Ok(Some(Self {
+            root: stable_root,
+            relative,
+            path,
+            file,
+            info,
+            max_size,
+            parent_chain,
+        }))
+    }
+
+    fn current_info_with_limit(&self, enforce_limit: bool) -> ManagedFsResult<NodeInfo> {
+        self.parent_chain.revalidate()?;
+        verify_handle_path(&self.file, &self.path)?;
+        let current = node_info(&self.file, &self.path)?;
+        current.require_regular_single_link(&self.path)?;
+        if current.identity != self.info.identity || (enforce_limit && current.size > self.max_size)
+        {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file identity or size changed: {}",
+                self.path.display()
+            )));
+        }
+        Ok(current)
+    }
+
+    pub(super) fn len(&self) -> ManagedFsResult<u64> {
+        Ok(self.current_info_with_limit(false)?.size)
+    }
+
+    pub(super) fn truncate_zero(&mut self) -> ManagedFsResult<()> {
+        self.current_info_with_limit(false)?;
+        self.file.set_len(0).map_err(|error| {
+            ManagedFsError::io("Cannot truncate managed resumable file", &self.path, error)
+        })?;
+        self.file.sync_all().map_err(|error| {
+            ManagedFsError::io(
+                "Cannot flush truncated managed resumable file",
+                &self.path,
+                error,
+            )
+        })?;
+        let after = self.current_info_with_limit(true)?;
+        if after.size != 0 {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file did not truncate to zero: {}",
+                self.path.display()
+            )));
+        }
+        self.info = after;
+        Ok(())
+    }
+
+    pub(super) fn write_all_at(
+        &mut self,
+        expected_offset: u64,
+        bytes: &[u8],
+    ) -> ManagedFsResult<u64> {
+        let before = self.current_info_with_limit(true)?;
+        if before.size != expected_offset {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable write offset no longer matches the file: {}",
+                self.path.display()
+            )));
+        }
+        let next = expected_offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| ManagedFsError::UnsafeNode("Managed resumable size overflow".into()))?;
+        if next > self.max_size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable write exceeds its signed limit: {}",
+                self.path.display()
+            )));
+        }
+        self.file
+            .seek(SeekFrom::Start(expected_offset))
+            .map_err(|error| {
+                ManagedFsError::io("Cannot seek managed resumable file", &self.path, error)
+            })?;
+        self.file.write_all(bytes).map_err(|error| {
+            ManagedFsError::io("Cannot write managed resumable file", &self.path, error)
+        })?;
+        let after = self.current_info_with_limit(true)?;
+        if after.size != next {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file size changed during write: {}",
+                self.path.display()
+            )));
+        }
+        self.info = after;
+        Ok(next)
+    }
+
+    pub(super) fn sync_all(&mut self) -> ManagedFsResult<()> {
+        self.current_info_with_limit(true)?;
+        self.file.sync_all().map_err(|error| {
+            ManagedFsError::io("Cannot flush managed resumable file", &self.path, error)
+        })?;
+        self.info = self.current_info_with_limit(true)?;
+        Ok(())
+    }
+
+    pub(super) fn sha256(&mut self, expected_size: u64) -> ManagedFsResult<FileDigest> {
+        let before = self.current_info_with_limit(true)?;
+        if before.size != expected_size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file size differs from the signed size: {}",
+                self.path.display()
+            )));
+        }
+        self.file.seek(SeekFrom::Start(0)).map_err(|error| {
+            ManagedFsError::io("Cannot rewind managed resumable file", &self.path, error)
+        })?;
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = self.file.read(&mut buffer).map_err(|error| {
+                ManagedFsError::io("Cannot hash managed resumable file", &self.path, error)
+            })?;
+            if read == 0 {
+                break;
+            }
+            total = total.checked_add(read as u64).ok_or_else(|| {
+                ManagedFsError::UnsafeNode("Managed resumable hash size overflow".into())
+            })?;
+            if total > expected_size {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed resumable file exceeded its signed size: {}",
+                    self.path.display()
+                )));
+            }
+            digest.update(&buffer[..read]);
+        }
+        let after = self.current_info_with_limit(true)?;
+        if total != expected_size || after.size != expected_size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file changed while hashing: {}",
+                self.path.display()
+            )));
+        }
+        self.info = after;
+        Ok(FileDigest {
+            size: total,
+            sha256: format!("{:x}", digest.finalize()),
+        })
+    }
+
+    pub(super) fn commit_no_replace(
+        mut self,
+        destination: RelativeManagedPath,
+    ) -> ManagedFsResult<ResumableCommitOutcome> {
+        self.sync_all()?;
+        if self.relative == destination {
+            return Err(ManagedFsError::Conflict(
+                "Managed resumable source and destination are identical".into(),
+            ));
+        }
+        let destination_parent = GuardedDirectoryChain::open_parent(&self.root, &destination)?;
+        ensure_same_root_and_volume(&self.parent_chain, &destination_parent)?;
+        let destination_path = destination.join_to(&self.root);
+        match rename_handle(&self.file, &destination_path, ManagedRenameMode::NoReplace) {
+            Ok(()) => {}
+            Err(ManagedFsError::Conflict(_)) => {
+                self.current_info_with_limit(true)?;
+                return Ok(ResumableCommitOutcome::DestinationExists(self));
+            }
+            Err(error) => return Err(error),
+        }
+        if let Err(error) = verify_handle_path(&self.file, &destination_path) {
+            return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: destination_path,
+                detail: format!("renamed resumable handle did not resolve: {error}"),
+            });
+        }
+        let after = node_info(&self.file, &destination_path).map_err(|error| {
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: destination_path.clone(),
+                detail: format!("cannot verify renamed resumable handle: {error}"),
+            }
+        })?;
+        if after.identity != self.info.identity
+            || after.kind != ManagedNodeKind::File
+            || after.reparse_tag != 0
+            || after.number_of_links != 1
+            || after.size > self.max_size
+        {
+            return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: destination_path,
+                detail: "renamed resumable object identity changed".into(),
+            });
+        }
+        flush_rename_parents(
+            self.parent_chain.leaf(),
+            destination_parent.leaf(),
+            &destination_path,
+        )?;
+        Ok(ResumableCommitOutcome::Committed(CommittedManagedFile {
+            destination,
+            identity: after.identity,
+            size: after.size,
+        }))
+    }
+
+    pub(super) fn discard(self) -> ManagedFsResult<()> {
+        let current = self.current_info_with_limit(false)?;
+        let path = self.path.clone();
+        let parent_chain = self.parent_chain;
+        delete_open_file(&self.file, &path)?;
+        drop(self.file);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "A filesystem node appeared at a discarded resumable path: {}",
+                    path.display()
+                )))
+            }
+            Err(error) => {
+                return Err(ManagedFsError::io(
+                    "Cannot confirm managed resumable file removal",
+                    &path,
+                    error,
+                ))
+            }
+        }
+        if current.identity != self.info.identity {
+            return Err(ManagedFsError::UnsafeNode(
+                "Managed resumable file identity changed before discard".into(),
+            ));
+        }
+        parent_chain.leaf().sync_directory().map_err(|error| {
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: path,
+                detail: format!("discarded resumable file parent flush failed: {error}"),
+            }
+        })
+    }
 }
 
 impl ExclusiveManagedFile {
@@ -1387,6 +1814,25 @@ fn flush_rename_parents(
 }
 
 #[cfg(windows)]
+fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(unix)]
+fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buffer, offset)
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut clone = file.try_clone()?;
+    clone.seek(SeekFrom::Start(offset))?;
+    clone.read(buffer)
+}
+
+#[cfg(windows)]
 fn open_directory_nofollow(path: &Path, delete: bool) -> ManagedFsResult<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{
@@ -1524,6 +1970,65 @@ fn create_exclusive_file(path: &Path) -> ManagedFsResult<File> {
         .create_new(true)
         .open(path)
         .map_err(|error| ManagedFsError::io("Cannot create exclusive managed file", path, error))
+}
+
+#[cfg(windows)]
+fn open_resumable_file_nofollow(path: &Path, create_new: bool) -> ManagedFsResult<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::{
+        Foundation::{GENERIC_READ, GENERIC_WRITE},
+        Storage::FileSystem::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT, SYNCHRONIZE},
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(create_new)
+        .access_mode(GENERIC_READ.0 | GENERIC_WRITE.0 | DELETE.0 | SYNCHRONIZE.0)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    options.open(path).map_err(|error| {
+        ManagedFsError::io(
+            "Cannot open managed resumable file without following links",
+            path,
+            error,
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn open_resumable_file_nofollow(path: &Path, create_new: bool) -> ManagedFsResult<File> {
+    if !create_new {
+        let before = fs::symlink_metadata(path).map_err(|error| {
+            ManagedFsError::io("Cannot inspect managed resumable file", path, error)
+        })?;
+        if !before.is_file() || before.file_type().is_symlink() {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable path is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| {
+                ManagedFsError::io("Cannot open managed resumable file", path, error)
+            })?;
+        if metadata_identity(&before) != node_info(&file, path)?.identity {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file changed while opening: {}",
+                path.display()
+            )));
+        }
+        return Ok(file);
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| ManagedFsError::io("Cannot create managed resumable file", path, error))
 }
 
 #[cfg(windows)]

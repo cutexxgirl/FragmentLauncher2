@@ -1,5 +1,5 @@
 use super::{
-    cas::{cas_object_relative_path, VerifiedCasObject},
+    cas::VerifiedCasObject,
     contracts::{
         domain_digest, EmbeddedInstallerEntry, GameRuntimeLock, GameRuntimeRole, GameRuntimeSource,
         NormalizedProcessorArgument, OfflineProcessorVerification, ProcessorInput,
@@ -9,7 +9,7 @@ use super::{
         atomic_write_small, ensure_directory_chain, ExclusiveManagedFile, GuardedDirectoryChain,
         ImmutableManagedFile, RelativeManagedPath,
     },
-    storage::{inspect_existing_ancestors, is_windows_reparse_point},
+    storage::{inspect_existing_ancestors, is_windows_reparse_point, OwnedCasRoot},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -216,7 +216,7 @@ impl ProcessorWorkspace {
 pub(super) fn materialize_processor_workspace(
     workspaces_root: &Path,
     workspace_name: &str,
-    cas_root: &Path,
+    cas_root: &OwnedCasRoot,
     lock: &GameRuntimeLock,
     cas_objects: &HashMap<String, VerifiedCasObject>,
 ) -> Result<ProcessorWorkspace, String> {
@@ -572,33 +572,25 @@ fn write_state_marker(
 
 fn copy_official_input(
     inputs_root: &Path,
-    cas_root: &Path,
+    cas_root: &OwnedCasRoot,
     expected: &ExpectedInput,
     object: &VerifiedCasObject,
 ) -> Result<(), String> {
     if !expected.official || expected.sha1.is_none() {
         return Err("Only an official dual-hash object can be copied from CAS".into());
     }
-    if object.sha256 != expected.sha256 || object.size != expected.size {
+    if object.sha256() != expected.sha256 || object.size() != expected.size {
         return Err(format!(
             "Verified CAS metadata differs from signed processor input: {}",
             expected.path
-        ));
-    }
-    inspect_existing_ancestors(cas_root)?;
-    let source_relative = cas_object_relative_path(&expected.sha256)?;
-    let canonical_source = source_relative.join_to(cas_root);
-    if object.path != canonical_source {
-        return Err(format!(
-            "Verified CAS object path is not canonical for {}",
-            expected.sha256
         ));
     }
     let destination_relative = RelativeManagedPath::new(&expected.path)
         .map_err(|error| format!("Processor input destination is unsafe: {error}"))?;
     ensure_parent(inputs_root, &destination_relative)?;
 
-    let mut source = ImmutableManagedFile::open(cas_root, &source_relative)
+    let mut source = object
+        .open(cas_root)
         .map_err(|error| format!("CAS object is unsafe ({}): {error}", expected.sha256))?;
     let source_digest = source
         .sha1_sha256(expected.size)
@@ -1397,6 +1389,10 @@ fn validate_execution_state_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_manager::{
+        cas::{cas_object_relative_path, verify_existing_object, ExpectedObject},
+        storage::select_install_directory,
+    };
     use sha1::Sha1;
     use std::{
         fs::OpenOptions,
@@ -1538,10 +1534,12 @@ mod tests {
         let sha1 = format!("{:x}", Sha1::digest(bytes));
         let sha256 = format!("{:x}", Sha256::digest(bytes));
         let root = temp_root("cas-copy");
-        let cas_root = root.join("cas");
-        let inputs = root.join("inputs");
+        let cas_root = select_install_directory(&root)
+            .expect("claim install")
+            .into_owned_cas_root();
+        let inputs = root.join("test-inputs");
         let source_relative = cas_object_relative_path(&sha256).unwrap();
-        let source = source_relative.join_to(&cas_root);
+        let source = source_relative.join_to(cas_root.managed_root());
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(&inputs).unwrap();
         fs::write(&source, bytes).unwrap();
@@ -1552,12 +1550,15 @@ mod tests {
             sha256: sha256.clone(),
             official: true,
         };
-        let object = VerifiedCasObject {
-            path: source.clone(),
-            sha256,
-            size: bytes.len() as u64,
-            resumed_bytes: 0,
-        };
+        let object = verify_existing_object(
+            &cas_root,
+            &ExpectedObject {
+                sha256,
+                size: bytes.len() as u64,
+            },
+            0,
+        )
+        .expect("verify CAS fixture");
         copy_official_input(&inputs, &cas_root, &expected, &object).expect("copy input");
         let destination = inputs.join("libraries/example/input.jar");
         OpenOptions::new()
@@ -1567,20 +1568,27 @@ mod tests {
             .write_all(b"changed")
             .unwrap();
         assert_eq!(fs::read(&source).unwrap(), bytes);
+        drop(cas_root);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn cas_copy_rejects_noncanonical_progress_path_and_hardlinked_source() {
+    fn cas_copy_rejects_another_owned_root_and_hardlinked_source() {
         let bytes = b"cas-object";
         let sha1 = format!("{:x}", Sha1::digest(bytes));
         let sha256 = format!("{:x}", Sha256::digest(bytes));
         let root = temp_root("cas-path");
-        let cas_root = root.join("cas");
-        let inputs = root.join("inputs");
+        let cas_root = select_install_directory(&root)
+            .expect("claim install")
+            .into_owned_cas_root();
+        let other_install = temp_root("cas-other-root");
+        let other_cas_root = select_install_directory(&other_install)
+            .expect("claim other install")
+            .into_owned_cas_root();
+        let inputs = root.join("test-inputs");
         let source = cas_object_relative_path(&sha256)
             .unwrap()
-            .join_to(&cas_root);
+            .join_to(cas_root.managed_root());
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(&inputs).unwrap();
         fs::write(&source, bytes).unwrap();
@@ -1591,18 +1599,23 @@ mod tests {
             sha256: sha256.clone(),
             official: true,
         };
-        let mut object = VerifiedCasObject {
-            path: root.join("attacker-controlled-path"),
-            sha256: sha256.clone(),
-            size: bytes.len() as u64,
-            resumed_bytes: 0,
-        };
-        assert!(copy_official_input(&inputs, &cas_root, &expected, &object).is_err());
-        object.path = source.clone();
+        let object = verify_existing_object(
+            &cas_root,
+            &ExpectedObject {
+                sha256: sha256.clone(),
+                size: bytes.len() as u64,
+            },
+            0,
+        )
+        .expect("verify CAS fixture");
+        assert!(copy_official_input(&inputs, &other_cas_root, &expected, &object).is_err());
         let alias = root.join("hardlink-alias");
         if fs::hard_link(&source, &alias).is_ok() {
             assert!(copy_official_input(&inputs, &cas_root, &expected, &object).is_err());
         }
+        drop(other_cas_root);
+        drop(cas_root);
+        fs::remove_dir_all(other_install).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

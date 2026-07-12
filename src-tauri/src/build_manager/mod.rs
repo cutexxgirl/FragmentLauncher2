@@ -107,11 +107,11 @@ impl BuildManager {
             {
                 Ok(validated) => {
                     let _instance_directory =
-                        validated.path.join("instances").join(match channel {
+                        validated.path().join("instances").join(match channel {
                             BuildChannel::Stable => "stable",
                             BuildChannel::Dev => "dev",
                         });
-                    validated.free_bytes
+                    validated.free_bytes()
                 }
                 Err(error) => {
                     return Ok(BuildStatus::error(
@@ -144,8 +144,8 @@ impl BuildManager {
             .write()
             .map_err(|_| "Менеджер сборки временно недоступен".to_string())?;
         let mut updated = config.clone();
-        updated.install_directory = Some(validated.path.clone());
-        updated.install_id = Some(validated.install_id);
+        updated.install_directory = Some(validated.path().to_path_buf());
+        updated.install_id = Some(validated.install_id());
         save_config(&self.config_path, &updated)?;
         *config = updated;
         *self
@@ -155,8 +155,8 @@ impl BuildManager {
         Ok(BuildStatus::not_installed(
             channel,
             preset,
-            Some(validated.path.to_string_lossy().into_owned()),
-            validated.free_bytes,
+            Some(validated.path().to_string_lossy().into_owned()),
+            validated.free_bytes(),
         ))
     }
 }
