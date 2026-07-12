@@ -1171,12 +1171,10 @@ impl GameRuntimeLock {
                     sha256,
                 } => {
                     if expected_derived.is_some()
-                        || !is_allowed_official_game_url(url)
+                        || validate_official_game_source(url, sha1).is_err()
                         || *size == 0
                         || *size > MAX_GAME_RUNTIME_FILE_SIZE
-                        || !is_lower_hex(sha1, 40)
                         || !is_sha256(sha256)
-                        || !official_source_is_bound(url, sha1)
                     {
                         return Err(format!(
                             "Invalid official game runtime source: {}",
@@ -2382,10 +2380,8 @@ fn validate_official_artifact(artifact: &GameOfficialArtifact) -> Result<(), Str
     if artifact.kind != "official"
         || artifact.size == 0
         || artifact.size > MAX_GAME_RUNTIME_FILE_SIZE
-        || !is_lower_hex(&artifact.sha1, 40)
         || !is_sha256(&artifact.sha256)
-        || !is_allowed_official_game_url(&artifact.url)
-        || !official_source_is_bound(&artifact.url, &artifact.sha1)
+        || validate_official_game_source(&artifact.url, &artifact.sha1).is_err()
     {
         return Err("Official game artifact provenance is invalid".into());
     }
@@ -3392,6 +3388,34 @@ fn expected_game_runtime_inputs_sha256() -> Result<String, String> {
     )
 }
 
+/// Parses one immutable Mojang/NeoForge artifact source. This is the shared trust boundary used
+/// by contract validation, artifact planning and the production downloader: only the five exact
+/// official origins, their role-independent canonical path forms and any path-embedded SHA-1 are
+/// accepted. The returned URL is therefore safe to hand to the pinned official transport.
+pub(super) fn validate_official_game_source(value: &str, sha1: &str) -> Result<Url, String> {
+    if !is_lower_hex(sha1, 40) || !is_allowed_official_game_url(value) {
+        return Err("Official game artifact source is invalid".into());
+    }
+    let url =
+        Url::parse(value).map_err(|_| "Official game artifact source is invalid".to_string())?;
+    if !official_source_is_bound(&url, sha1) {
+        return Err("Official game artifact source is not bound to its SHA-1".into());
+    }
+    Ok(url)
+}
+
+pub(super) const OFFICIAL_GAME_HOSTS: [&str; 5] = [
+    "libraries.minecraft.net",
+    "maven.neoforged.net",
+    "piston-data.mojang.com",
+    "piston-meta.mojang.com",
+    "resources.download.minecraft.net",
+];
+
+pub(super) fn official_game_host_is_allowed(host: &str) -> bool {
+    OFFICIAL_GAME_HOSTS.contains(&host)
+}
+
 fn is_allowed_official_game_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
@@ -3435,10 +3459,7 @@ fn is_allowed_official_game_url(value: &str) -> bool {
     }
 }
 
-fn official_source_is_bound(value: &str, sha1: &str) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return false;
-    };
+fn official_source_is_bound(url: &Url, sha1: &str) -> bool {
     match url.host_str() {
         Some("resources.download.minecraft.net") => {
             url.path() == format!("/{}/{}", &sha1[..2], sha1)

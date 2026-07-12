@@ -25,6 +25,8 @@ mod mutable;
 #[allow(dead_code)]
 mod neoforge;
 #[allow(dead_code)]
+mod official_cas;
+#[allow(dead_code)]
 mod planner;
 #[allow(dead_code)]
 mod process_supervisor;

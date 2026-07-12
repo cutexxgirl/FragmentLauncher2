@@ -103,7 +103,7 @@ impl From<&str> for CasError {
 
 type CasResult<T> = Result<T, CasError>;
 
-fn managed_error(context: &str, error: ManagedFsError) -> CasError {
+pub(super) fn managed_error(context: &str, error: ManagedFsError) -> CasError {
     match error {
         ManagedFsError::AppliedButDurabilityUnconfirmed {
             destination,
@@ -430,17 +430,17 @@ impl RetryBudget {
     }
 }
 
-struct CasPaths {
+pub(super) struct CasPaths {
     directory: RelativeManagedPath,
-    final_path: RelativeManagedPath,
-    partial: RelativeManagedPath,
-    lock: RelativeManagedPath,
+    pub(super) final_path: RelativeManagedPath,
+    pub(super) partial: RelativeManagedPath,
+    pub(super) lock: RelativeManagedPath,
     locks: RelativeManagedPath,
-    quarantine: RelativeManagedPath,
+    pub(super) quarantine: RelativeManagedPath,
 }
 
 impl CasPaths {
-    fn new(sha256: &str) -> Result<Self, String> {
+    pub(super) fn new(sha256: &str) -> Result<Self, String> {
         let final_path = cas_object_relative_path(sha256)?;
         let directory = RelativeManagedPath::new(&format!("sha256/{}", &sha256[..2]))
             .map_err(|error| format!("Cannot construct CAS shard path: {error}"))?;
@@ -463,7 +463,7 @@ impl CasPaths {
         })
     }
 
-    fn prepare(&self, root: &OwnedCasRoot) -> CasResult<PreparedCasPaths> {
+    pub(super) fn prepare(&self, root: &OwnedCasRoot) -> CasResult<PreparedCasPaths> {
         root.revalidate().map_err(CasError::Failed)?;
         let directory = ensure_directory_chain(root.managed_root(), &self.directory)
             .map_err(|error| managed_error("Cannot prepare CAS shard directory", error))?;
@@ -480,14 +480,14 @@ impl CasPaths {
     }
 }
 
-struct PreparedCasPaths {
+pub(super) struct PreparedCasPaths {
     _directory: GuardedDirectoryChain,
     _locks: GuardedDirectoryChain,
     _quarantine: GuardedDirectoryChain,
 }
 
 impl PreparedCasPaths {
-    fn revalidate(&self) -> CasResult<()> {
+    pub(super) fn revalidate(&self) -> CasResult<()> {
         self._directory
             .revalidate()
             .map_err(|error| managed_error("CAS shard directory changed", error))?;
@@ -500,7 +500,7 @@ impl PreparedCasPaths {
     }
 }
 
-async fn acquire_object_lock(
+pub(super) async fn acquire_object_lock(
     root: &OwnedCasRoot,
     path: &RelativeManagedPath,
 ) -> CasResult<ManagedLockFile> {
@@ -615,7 +615,7 @@ enum StreamResponseError {
     Fatal(CasError),
 }
 
-enum ExistingFinal {
+pub(super) enum ExistingFinal {
     Missing,
     Corrupt,
     Verified(VerifiedCasObject),
@@ -624,6 +624,27 @@ enum ExistingFinal {
 fn audit_existing_final(
     root: &OwnedCasRoot,
     expected: &ExpectedObject,
+    resumed_bytes: u64,
+) -> CasResult<ExistingFinal> {
+    audit_existing_final_digests(root, expected, None, resumed_bytes)
+}
+
+/// Official sources carry both Mojang's/NeoForge's SHA-1 and the Spark2 lock's SHA-256. Audit
+/// both through the same immutable handle so a Complete plan remains strictly verify-only while
+/// retaining both independent signed bindings.
+pub(super) fn audit_existing_official_final(
+    root: &OwnedCasRoot,
+    expected: &ExpectedObject,
+    expected_sha1: &str,
+    resumed_bytes: u64,
+) -> CasResult<ExistingFinal> {
+    audit_existing_final_digests(root, expected, Some(expected_sha1), resumed_bytes)
+}
+
+fn audit_existing_final_digests(
+    root: &OwnedCasRoot,
+    expected: &ExpectedObject,
+    expected_sha1: Option<&str>,
     resumed_bytes: u64,
 ) -> CasResult<ExistingFinal> {
     root.revalidate().map_err(CasError::Failed)?;
@@ -638,11 +659,26 @@ fn audit_existing_final(
     if file.info().size != expected.size {
         return Ok(ExistingFinal::Corrupt);
     }
-    let digest = file
-        .sha256(expected.size)
-        .map_err(|error| managed_error("Cannot hash canonical CAS object", error))?;
-    if digest.size != expected.size || digest.sha256 != expected.sha256 {
-        return Ok(ExistingFinal::Corrupt);
+    match expected_sha1 {
+        Some(expected_sha1) => {
+            let digests = file.sha1_sha256(expected.size).map_err(|error| {
+                managed_error("Cannot hash canonical official CAS object", error)
+            })?;
+            if digests.size != expected.size
+                || digests.sha1 != expected_sha1
+                || digests.sha256 != expected.sha256
+            {
+                return Ok(ExistingFinal::Corrupt);
+            }
+        }
+        None => {
+            let digest = file
+                .sha256(expected.size)
+                .map_err(|error| managed_error("Cannot hash canonical CAS object", error))?;
+            if digest.size != expected.size || digest.sha256 != expected.sha256 {
+                return Ok(ExistingFinal::Corrupt);
+            }
+        }
     }
     let (binding_nonce, install_id, install_identity, objects_identity) = root.binding();
     Ok(ExistingFinal::Verified(VerifiedCasObject {
@@ -754,7 +790,7 @@ fn partial_matches(
     Ok(digest.size == expected.size && digest.sha256 == expected.sha256)
 }
 
-fn discard_stale_partial(
+pub(super) fn discard_stale_partial(
     root: &OwnedCasRoot,
     paths: &CasPaths,
     expected_size: u64,
@@ -777,19 +813,42 @@ fn activate_partial(
     root: &OwnedCasRoot,
     paths: &CasPaths,
     expected: &ExpectedObject,
-    mut partial: ResumableManagedFile,
+    partial: ResumableManagedFile,
     resumed_bytes: u64,
 ) -> CasResult<VerifiedCasObject> {
+    activate_partial_if(root, paths, expected, partial, resumed_bytes, || true)?.ok_or_else(|| {
+        CasError::Failed("Unconditional CAS activation was unexpectedly cancelled".into())
+    })
+}
+
+/// Performs the same durable CAS transaction but checks one final operation predicate after the
+/// partial fsync and all source/destination identity validation, immediately before the
+/// no-replace rename. `None` means no namespace mutation occurred and the synced `.part` remains
+/// safely resumable. Once rename starts, the result is always success or a typed durability error.
+pub(super) fn activate_partial_if<F>(
+    root: &OwnedCasRoot,
+    paths: &CasPaths,
+    expected: &ExpectedObject,
+    mut partial: ResumableManagedFile,
+    resumed_bytes: u64,
+    should_commit: F,
+) -> CasResult<Option<VerifiedCasObject>>
+where
+    F: FnOnce() -> bool,
+{
     if !partial_matches(&mut partial, expected)? {
         return Err(CasError::Failed(
             "CAS partial changed before activation".into(),
         ));
     }
     root.revalidate().map_err(CasError::Failed)?;
-    match partial
-        .commit_no_replace(paths.final_path.clone())
+    let Some(outcome) = partial
+        .commit_no_replace_if(paths.final_path.clone(), should_commit)
         .map_err(|error| managed_error("Cannot atomically activate CAS object", error))?
-    {
+    else {
+        return Ok(None);
+    };
+    match outcome {
         ResumableCommitOutcome::Committed(committed) => {
             if committed.size != expected.size {
                 return Err(CasError::AppliedButDurabilityUnconfirmed {
@@ -817,7 +876,7 @@ fn activate_partial(
     }
     root.revalidate().map_err(CasError::Failed)?;
     match audit_existing_final(root, expected, resumed_bytes)? {
-        ExistingFinal::Verified(object) => Ok(object),
+        ExistingFinal::Verified(object) => Ok(Some(object)),
         ExistingFinal::Missing | ExistingFinal::Corrupt => Err(CasError::Failed(
             "Activated CAS object failed its final exact audit".into(),
         )),

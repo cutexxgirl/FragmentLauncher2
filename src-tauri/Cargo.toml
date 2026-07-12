@@ -31,7 +31,7 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-log = "2"
 tauri-plugin-updater = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 tough = { version = "=0.24.0", default-features = false }
 fs2 = "0.4.3"
 jiff = "0.2"

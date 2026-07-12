@@ -1,7 +1,8 @@
 use super::{
     availability::{ArtifactAvailabilityStateV2, VerifiedAvailabilityV2},
     contracts::{
-        validate_manifest_path, GameRuntimeLock, GameRuntimeRole, GameRuntimeSource, RuntimeLock,
+        validate_manifest_path, validate_official_game_source, GameRuntimeLock, GameRuntimeRole,
+        GameRuntimeSource, RuntimeLock,
     },
     release::FilePolicy,
     storage::OwnedCasRoot,
@@ -12,7 +13,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::UnicodeNormalization;
-use url::Url;
 use uuid::{Uuid, Version};
 
 const INVENTORY_SCHEMA_VERSION: u8 = 2;
@@ -354,7 +354,7 @@ impl ArtifactInventoryV2 {
             else {
                 continue;
             };
-            validate_official_url(url)?;
+            validate_official_game_source(url, sha1)?;
             official_sha256.insert(sha256.clone());
             insert_requirement(
                 &mut by_sha,
@@ -901,19 +901,6 @@ fn role_name(role: GameRuntimeRole) -> Result<String, String> {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| "Cannot encode game runtime artifact role".into())
-}
-
-fn validate_official_url(value: &str) -> Result<(), String> {
-    let url = Url::parse(value).map_err(|_| "Official artifact URL is invalid".to_string())?;
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("Official artifact URL is not an absolute credential-free HTTPS URL".into());
-    }
-    Ok(())
 }
 
 fn validate_sha256(value: &str) -> Result<(), String> {

@@ -1192,10 +1192,66 @@ impl ResumableManagedFile {
         })
     }
 
-    pub(super) fn commit_no_replace(
+    /// Hashes both official digests through the exact writable handle that will later be renamed
+    /// into the CAS. Keeping inspection, resume, hashing, fsync and activation on this one handle
+    /// prevents a path replacement from swapping bytes between verification and commit.
+    pub(super) fn sha1_sha256(&mut self, expected_size: u64) -> ManagedFsResult<FileDigests> {
+        let before = self.current_info_with_limit(true)?;
+        if before.size != expected_size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file size differs from the signed size: {}",
+                self.path.display()
+            )));
+        }
+        self.file.seek(SeekFrom::Start(0)).map_err(|error| {
+            ManagedFsError::io("Cannot rewind managed resumable file", &self.path, error)
+        })?;
+        let mut sha1 = Sha1::new();
+        let mut sha256 = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = self.file.read(&mut buffer).map_err(|error| {
+                ManagedFsError::io("Cannot hash managed resumable file", &self.path, error)
+            })?;
+            if read == 0 {
+                break;
+            }
+            total = total.checked_add(read as u64).ok_or_else(|| {
+                ManagedFsError::UnsafeNode("Managed resumable hash size overflow".into())
+            })?;
+            if total > expected_size {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed resumable file exceeded its signed size: {}",
+                    self.path.display()
+                )));
+            }
+            sha1.update(&buffer[..read]);
+            sha256.update(&buffer[..read]);
+        }
+        let after = self.current_info_with_limit(true)?;
+        if total != expected_size || after.size != expected_size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed resumable file changed while hashing: {}",
+                self.path.display()
+            )));
+        }
+        self.info = after;
+        Ok(FileDigests {
+            size: total,
+            sha1: format!("{:x}", sha1.finalize()),
+            sha256: format!("{:x}", sha256.finalize()),
+        })
+    }
+
+    pub(super) fn commit_no_replace_if<F>(
         mut self,
         destination: RelativeManagedPath,
-    ) -> ManagedFsResult<ResumableCommitOutcome> {
+        should_commit: F,
+    ) -> ManagedFsResult<Option<ResumableCommitOutcome>>
+    where
+        F: FnOnce() -> bool,
+    {
         self.sync_all()?;
         if self.relative == destination {
             return Err(ManagedFsError::Conflict(
@@ -1205,11 +1261,17 @@ impl ResumableManagedFile {
         let destination_parent = GuardedDirectoryChain::open_parent(&self.root, &destination)?;
         ensure_same_root_and_volume(&self.parent_chain, &destination_parent)?;
         let destination_path = destination.join_to(&self.root);
+        // This is the last cancellation boundary. The partial is already durably flushed and
+        // every source/destination identity has been revalidated; after the no-replace rename
+        // starts, callers must report its applied/durability outcome instead of cancellation.
+        if !should_commit() {
+            return Ok(None);
+        }
         match rename_handle(&self.file, &destination_path, ManagedRenameMode::NoReplace) {
             Ok(()) => {}
             Err(ManagedFsError::Conflict(_)) => {
                 self.current_info_with_limit(true)?;
-                return Ok(ResumableCommitOutcome::DestinationExists(self));
+                return Ok(Some(ResumableCommitOutcome::DestinationExists(self)));
             }
             Err(error) => return Err(error),
         }
@@ -1241,11 +1303,13 @@ impl ResumableManagedFile {
             destination_parent.leaf(),
             &destination_path,
         )?;
-        Ok(ResumableCommitOutcome::Committed(CommittedManagedFile {
-            destination,
-            identity: after.identity,
-            size: after.size,
-        }))
+        Ok(Some(ResumableCommitOutcome::Committed(
+            CommittedManagedFile {
+                destination,
+                identity: after.identity,
+                size: after.size,
+            },
+        )))
     }
 
     pub(super) fn discard(self) -> ManagedFsResult<()> {
