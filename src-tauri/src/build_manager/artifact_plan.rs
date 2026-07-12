@@ -1,0 +1,1235 @@
+use super::{
+    availability::{ArtifactAvailabilityStateV2, VerifiedAvailabilityV2},
+    contracts::{
+        validate_manifest_path, GameRuntimeLock, GameRuntimeRole, GameRuntimeSource, RuntimeLock,
+    },
+    release::FilePolicy,
+    storage::OwnedCasRoot,
+    tuf::{TrustedRelease, TrustedReleaseEvidence},
+    types::{BuildChannel, PresetId},
+};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use unicode_normalization::UnicodeNormalization;
+use url::Url;
+use uuid::{Uuid, Version};
+
+const INVENTORY_SCHEMA_VERSION: u8 = 2;
+const MAX_ARTIFACTS: usize = 250_000;
+
+/// Which authenticated service is allowed to provide an artifact. Keeping this in the sealed
+/// requirement prevents an official Mojang/NeoForge URL from being silently replaced by Spark,
+/// or a private Spark object from being fetched from an arbitrary public URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum ArtifactAuthorityV2 {
+    SparkCas,
+    OfficialHttps,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+enum ArtifactSourceV2 {
+    SparkCas,
+    OfficialHttps { url: String, sha1: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ArtifactProvenanceKindV2 {
+    ManifestExact,
+    MutableDefault,
+    JavaArchive,
+    GameRuntimeOfficial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactProvenanceV2 {
+    kind: ArtifactProvenanceKindV2,
+    path: String,
+    role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ArtifactRequirementV2 {
+    sha256: String,
+    size: u64,
+    authority: ArtifactAuthorityV2,
+    source: ArtifactSourceV2,
+    provenances: Vec<ArtifactProvenanceV2>,
+}
+
+impl ArtifactRequirementV2 {
+    pub(super) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(super) fn authority(&self) -> ArtifactAuthorityV2 {
+        self.authority
+    }
+
+    pub(super) fn official_source(&self) -> Option<(&str, &str)> {
+        match &self.source {
+            ArtifactSourceV2::OfficialHttps { url, sha1 } => Some((url, sha1)),
+            ArtifactSourceV2::SparkCas => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactBindingV2 {
+    schema_version: u8,
+    install_id: Uuid,
+    operation_id: Uuid,
+    channel: BuildChannel,
+    preset: PresetId,
+    release_id: String,
+    tuf_root_version: u64,
+    evidence: TrustedReleaseEvidence,
+    cas_root: CasRootBindingV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CasRootBindingV2 {
+    binding_nonce: Uuid,
+    install_root_volume: u64,
+    install_root_file_id: [u8; 16],
+    objects_root_volume: u64,
+    objects_root_file_id: [u8; 16],
+}
+
+/// A release-bound candidate inventory. Its fields and constructor are private to this module;
+/// callers can inspect requirements but cannot append a hash or rewrite its trust binding.
+#[derive(Debug)]
+pub(super) struct ArtifactInventoryV2 {
+    binding: ArtifactBindingV2,
+    fingerprint: String,
+    artifacts: Vec<ArtifactRequirementV2>,
+    manifest_by_path: BTreeMap<String, String>,
+    mutable_by_path: BTreeMap<String, String>,
+    java_archive_sha256: String,
+    official_sha256: Vec<String>,
+    runtime_lock: RuntimeLock,
+    game_runtime_lock: GameRuntimeLock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlannedArtifactV2 {
+    requirement: ArtifactRequirementV2,
+    availability: ArtifactAvailabilityStateV2,
+    resume_from: u64,
+}
+
+/// A short-lived view that is usable only while the exact owned CAS capability is live. It is
+/// created from a sealed plan and yields non-constructible execution items for Spark or a future
+/// official downloader.
+pub(super) struct ArtifactExecutionViewV2<'a> {
+    binding: &'a ArtifactBindingV2,
+    inventory: &'a ArtifactInventoryV2,
+    requirements: &'a [PlannedArtifactV2],
+}
+
+pub(super) struct PlannedArtifactExecutionV2<'a> {
+    binding: &'a ArtifactBindingV2,
+    inventory: &'a ArtifactInventoryV2,
+    planned: &'a PlannedArtifactV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArtifactExecutionSourceV2<'a> {
+    SparkCas,
+    OfficialHttps { url: &'a str, sha1: &'a str },
+}
+
+impl<'a> ArtifactExecutionViewV2<'a> {
+    pub(super) fn items(&self) -> impl ExactSizeIterator<Item = PlannedArtifactExecutionV2<'_>> {
+        self.requirements
+            .iter()
+            .map(|planned| PlannedArtifactExecutionV2 {
+                binding: self.binding,
+                inventory: self.inventory,
+                planned,
+            })
+    }
+}
+
+impl PlannedArtifactExecutionV2<'_> {
+    pub(super) fn validate_root(&self, root: &OwnedCasRoot) -> Result<(), String> {
+        self.inventory.validate_root(root)?;
+        if self.binding != &self.inventory.binding
+            || self
+                .inventory
+                .requirement(&self.planned.requirement.sha256)?
+                != &self.planned.requirement
+        {
+            return Err("Planned artifact execution binding is invalid".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn sha256(&self) -> &str {
+        &self.planned.requirement.sha256
+    }
+
+    pub(super) fn size(&self) -> u64 {
+        self.planned.requirement.size
+    }
+
+    pub(super) fn resume_from(&self) -> u64 {
+        self.planned.resume_from
+    }
+
+    pub(super) fn availability(&self) -> ArtifactAvailabilityStateV2 {
+        self.planned.availability
+    }
+
+    pub(super) fn channel(&self) -> BuildChannel {
+        self.binding.channel
+    }
+
+    pub(super) fn preset(&self) -> PresetId {
+        self.binding.preset
+    }
+
+    pub(super) fn release_id(&self) -> &str {
+        &self.binding.release_id
+    }
+
+    pub(super) fn source(&self) -> ArtifactExecutionSourceV2<'_> {
+        match &self.planned.requirement.source {
+            ArtifactSourceV2::SparkCas => ArtifactExecutionSourceV2::SparkCas,
+            ArtifactSourceV2::OfficialHttps { url, sha1 } => {
+                ArtifactExecutionSourceV2::OfficialHttps { url, sha1 }
+            }
+        }
+    }
+}
+
+/// Non-serializable download authority for exactly one reconcile operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArtifactPlanV2 {
+    binding: ArtifactBindingV2,
+    inventory_fingerprint: String,
+    requirements: Vec<PlannedArtifactV2>,
+    network_bytes: u64,
+    disk_download_reserve_bytes: u64,
+}
+
+/// The only pre-planner exception: canonical signed defaults needed to materialize and validate
+/// user-mutable settings. It carries the same operation/release binding as the final plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MutableBootstrapPlanV2 {
+    binding: ArtifactBindingV2,
+    inventory_fingerprint: String,
+    requirements: Vec<PlannedArtifactV2>,
+    network_bytes: u64,
+    disk_download_reserve_bytes: u64,
+}
+
+impl ArtifactInventoryV2 {
+    pub(super) fn build(
+        root: &OwnedCasRoot,
+        trusted: &TrustedRelease,
+        install_id: Uuid,
+        operation_id: Uuid,
+        channel: BuildChannel,
+        preset: PresetId,
+    ) -> Result<Self, String> {
+        root.revalidate()?;
+        validate_release_binding(trusted, channel)?;
+        if install_id.is_nil()
+            || operation_id.is_nil()
+            || operation_id.get_version() != Some(Version::Random)
+        {
+            return Err("Artifact inventory requires an install ID and operation UUIDv4".into());
+        }
+        let (root_nonce, root_install_id, install_identity, objects_identity) = root.binding();
+        if root_install_id != install_id {
+            return Err("Owned CAS root belongs to another install ID".into());
+        }
+        let selected = trusted.manifest().selected_preset(preset)?;
+        let binding = ArtifactBindingV2 {
+            schema_version: INVENTORY_SCHEMA_VERSION,
+            install_id,
+            operation_id,
+            channel,
+            preset,
+            release_id: trusted.manifest().release.id.clone(),
+            tuf_root_version: trusted.tuf_root_version(),
+            evidence: trusted.evidence().clone(),
+            cas_root: CasRootBindingV2 {
+                binding_nonce: root_nonce,
+                install_root_volume: install_identity.volume_serial_number,
+                install_root_file_id: install_identity.file_id,
+                objects_root_volume: objects_identity.volume_serial_number,
+                objects_root_file_id: objects_identity.file_id,
+            },
+        };
+
+        let mut by_sha = BTreeMap::<String, ArtifactRequirementV2>::new();
+        let mut manifest_by_path = BTreeMap::new();
+        let mut mutable_by_path = BTreeMap::new();
+        let mut manifest_paths = BTreeMap::new();
+        for file in &selected.files {
+            validate_manifest_path(&file.path)?;
+            register_path(&mut manifest_paths, &file.path, "manifest")?;
+            let key = path_key(&file.path);
+            if manifest_by_path
+                .insert(key.clone(), file.sha256.clone())
+                .is_some()
+            {
+                return Err("Selected preset contains duplicate artifact paths".into());
+            }
+            let kind = match file.policy {
+                FilePolicy::Exact => ArtifactProvenanceKindV2::ManifestExact,
+                FilePolicy::ValidatedMutable => {
+                    mutable_by_path.insert(key, file.sha256.clone());
+                    ArtifactProvenanceKindV2::MutableDefault
+                }
+            };
+            insert_requirement(
+                &mut by_sha,
+                ArtifactRequirementV2 {
+                    sha256: file.sha256.clone(),
+                    size: file.size,
+                    authority: ArtifactAuthorityV2::SparkCas,
+                    source: ArtifactSourceV2::SparkCas,
+                    provenances: vec![ArtifactProvenanceV2 {
+                        kind,
+                        path: file.path.clone(),
+                        role: None,
+                    }],
+                },
+            )?;
+        }
+
+        let java_archive_sha256 = trusted.runtime_lock().java.archive.sha256.clone();
+        insert_requirement(
+            &mut by_sha,
+            ArtifactRequirementV2 {
+                sha256: java_archive_sha256.clone(),
+                size: trusted.runtime_lock().java.archive.size,
+                authority: ArtifactAuthorityV2::SparkCas,
+                source: ArtifactSourceV2::SparkCas,
+                provenances: vec![ArtifactProvenanceV2 {
+                    kind: ArtifactProvenanceKindV2::JavaArchive,
+                    path: "runtime/java/archive".into(),
+                    role: None,
+                }],
+            },
+        )?;
+
+        let mut official_sha256 = BTreeSet::new();
+        let mut game_paths = BTreeMap::new();
+        for file in &trusted.game_runtime_lock().files {
+            validate_manifest_path(&file.path)?;
+            register_path(&mut game_paths, &file.path, "game runtime")?;
+            let GameRuntimeSource::Official {
+                url,
+                size,
+                sha1,
+                sha256,
+            } = &file.source
+            else {
+                continue;
+            };
+            validate_official_url(url)?;
+            official_sha256.insert(sha256.clone());
+            insert_requirement(
+                &mut by_sha,
+                ArtifactRequirementV2 {
+                    sha256: sha256.clone(),
+                    size: *size,
+                    authority: ArtifactAuthorityV2::OfficialHttps,
+                    source: ArtifactSourceV2::OfficialHttps {
+                        url: url.clone(),
+                        sha1: sha1.clone(),
+                    },
+                    provenances: vec![ArtifactProvenanceV2 {
+                        kind: ArtifactProvenanceKindV2::GameRuntimeOfficial,
+                        path: file.path.clone(),
+                        role: Some(role_name(file.role)?),
+                    }],
+                },
+            )?;
+        }
+        if by_sha.len() > MAX_ARTIFACTS {
+            return Err("Artifact inventory exceeds the launcher limit".into());
+        }
+        let artifacts = by_sha.into_values().collect::<Vec<_>>();
+        let fingerprint = inventory_fingerprint(&binding, &artifacts)?;
+        root.revalidate()?;
+        let inventory = Self {
+            binding,
+            fingerprint,
+            artifacts,
+            manifest_by_path,
+            mutable_by_path,
+            java_archive_sha256,
+            official_sha256: official_sha256.into_iter().collect(),
+            runtime_lock: trusted.runtime_lock().clone(),
+            game_runtime_lock: trusted.game_runtime_lock().clone(),
+        };
+        inventory.validate_root(root)?;
+        Ok(inventory)
+    }
+
+    pub(super) fn artifacts(&self) -> &[ArtifactRequirementV2] {
+        &self.artifacts
+    }
+
+    pub(super) fn install_id(&self) -> Uuid {
+        self.binding.install_id
+    }
+
+    pub(super) fn runtime_lock(&self) -> &RuntimeLock {
+        &self.runtime_lock
+    }
+
+    pub(super) fn game_runtime_lock(&self) -> &GameRuntimeLock {
+        &self.game_runtime_lock
+    }
+
+    pub(super) fn java_runtime_lock_sha256(&self) -> &str {
+        &self.binding.evidence.java_runtime_lock.sha256
+    }
+
+    pub(super) fn game_runtime_lock_sha256(&self) -> &str {
+        &self.binding.evidence.game_runtime_lock.sha256
+    }
+
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(super) fn root_binding_nonce(&self) -> Uuid {
+        self.binding.cas_root.binding_nonce
+    }
+
+    pub(super) fn validate_root(&self, root: &OwnedCasRoot) -> Result<(), String> {
+        root.revalidate()?;
+        let (nonce, install_id, install_identity, objects_identity) = root.binding();
+        if install_id != self.binding.install_id
+            || nonce != self.binding.cas_root.binding_nonce
+            || install_identity.volume_serial_number != self.binding.cas_root.install_root_volume
+            || install_identity.file_id != self.binding.cas_root.install_root_file_id
+            || objects_identity.volume_serial_number != self.binding.cas_root.objects_root_volume
+            || objects_identity.file_id != self.binding.cas_root.objects_root_file_id
+        {
+            return Err("Owned CAS root differs from the sealed artifact inventory".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_request(
+        &self,
+        trusted: &TrustedRelease,
+        install_id: Uuid,
+        operation_id: Uuid,
+        channel: BuildChannel,
+        preset: PresetId,
+    ) -> Result<(), String> {
+        validate_release_binding(trusted, channel)?;
+        if self.binding.install_id != install_id
+            || self.binding.operation_id != operation_id
+            || self.binding.channel != channel
+            || self.binding.preset != preset
+            || self.binding.release_id != trusted.manifest().release.id
+            || self.binding.tuf_root_version != trusted.tuf_root_version()
+            || self.binding.evidence != *trusted.evidence()
+            || inventory_fingerprint(&self.binding, &self.artifacts)? != self.fingerprint
+        {
+            return Err("Artifact inventory belongs to another trusted operation".into());
+        }
+        Ok(())
+    }
+
+    fn requirement(&self, sha256: &str) -> Result<&ArtifactRequirementV2, String> {
+        self.artifacts
+            .binary_search_by(|candidate| candidate.sha256.as_str().cmp(sha256))
+            .ok()
+            .map(|index| &self.artifacts[index])
+            .ok_or_else(|| "Artifact inventory is missing its own requirement".into())
+    }
+}
+
+impl ArtifactPlanV2 {
+    pub(super) fn for_reconcile(
+        inventory: &ArtifactInventoryV2,
+        availability: &VerifiedAvailabilityV2,
+        install_paths: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        availability.validate_for(inventory)?;
+        let mut hashes = BTreeSet::new();
+        for path in install_paths {
+            let hash = inventory
+                .manifest_by_path
+                .get(&path_key(&path))
+                .ok_or_else(|| format!("Reconcile requested an unsigned artifact path: {path}"))?;
+            hashes.insert(hash.clone());
+        }
+        if !availability.java_generation_complete() {
+            hashes.insert(inventory.java_archive_sha256.clone());
+        }
+        if !availability.game_generation_complete() {
+            hashes.extend(inventory.official_sha256.iter().cloned());
+        }
+        let (requirements, network_bytes, disk_download_reserve_bytes) =
+            missing_requirements(inventory, availability, hashes)?;
+        Ok(Self {
+            binding: inventory.binding.clone(),
+            inventory_fingerprint: inventory.fingerprint.clone(),
+            requirements,
+            network_bytes,
+            disk_download_reserve_bytes,
+        })
+    }
+
+    pub(super) fn execution_view<'a>(
+        &'a self,
+        root: &OwnedCasRoot,
+        inventory: &'a ArtifactInventoryV2,
+    ) -> Result<ArtifactExecutionViewV2<'a>, String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        Ok(ArtifactExecutionViewV2 {
+            binding: &self.binding,
+            inventory,
+            requirements: &self.requirements,
+        })
+    }
+
+    pub(super) fn network_bytes(&self) -> u64 {
+        self.network_bytes
+    }
+
+    pub(super) fn disk_download_reserve_bytes(&self) -> u64 {
+        self.disk_download_reserve_bytes
+    }
+
+    pub(super) fn validate_for(&self, inventory: &ArtifactInventoryV2) -> Result<(), String> {
+        if self.binding != inventory.binding
+            || self.inventory_fingerprint != inventory.fingerprint
+            || self
+                .requirements
+                .windows(2)
+                .any(|pair| pair[0].requirement.sha256 >= pair[1].requirement.sha256)
+        {
+            return Err("Artifact plan binding or canonical order is invalid".into());
+        }
+        let (network, reserve) = self.requirements.iter().try_fold(
+            (0_u64, 0_u64),
+            |(network, reserve), planned| -> Result<(u64, u64), String> {
+                let expected = inventory.requirement(&planned.requirement.sha256)?;
+                if expected != &planned.requirement || !valid_planned_availability(planned) {
+                    return Err("Artifact plan contains a forged requirement".into());
+                }
+                let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
+                    0
+                } else {
+                    planned.requirement.size
+                };
+                let network = network
+                    .checked_add(charge)
+                    .ok_or_else(|| "Artifact plan network byte total overflow".to_string())?;
+                let reserve = reserve
+                    .checked_add(charge)
+                    .ok_or_else(|| "Artifact plan disk reserve overflow".to_string())?;
+                Ok((network, reserve))
+            },
+        )?;
+        if network != self.network_bytes || reserve != self.disk_download_reserve_bytes {
+            return Err("Artifact plan byte total changed".into());
+        }
+        Ok(())
+    }
+}
+
+impl MutableBootstrapPlanV2 {
+    pub(super) fn build(
+        inventory: &ArtifactInventoryV2,
+        availability: &VerifiedAvailabilityV2,
+    ) -> Result<Self, String> {
+        availability.validate_for(inventory)?;
+        let hashes = inventory
+            .mutable_by_path
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let (requirements, network_bytes, disk_download_reserve_bytes) =
+            missing_requirements(inventory, availability, hashes)?;
+        Ok(Self {
+            binding: inventory.binding.clone(),
+            inventory_fingerprint: inventory.fingerprint.clone(),
+            requirements,
+            network_bytes,
+            disk_download_reserve_bytes,
+        })
+    }
+
+    pub(super) fn execution_view<'a>(
+        &'a self,
+        root: &OwnedCasRoot,
+        inventory: &'a ArtifactInventoryV2,
+    ) -> Result<ArtifactExecutionViewV2<'a>, String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        Ok(ArtifactExecutionViewV2 {
+            binding: &self.binding,
+            inventory,
+            requirements: &self.requirements,
+        })
+    }
+
+    pub(super) fn network_bytes(&self) -> u64 {
+        self.network_bytes
+    }
+
+    pub(super) fn disk_download_reserve_bytes(&self) -> u64 {
+        self.disk_download_reserve_bytes
+    }
+
+    pub(super) fn validate_for(&self, inventory: &ArtifactInventoryV2) -> Result<(), String> {
+        if self.binding != inventory.binding || self.inventory_fingerprint != inventory.fingerprint
+        {
+            return Err("Mutable bootstrap belongs to another trusted operation".into());
+        }
+        if self
+            .requirements
+            .windows(2)
+            .any(|pair| pair[0].requirement.sha256 >= pair[1].requirement.sha256)
+        {
+            return Err("Mutable bootstrap requirements are not canonical".into());
+        }
+        let mut network = 0_u64;
+        let mut reserve = 0_u64;
+        for planned in &self.requirements {
+            let expected = inventory.requirement(planned.requirement.sha256())?;
+            if expected != &planned.requirement
+                || !valid_planned_availability(planned)
+                || !inventory
+                    .mutable_by_path
+                    .values()
+                    .any(|hash| hash == planned.requirement.sha256())
+            {
+                return Err("Mutable bootstrap contains a forged non-default artifact".into());
+            }
+            let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
+                0
+            } else {
+                planned.requirement.size
+            };
+            network = network
+                .checked_add(charge)
+                .ok_or_else(|| "Mutable bootstrap network byte total overflow".to_string())?;
+            reserve = reserve
+                .checked_add(charge)
+                .ok_or_else(|| "Mutable bootstrap disk reserve overflow".to_string())?;
+        }
+        if network != self.network_bytes || reserve != self.disk_download_reserve_bytes {
+            return Err("Mutable bootstrap byte total changed".into());
+        }
+        Ok(())
+    }
+}
+
+fn missing_requirements(
+    inventory: &ArtifactInventoryV2,
+    availability: &VerifiedAvailabilityV2,
+    hashes: BTreeSet<String>,
+) -> Result<(Vec<PlannedArtifactV2>, u64, u64), String> {
+    let mut requirements = Vec::new();
+    let mut network = 0_u64;
+    let mut reserve = 0_u64;
+    for sha256 in hashes {
+        let expected = inventory.requirement(&sha256)?;
+        let state = *availability.state(&sha256)?;
+        let resume_from = match state {
+            ArtifactAvailabilityStateV2::Complete
+            | ArtifactAvailabilityStateV2::Missing
+            | ArtifactAvailabilityStateV2::Corrupt => 0,
+            ArtifactAvailabilityStateV2::Partial { bytes } => bytes,
+        };
+        if resume_from > expected.size {
+            return Err("Partial artifact availability is not resumable".into());
+        }
+        // A `.part` length is useful network-resume evidence, but not disk-allocation evidence:
+        // NTFS sparse/compressed files can have a large logical length with almost no allocated
+        // clusters. Budget the complete signed size until a final object is fully verified.
+        let charge = if state == ArtifactAvailabilityStateV2::Complete {
+            0
+        } else {
+            expected.size
+        };
+        network = network
+            .checked_add(charge)
+            .ok_or_else(|| "Artifact network byte total overflow".to_string())?;
+        reserve = reserve
+            .checked_add(charge)
+            .ok_or_else(|| "Artifact disk reserve overflow".to_string())?;
+        requirements.push(PlannedArtifactV2 {
+            requirement: expected.clone(),
+            availability: state,
+            resume_from,
+        });
+    }
+    Ok((requirements, network, reserve))
+}
+
+fn valid_planned_availability(planned: &PlannedArtifactV2) -> bool {
+    match planned.availability {
+        ArtifactAvailabilityStateV2::Partial { bytes } => {
+            bytes == planned.resume_from && bytes <= planned.requirement.size
+        }
+        ArtifactAvailabilityStateV2::Complete
+        | ArtifactAvailabilityStateV2::Missing
+        | ArtifactAvailabilityStateV2::Corrupt => planned.resume_from == 0,
+    }
+}
+
+fn insert_requirement(
+    by_sha: &mut BTreeMap<String, ArtifactRequirementV2>,
+    mut candidate: ArtifactRequirementV2,
+) -> Result<(), String> {
+    validate_sha256(&candidate.sha256)?;
+    if candidate.provenances.len() != 1 {
+        return Err("Artifact requirement has invalid provenance".into());
+    }
+    match by_sha.get_mut(&candidate.sha256) {
+        None => {
+            by_sha.insert(candidate.sha256.clone(), candidate);
+        }
+        Some(existing) => {
+            if existing.size != candidate.size
+                || existing.authority != candidate.authority
+                || existing.source != candidate.source
+                || !compatible_provenance(existing, &candidate)
+            {
+                return Err(format!(
+                    "SHA-256 {} is reused with conflicting size, source or provenance",
+                    candidate.sha256
+                ));
+            }
+            let provenance = candidate.provenances.pop().expect("one provenance");
+            if existing.provenances.binary_search(&provenance).is_err() {
+                existing.provenances.push(provenance);
+                existing.provenances.sort();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compatible_provenance(
+    existing: &ArtifactRequirementV2,
+    candidate: &ArtifactRequirementV2,
+) -> bool {
+    let existing_kind = existing.provenances.first().map(|value| value.kind);
+    let candidate_kind = candidate.provenances.first().map(|value| value.kind);
+    existing_kind == candidate_kind
+        && matches!(
+            existing_kind,
+            Some(ArtifactProvenanceKindV2::ManifestExact)
+                | Some(ArtifactProvenanceKindV2::MutableDefault)
+                | Some(ArtifactProvenanceKindV2::GameRuntimeOfficial)
+        )
+}
+
+fn validate_release_binding(trusted: &TrustedRelease, channel: BuildChannel) -> Result<(), String> {
+    if trusted.channel() != channel
+        || trusted.current().channel != channel
+        || trusted.current().release_id != trusted.manifest().release.id
+        || trusted.tuf_root_version() != trusted.evidence().roles.root
+    {
+        return Err("Trusted release channel/current/root binding is invalid".into());
+    }
+    trusted.manifest().validate()?;
+    trusted.runtime_lock().validate()?;
+    trusted.game_runtime_lock().validate()?;
+    trusted
+        .manifest()
+        .bind_runtime_lock(trusted.runtime_lock())?;
+    trusted
+        .manifest()
+        .bind_game_runtime_lock(trusted.runtime_lock(), trusted.game_runtime_lock())?;
+    trusted.evidence().validate_binding(
+        channel,
+        &trusted.manifest().release.id,
+        &trusted.current().manifest_target,
+        &trusted.manifest().runtime.java.runtime_target,
+        &trusted.manifest().runtime.game.runtime_target,
+        &trusted.evidence().release_manifest.sha256,
+        &trusted.manifest().runtime.java.runtime_lock_sha256,
+        &trusted.manifest().runtime.game.runtime_lock_sha256,
+    )
+}
+
+fn inventory_fingerprint(
+    binding: &ArtifactBindingV2,
+    artifacts: &[ArtifactRequirementV2],
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        domain: &'static str,
+        binding: &'a ArtifactBindingV2,
+        artifacts: &'a [ArtifactRequirementV2],
+    }
+    let bytes = serde_json::to_vec(&Envelope {
+        domain: "ru.fragmc.launcher.artifact-inventory.v2",
+        binding,
+        artifacts,
+    })
+    .map_err(|error| format!("Cannot bind artifact inventory: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn register_path(
+    paths: &mut BTreeMap<String, String>,
+    path: &str,
+    label: &str,
+) -> Result<(), String> {
+    let key = path_key(path);
+    if paths
+        .insert(key, path.to_owned())
+        .is_some_and(|existing| existing != path)
+    {
+        return Err(format!("{label} paths collide by case or normalization"));
+    }
+    Ok(())
+}
+
+fn path_key(path: &str) -> String {
+    path.nfkc().flat_map(char::to_lowercase).collect()
+}
+
+fn role_name(role: GameRuntimeRole) -> Result<String, String> {
+    serde_json::to_value(role)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| "Cannot encode game runtime artifact role".into())
+}
+
+fn validate_official_url(value: &str) -> Result<(), String> {
+    let url = Url::parse(value).map_err(|_| "Official artifact URL is invalid".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Official artifact URL is not an absolute credential-free HTTPS URL".into());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("Artifact requirement has an invalid SHA-256".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build_manager::{
+        availability::VerifiedAvailabilityV2,
+        planner::tests::trusted,
+        storage::{select_install_directory, OwnedCasRoot},
+    };
+    use std::{fs, path::PathBuf};
+
+    struct TestRoot {
+        path: PathBuf,
+        root: Option<OwnedCasRoot>,
+        install_id: Uuid,
+    }
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("fragment-artifact-plan-{label}-{}", Uuid::new_v4()));
+            let selected = select_install_directory(&path).unwrap();
+            let install_id = selected.install_id();
+            Self {
+                path,
+                root: Some(selected.into_owned_cas_root()),
+                install_id,
+            }
+        }
+
+        fn root(&self) -> &OwnedCasRoot {
+            self.root.as_ref().unwrap()
+        }
+
+        fn from_owner_marker(label: &str, source: &TestRoot) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("fragment-artifact-plan-{label}-{}", Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            fs::copy(
+                source.path.join(".fragment-launcher-root.json"),
+                path.join(".fragment-launcher-root.json"),
+            )
+            .unwrap();
+            let selected = select_install_directory(&path).unwrap();
+            assert_eq!(selected.install_id(), source.install_id);
+            Self {
+                path,
+                install_id: selected.install_id(),
+                root: Some(selected.into_owned_cas_root()),
+            }
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            drop(self.root.take());
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn inventory(
+        root: &TestRoot,
+        trusted: &TrustedRelease,
+        operation_id: Uuid,
+    ) -> ArtifactInventoryV2 {
+        ArtifactInventoryV2::build(
+            root.root(),
+            trusted,
+            root.install_id,
+            operation_id,
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inventory_is_exactly_release_bound_and_keeps_authoritative_sources() {
+        let root = TestRoot::new("enumerates");
+        let release = trusted('a', 1);
+        let operation_id = Uuid::new_v4();
+        let inventory = inventory(&root, &release, operation_id);
+
+        let expected = release
+            .manifest()
+            .selected_preset(PresetId::Medium)
+            .unwrap()
+            .files
+            .iter()
+            .map(|file| file.sha256.clone())
+            .chain(std::iter::once(
+                release.runtime_lock().java.archive.sha256.clone(),
+            ))
+            .chain(release.game_runtime_lock().files.iter().filter_map(|file| {
+                if let GameRuntimeSource::Official { sha256, .. } = &file.source {
+                    Some(sha256.clone())
+                } else {
+                    None
+                }
+            }))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            inventory
+                .artifacts()
+                .iter()
+                .map(|artifact| artifact.sha256().to_owned())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            inventory
+                .artifacts()
+                .iter()
+                .filter(|artifact| artifact.authority() == ArtifactAuthorityV2::OfficialHttps)
+                .count(),
+            4_022
+        );
+        assert!(inventory
+            .artifacts()
+            .iter()
+            .filter(|artifact| artifact.authority() == ArtifactAuthorityV2::OfficialHttps)
+            .all(|artifact| artifact.official_source().is_some()));
+        assert!(inventory
+            .artifacts()
+            .windows(2)
+            .all(|pair| pair[0].sha256() < pair[1].sha256()));
+    }
+
+    #[test]
+    fn wrong_operation_release_and_injected_hash_are_rejected() {
+        let root = TestRoot::new("binding");
+        let release = trusted('a', 1);
+        let operation_id = Uuid::new_v4();
+        let mut inventory = inventory(&root, &release, operation_id);
+        assert!(inventory
+            .validate_request(
+                &release,
+                root.install_id,
+                Uuid::new_v4(),
+                BuildChannel::Stable,
+                PresetId::Medium,
+            )
+            .is_err());
+        assert!(inventory
+            .validate_request(
+                &trusted('b', 2),
+                root.install_id,
+                operation_id,
+                BuildChannel::Stable,
+                PresetId::Medium,
+            )
+            .is_err());
+
+        inventory.artifacts.push(ArtifactRequirementV2 {
+            sha256: "0".repeat(64),
+            size: 1,
+            authority: ArtifactAuthorityV2::SparkCas,
+            source: ArtifactSourceV2::SparkCas,
+            provenances: vec![ArtifactProvenanceV2 {
+                kind: ArtifactProvenanceKindV2::ManifestExact,
+                path: "mods/injected.jar".into(),
+                role: None,
+            }],
+        });
+        inventory
+            .artifacts
+            .sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        assert!(inventory
+            .validate_request(
+                &release,
+                root.install_id,
+                operation_id,
+                BuildChannel::Stable,
+                PresetId::Medium,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn conflicting_duplicate_and_case_ambiguous_paths_fail_closed() {
+        let root = TestRoot::new("duplicates");
+        let operation_id = Uuid::new_v4();
+        let conflict_base = trusted('a', 1);
+        let mut conflict_manifest = conflict_base.manifest().clone();
+        let files = &mut conflict_manifest
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == PresetId::Medium)
+            .unwrap()
+            .files;
+        files[1].sha256 = files[0].sha256.clone();
+        files[1].size = files[0].size.saturating_add(1);
+        let conflict = TrustedRelease::new_for_test(
+            conflict_base.channel(),
+            conflict_base.current().clone(),
+            conflict_manifest,
+            conflict_base.runtime_lock().clone(),
+            conflict_base.game_runtime_lock().clone(),
+            conflict_base.tuf_root_version(),
+            conflict_base.evidence().clone(),
+        );
+        assert!(ArtifactInventoryV2::build(
+            root.root(),
+            &conflict,
+            root.install_id,
+            operation_id,
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .is_err());
+
+        let alias_base = trusted('a', 1);
+        let mut alias_manifest = alias_base.manifest().clone();
+        let files = &mut alias_manifest
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == PresetId::Medium)
+            .unwrap()
+            .files;
+        let mut duplicate = files[0].clone();
+        duplicate.path = duplicate.path.to_uppercase();
+        files.push(duplicate);
+        let alias = TrustedRelease::new_for_test(
+            alias_base.channel(),
+            alias_base.current().clone(),
+            alias_manifest,
+            alias_base.runtime_lock().clone(),
+            alias_base.game_runtime_lock().clone(),
+            alias_base.tuf_root_version(),
+            alias_base.evidence().clone(),
+        );
+        assert!(ArtifactInventoryV2::build(
+            root.root(),
+            &alias,
+            root.install_id,
+            Uuid::new_v4(),
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn duplicate_metadata_rules_merge_only_compatible_provenance() {
+        let hash = "1".repeat(64);
+        let spark = |kind, path: &str| ArtifactRequirementV2 {
+            sha256: hash.clone(),
+            size: 7,
+            authority: ArtifactAuthorityV2::SparkCas,
+            source: ArtifactSourceV2::SparkCas,
+            provenances: vec![ArtifactProvenanceV2 {
+                kind,
+                path: path.into(),
+                role: None,
+            }],
+        };
+        let mut immutable = BTreeMap::new();
+        insert_requirement(
+            &mut immutable,
+            spark(ArtifactProvenanceKindV2::ManifestExact, "mods/a.jar"),
+        )
+        .unwrap();
+        insert_requirement(
+            &mut immutable,
+            spark(ArtifactProvenanceKindV2::ManifestExact, "mods/b.jar"),
+        )
+        .unwrap();
+        assert_eq!(immutable.len(), 1);
+        assert_eq!(immutable[&hash].provenances.len(), 2);
+
+        let mut mutable = BTreeMap::new();
+        insert_requirement(
+            &mut mutable,
+            spark(ArtifactProvenanceKindV2::MutableDefault, "options.txt"),
+        )
+        .unwrap();
+        insert_requirement(
+            &mut mutable,
+            spark(
+                ArtifactProvenanceKindV2::MutableDefault,
+                "config/client.toml",
+            ),
+        )
+        .unwrap();
+        assert_eq!(mutable.len(), 1);
+        assert_eq!(mutable[&hash].provenances.len(), 2);
+        assert!(insert_requirement(
+            &mut mutable,
+            spark(ArtifactProvenanceKindV2::ManifestExact, "mods/conflict.jar"),
+        )
+        .is_err());
+        assert!(insert_requirement(
+            &mut mutable,
+            ArtifactRequirementV2 {
+                sha256: hash,
+                size: 7,
+                authority: ArtifactAuthorityV2::OfficialHttps,
+                source: ArtifactSourceV2::OfficialHttps {
+                    url: "https://example.invalid/object".into(),
+                    sha1: "2".repeat(40),
+                },
+                provenances: vec![ArtifactProvenanceV2 {
+                    kind: ArtifactProvenanceKindV2::GameRuntimeOfficial,
+                    path: "libraries/conflict.jar".into(),
+                    role: Some("library".into()),
+                }],
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cached_runtime_inputs_remain_in_the_sealed_execution_set() {
+        let root = TestRoot::new("cached-runtime-inputs");
+        let release = trusted('a', 1);
+        let inventory = inventory(&root, &release, Uuid::new_v4());
+        let complete = inventory
+            .artifacts()
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.sha256().to_owned(),
+                    ArtifactAvailabilityStateV2::Complete,
+                )
+            })
+            .collect::<Vec<_>>();
+        let availability = VerifiedAvailabilityV2::for_test(&inventory, complete, false, false);
+        let plan = ArtifactPlanV2::for_reconcile(&inventory, &availability, []).unwrap();
+        plan.validate_for(&inventory).unwrap();
+        let view = plan.execution_view(root.root(), &inventory).unwrap();
+        let items = view.items().collect::<Vec<_>>();
+        assert_eq!(items.len(), 4_023);
+        assert!(items
+            .iter()
+            .all(|item| item.availability() == ArtifactAvailabilityStateV2::Complete));
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.source() == ArtifactExecutionSourceV2::SparkCas)
+                .count(),
+            1
+        );
+        assert_eq!(plan.network_bytes(), 0);
+        assert_eq!(plan.disk_download_reserve_bytes(), 0);
+        let first = &items[0];
+        assert_eq!(first.channel(), BuildChannel::Stable);
+        assert_eq!(first.preset(), PresetId::Medium);
+        assert_eq!(first.release_id(), release.manifest().release.id);
+
+        let rebound = TestRoot::from_owner_marker("cached-runtime-rebound", &root);
+        assert!(plan.execution_view(rebound.root(), &inventory).is_err());
+        assert!(first.validate_root(rebound.root()).is_err());
+    }
+
+    #[test]
+    fn mutable_bootstrap_contains_only_missing_signed_defaults() {
+        let root = TestRoot::new("mutable");
+        let release = trusted('a', 1);
+        let inventory = inventory(&root, &release, Uuid::new_v4());
+        let availability = VerifiedAvailabilityV2::for_test(&inventory, [], false, false);
+        let plan = MutableBootstrapPlanV2::build(&inventory, &availability).unwrap();
+        plan.validate_for(&inventory).unwrap();
+        let view = plan.execution_view(root.root(), &inventory).unwrap();
+        let requirements = view.items().collect::<Vec<_>>();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].sha256(), "e".repeat(64));
+        assert_eq!(plan.network_bytes(), requirements[0].size());
+        assert_eq!(plan.disk_download_reserve_bytes(), requirements[0].size());
+
+        let complete = VerifiedAvailabilityV2::for_test(
+            &inventory,
+            [("e".repeat(64), ArtifactAvailabilityStateV2::Complete)],
+            false,
+            false,
+        );
+        let cached = MutableBootstrapPlanV2::build(&inventory, &complete).unwrap();
+        assert_eq!(
+            cached
+                .execution_view(root.root(), &inventory)
+                .unwrap()
+                .items()
+                .len(),
+            1
+        );
+        assert_eq!(cached.network_bytes(), 0);
+        assert_eq!(cached.disk_download_reserve_bytes(), 0);
+    }
+}

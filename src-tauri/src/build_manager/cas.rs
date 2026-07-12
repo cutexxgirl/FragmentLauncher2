@@ -1,4 +1,5 @@
 use super::{
+    artifact_plan::{ArtifactExecutionSourceV2, PlannedArtifactExecutionV2},
     managed_fs::{
         ensure_directory_chain, open_or_create_lock_file, FileIdentity, GuardedDirectoryChain,
         ImmutableManagedFile, ManagedFsError, ManagedLockFile, RelativeManagedPath,
@@ -35,8 +36,8 @@ pub(super) fn cas_object_relative_path(sha256: &str) -> Result<RelativeManagedPa
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedObject {
-    pub sha256: String,
-    pub size: u64,
+    pub(super) sha256: String,
+    pub(super) size: u64,
 }
 
 #[derive(Debug)]
@@ -48,6 +49,16 @@ pub struct VerifiedCasObject {
     sha256: String,
     size: u64,
     resumed_bytes: u64,
+}
+
+/// Read-only result used by the coordinator's availability scanner. Construction remains inside
+/// the CAS module so no caller needs to know or reproduce the private final/`.part` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CasObjectAvailability {
+    Missing,
+    Partial { bytes: u64 },
+    Complete,
+    Corrupt,
 }
 
 pub struct CasDownloader<'root> {
@@ -150,7 +161,7 @@ impl<'root> CasDownloader<'root> {
         Self { cache_root, spark }
     }
 
-    pub async fn ensure_object(
+    async fn ensure_object(
         &self,
         channel: BuildChannel,
         preset: PresetId,
@@ -175,6 +186,39 @@ impl<'root> CasDownloader<'root> {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(CasError::Failed(error)),
         }
+    }
+
+    /// The production Spark boundary accepts only an item yielded by a sealed artifact plan.
+    /// Scope, digest, size and root identity therefore cannot be reconstructed by the caller.
+    pub(super) async fn ensure_planned_spark_object(
+        &self,
+        planned: &PlannedArtifactExecutionV2<'_>,
+        bearer_token: &str,
+    ) -> CasResult<VerifiedCasObject> {
+        planned
+            .validate_root(self.cache_root)
+            .map_err(CasError::Failed)?;
+        if planned.source() != ArtifactExecutionSourceV2::SparkCas {
+            return Err(CasError::Failed(
+                "Spark downloader rejected a non-Spark artifact authority".into(),
+            ));
+        }
+        if planned.availability() == super::availability::ArtifactAvailabilityStateV2::Complete {
+            // A post-scan cache change invalidates the plan. Never quarantine/fetch against a
+            // zero-reserve Complete item; force the coordinator to rescan and replan instead.
+            return verify_planned_object(self.cache_root, planned);
+        }
+        self.ensure_object(
+            planned.channel(),
+            planned.preset(),
+            planned.release_id(),
+            &ExpectedObject {
+                sha256: planned.sha256().to_owned(),
+                size: planned.size(),
+            },
+            bearer_token,
+        )
+        .await
     }
 
     async fn ensure_object_locked(
@@ -612,6 +656,7 @@ fn audit_existing_final(
     }))
 }
 
+#[cfg(test)]
 pub(super) fn verify_existing_object(
     root: &OwnedCasRoot,
     expected: &ExpectedObject,
@@ -625,6 +670,78 @@ pub(super) fn verify_existing_object(
             "Canonical CAS object does not match its signed digest".into(),
         )),
     }
+}
+
+/// Reconstructs a cached object lease only from a sealed plan item and the exact bound root.
+pub(super) fn verify_planned_object(
+    root: &OwnedCasRoot,
+    planned: &PlannedArtifactExecutionV2<'_>,
+) -> CasResult<VerifiedCasObject> {
+    planned.validate_root(root).map_err(CasError::Failed)?;
+    match audit_existing_final(
+        root,
+        &ExpectedObject {
+            sha256: planned.sha256().to_owned(),
+            size: planned.size(),
+        },
+        planned.resume_from(),
+    )? {
+        ExistingFinal::Verified(object) => Ok(object),
+        ExistingFinal::Missing => Err(CasError::Failed("Canonical CAS object is missing".into())),
+        ExistingFinal::Corrupt => Err(CasError::Failed(
+            "Canonical CAS object does not match its sealed digest".into(),
+        )),
+    }
+}
+
+/// Audits one canonical object without mutating it. A final object is always fully rehashed;
+/// resumable state contributes only its safely leased length. Unsafe nodes are errors, while an
+/// ordinary single-link file with incorrect signed content is classified as corrupt.
+pub(super) fn audit_object_availability(
+    root: &OwnedCasRoot,
+    expected: &ExpectedObject,
+) -> CasResult<CasObjectAvailability> {
+    validate_expected(expected).map_err(CasError::Failed)?;
+    root.revalidate().map_err(CasError::Failed)?;
+    let paths = CasPaths::new(&expected.sha256).map_err(CasError::Failed)?;
+    match audit_existing_final(root, expected, 0)? {
+        ExistingFinal::Verified(_) => {
+            root.revalidate().map_err(CasError::Failed)?;
+            return Ok(CasObjectAvailability::Complete);
+        }
+        ExistingFinal::Corrupt => {
+            root.revalidate().map_err(CasError::Failed)?;
+            return Ok(CasObjectAvailability::Corrupt);
+        }
+        ExistingFinal::Missing => {}
+    }
+
+    let partial = match ResumableManagedFile::open_existing(
+        root.managed_root(),
+        paths.partial,
+        expected.size,
+    ) {
+        Ok(value) => value,
+        Err(ManagedFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            None
+        }
+        Err(error) => return Err(managed_error("Cannot audit CAS partial", error)),
+    };
+    let state = match partial {
+        None => CasObjectAvailability::Missing,
+        Some(partial) => {
+            let bytes = partial
+                .len()
+                .map_err(|error| managed_error("Cannot inspect CAS partial length", error))?;
+            if bytes > expected.size {
+                CasObjectAvailability::Corrupt
+            } else {
+                CasObjectAvailability::Partial { bytes }
+            }
+        }
+    };
+    root.revalidate().map_err(CasError::Failed)?;
+    Ok(state)
 }
 
 fn partial_matches(
@@ -744,7 +861,13 @@ fn map_spark_error(error: SparkClientError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_manager::storage::select_install_directory;
+    use crate::build_manager::{
+        artifact_plan::{ArtifactExecutionSourceV2, ArtifactInventoryV2, ArtifactPlanV2},
+        availability::VerifiedAvailabilityV2,
+        planner::tests::trusted,
+        storage::select_install_directory,
+        types::{BuildChannel, PresetId},
+    };
     use sha2::{Digest, Sha256};
     use std::{
         fs,
@@ -802,6 +925,113 @@ mod tests {
         let guards = paths.prepare(root).expect("prepare CAS paths");
         fs::write(absolute(root, &paths.partial), bytes).expect("write partial");
         drop(guards);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_downloader_rejects_official_plan_item_before_network() {
+        let (install, root) = owned_root("sealed-authority");
+        let release = trusted('a', 1);
+        let install_id = root.binding().1;
+        let inventory = ArtifactInventoryV2::build(
+            &root,
+            &release,
+            install_id,
+            Uuid::new_v4(),
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .unwrap();
+        let availability = VerifiedAvailabilityV2::for_test(&inventory, [], false, false);
+        let plan = ArtifactPlanV2::for_reconcile(&inventory, &availability, []).unwrap();
+        let view = plan.execution_view(&root, &inventory).unwrap();
+        let official = view
+            .items()
+            .find(|item| {
+                matches!(
+                    item.source(),
+                    ArtifactExecutionSourceV2::OfficialHttps { .. }
+                )
+            })
+            .expect("official runtime item");
+        let downloader =
+            CasDownloader::new(&root, SparkClient::new_for_test("http://127.0.0.1:9/"));
+        let error = downloader
+            .ensure_planned_spark_object(&official, BEARER)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-Spark artifact authority"));
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_plan_item_changed_after_scan_is_verify_only_and_forces_replan() {
+        let (install, root) = owned_root("complete-stale");
+        let base = trusted('a', 1);
+        let bytes = b"complete cached spark object";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let mut manifest = base.manifest().clone();
+        for preset in &mut manifest.presets {
+            let exact = preset
+                .files
+                .iter_mut()
+                .find(|file| file.path == "mods/fragment-launch-guard.jar")
+                .unwrap();
+            exact.size = bytes.len() as u64;
+            exact.sha256 = sha256.clone();
+        }
+        manifest.validate().unwrap();
+        let release = super::super::tuf::TrustedRelease::new_for_test(
+            base.channel(),
+            base.current().clone(),
+            manifest,
+            base.runtime_lock().clone(),
+            base.game_runtime_lock().clone(),
+            base.tuf_root_version(),
+            base.evidence().clone(),
+        );
+        let install_id = root.binding().1;
+        let inventory = ArtifactInventoryV2::build(
+            &root,
+            &release,
+            install_id,
+            Uuid::new_v4(),
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .unwrap();
+        let paths = CasPaths::new(&sha256).unwrap();
+        let guards = paths.prepare(&root).unwrap();
+        fs::write(absolute(&root, &paths.final_path), bytes).unwrap();
+        drop(guards);
+        let availability = VerifiedAvailabilityV2::scan(&root, &inventory).unwrap();
+        let plan = ArtifactPlanV2::for_reconcile(
+            &inventory,
+            &availability,
+            ["mods/fragment-launch-guard.jar".to_string()],
+        )
+        .unwrap();
+        let view = plan.execution_view(&root, &inventory).unwrap();
+        let item = view
+            .items()
+            .find(|item| item.sha256() == sha256)
+            .expect("complete Spark item");
+        assert_eq!(
+            item.availability(),
+            super::super::availability::ArtifactAvailabilityStateV2::Complete
+        );
+
+        fs::write(absolute(&root, &paths.final_path), vec![b'x'; bytes.len()]).unwrap();
+        let downloader =
+            CasDownloader::new(&root, SparkClient::new_for_test("http://127.0.0.1:9/"));
+        let error = downloader
+            .ensure_planned_spark_object(&item, BEARER)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sealed digest"));
+        assert!(absolute(&root, &paths.final_path).exists());
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
     }
 
     fn spawn_server(

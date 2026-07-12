@@ -110,6 +110,13 @@ impl OwnedCasRoot {
         &self.objects_root
     }
 
+    /// The installation root is part of the same non-cloneable filesystem lease as the CAS.
+    /// Native runtime auditors use this accessor so a caller cannot pair an owned CAS with an
+    /// unrelated Java or game-runtime directory.
+    pub(super) fn install_root(&self) -> &Path {
+        &self.install_root
+    }
+
     pub(super) fn binding(&self) -> (Uuid, Uuid, &FileIdentity, &FileIdentity) {
         (
             self.binding_nonce,

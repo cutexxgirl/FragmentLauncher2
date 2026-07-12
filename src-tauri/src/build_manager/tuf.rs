@@ -52,13 +52,64 @@ const TRUSTED_RELEASE_EVIDENCE_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug)]
 pub struct TrustedRelease {
-    pub channel: BuildChannel,
-    pub current: CurrentPointer,
-    pub manifest: ReleaseManifest,
-    pub runtime_lock: RuntimeLock,
-    pub game_runtime_lock: GameRuntimeLock,
-    pub tuf_root_version: u64,
-    pub evidence: TrustedReleaseEvidence,
+    channel: BuildChannel,
+    current: CurrentPointer,
+    manifest: ReleaseManifest,
+    runtime_lock: RuntimeLock,
+    game_runtime_lock: GameRuntimeLock,
+    tuf_root_version: u64,
+    evidence: TrustedReleaseEvidence,
+}
+
+impl TrustedRelease {
+    pub(super) fn channel(&self) -> BuildChannel {
+        self.channel
+    }
+
+    pub(super) fn current(&self) -> &CurrentPointer {
+        &self.current
+    }
+
+    pub(super) fn manifest(&self) -> &ReleaseManifest {
+        &self.manifest
+    }
+
+    pub(super) fn runtime_lock(&self) -> &RuntimeLock {
+        &self.runtime_lock
+    }
+
+    pub(super) fn game_runtime_lock(&self) -> &GameRuntimeLock {
+        &self.game_runtime_lock
+    }
+
+    pub(super) fn tuf_root_version(&self) -> u64 {
+        self.tuf_root_version
+    }
+
+    pub(super) fn evidence(&self) -> &TrustedReleaseEvidence {
+        &self.evidence
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        channel: BuildChannel,
+        current: CurrentPointer,
+        manifest: ReleaseManifest,
+        runtime_lock: RuntimeLock,
+        game_runtime_lock: GameRuntimeLock,
+        tuf_root_version: u64,
+        evidence: TrustedReleaseEvidence,
+    ) -> Self {
+        Self {
+            channel,
+            current,
+            manifest,
+            runtime_lock,
+            game_runtime_lock,
+            tuf_root_version,
+            evidence,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

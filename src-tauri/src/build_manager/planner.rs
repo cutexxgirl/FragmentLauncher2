@@ -1,9 +1,12 @@
 use super::{
+    artifact_plan::{ArtifactInventoryV2, ArtifactPlanV2, MutableBootstrapPlanV2},
+    availability::VerifiedAvailabilityV2,
     contracts::{GameRuntimeSource, RuntimeLock},
     instance_state::ActiveInstanceV2,
     journal::{DiskBudgetV2, JournalMutation, OperationKind, PlannedFileV2, ReconcilePlanV2},
     reconciler::InstanceAudit,
     release::{FilePolicy, ManifestFile},
+    storage::OwnedCasRoot,
     tuf::TrustedRelease,
     types::{BuildChannel, PresetId},
 };
@@ -23,23 +26,6 @@ pub(super) enum PlannedBuildState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct VerifiedCachedArtifactV2 {
-    pub sha256: String,
-    pub size: u64,
-    pub complete: bool,
-    /// Bytes already occupying the final `.part` file. They need no additional disk space.
-    pub partial_bytes: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct VerifiedAvailabilityV2 {
-    pub spark_cas: Vec<VerifiedCachedArtifactV2>,
-    pub official_upstream: Vec<VerifiedCachedArtifactV2>,
-    pub java_generation_lock_sha256: Option<String>,
-    pub game_generation_lock_sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MutableMaterializationProofV2 {
     pub path: String,
     pub size: u64,
@@ -49,13 +35,14 @@ pub(super) struct MutableMaterializationProofV2 {
     pub current_matches: bool,
 }
 
-#[derive(Debug)]
 pub(super) struct PlannerRequestV2<'a> {
     pub install_id: Uuid,
     pub channel: BuildChannel,
     pub preset: PresetId,
     pub operation_id: Uuid,
     pub trusted_release: &'a TrustedRelease,
+    pub artifact_inventory: &'a ArtifactInventoryV2,
+    pub cas_root: &'a OwnedCasRoot,
     pub installed: Option<&'a ActiveInstanceV2>,
     pub audit: &'a InstanceAudit,
     pub mutable_files: &'a [MutableMaterializationProofV2],
@@ -67,6 +54,7 @@ pub(super) struct PlannedBuildV2 {
     pub state: PlannedBuildState,
     pub plan: Option<ReconcilePlanV2>,
     pub disk_budget: DiskBudgetV2,
+    pub artifact_plan: Option<ArtifactPlanV2>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -245,6 +233,24 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
             "install ID and operation UUIDv4 are required".into(),
         ));
     }
+    request
+        .artifact_inventory
+        .validate_root(request.cas_root)
+        .map_err(PlannerError::Availability)?;
+    request
+        .artifact_inventory
+        .validate_request(
+            request.trusted_release,
+            request.install_id,
+            request.operation_id,
+            request.channel,
+            request.preset,
+        )
+        .map_err(PlannerError::Availability)?;
+    request
+        .availability
+        .validate_for(request.artifact_inventory)
+        .map_err(PlannerError::Availability)?;
     if let Some(installed) = request.installed {
         installed
             .validate(request.install_id, request.channel)
@@ -253,7 +259,7 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
 
     let preset = request
         .trusted_release
-        .manifest
+        .manifest()
         .selected_preset(request.preset)
         .map_err(PlannerError::TrustedRelease)?;
     let mutable = validate_mutable_proofs(&preset.files, request.mutable_files, request.audit)?;
@@ -266,10 +272,10 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
     if let Some(installed) = request.installed {
         if installed
             .trusted_release
-            .targets_match(&request.trusted_release.evidence)
+            .targets_match(request.trusted_release.evidence())
             && !installed
                 .trusted_release
-                .is_monotonic_to(&request.trusted_release.evidence)
+                .is_monotonic_to(request.trusted_release.evidence())
         {
             return Err(PlannerError::InstalledMarker(
                 "fresh TUF role versions are older than the installed evidence".into(),
@@ -280,27 +286,8 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
         && request
             .installed
             .is_some_and(|installed| installed.preset == request.preset);
-    validate_runtime_availability(request.availability)?;
-    let java_generation_verified = request.availability.java_generation_lock_sha256.as_deref()
-        == Some(
-            request
-                .trusted_release
-                .manifest
-                .runtime
-                .java
-                .runtime_lock_sha256
-                .as_str(),
-        );
-    let game_generation_verified = request.availability.game_generation_lock_sha256.as_deref()
-        == Some(
-            request
-                .trusted_release
-                .manifest
-                .runtime
-                .game
-                .runtime_lock_sha256
-                .as_str(),
-        );
+    let java_generation_verified = request.availability.java_generation_complete();
+    let game_generation_verified = request.availability.game_generation_complete();
     let runtime_ready = java_generation_verified && game_generation_verified;
     let needs_repair = !audit_plan.mutations.is_empty() || !runtime_ready;
 
@@ -314,10 +301,15 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
 
     if state == PlannedBuildState::Ready {
         let budget = DiskBudgetV2::new(0, 0, 0, 0).map_err(PlannerError::Plan)?;
+        request
+            .artifact_inventory
+            .validate_root(request.cas_root)
+            .map_err(PlannerError::Availability)?;
         return Ok(PlannedBuildV2 {
             state,
             plan: None,
             disk_budget: budget,
+            artifact_plan: None,
         });
     }
 
@@ -341,14 +333,21 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
         (Some(_), false, _) => OperationKind::Update,
     };
 
-    let requirements = required_artifacts(
-        &desired,
-        &audit_plan.install_keys,
-        request.trusted_release,
+    let install_paths = desired
+        .iter()
+        .filter(|file| audit_plan.install_keys.contains(&path_key(&file.path)))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let artifact_plan = ArtifactPlanV2::for_reconcile(
+        request.artifact_inventory,
         request.availability,
-        java_generation_verified,
-        game_generation_verified,
-    )?;
+        install_paths,
+    )
+    .map_err(PlannerError::Availability)?;
+    artifact_plan
+        .validate_for(request.artifact_inventory)
+        .map_err(PlannerError::Availability)?;
+    let requirements = artifact_plan.disk_download_reserve_bytes();
     let staging_bytes = audit_plan
         .mutations
         .iter()
@@ -360,14 +359,14 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
     let java_extracted_bytes = if java_generation_verified {
         0
     } else {
-        sum_java_files(&request.trusted_release.runtime_lock)?
+        sum_java_files(request.trusted_release.runtime_lock())?
     };
     let game_extracted_bytes = if game_generation_verified {
         0
     } else {
         request
             .trusted_release
-            .game_runtime_lock
+            .game_runtime_lock()
             .files
             .iter()
             .try_fold(0_u64, |total, file| {
@@ -389,14 +388,14 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
 
     let mut strict_roots = request
         .trusted_release
-        .manifest
+        .manifest()
         .integrity
         .strict_roots
         .clone();
     canonicalize_paths(&mut strict_roots);
     let mut preserved_paths = request
         .trusted_release
-        .manifest
+        .manifest()
         .integrity
         .preserved_paths
         .clone();
@@ -419,12 +418,35 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
         .map_err(PlannerError::Plan)?;
     // This also proves that every serialized vector is already canonical and bounded.
     plan.canonical_bytes().map_err(PlannerError::Plan)?;
+    request
+        .artifact_inventory
+        .validate_root(request.cas_root)
+        .map_err(PlannerError::Availability)?;
 
     Ok(PlannedBuildV2 {
         state,
         plan: Some(plan),
         disk_budget,
+        artifact_plan: Some(artifact_plan),
     })
+}
+
+pub(super) fn plan_mutable_bootstrap(
+    root: &OwnedCasRoot,
+    inventory: &ArtifactInventoryV2,
+    availability: &VerifiedAvailabilityV2,
+) -> Result<MutableBootstrapPlanV2, PlannerError> {
+    inventory
+        .validate_root(root)
+        .map_err(PlannerError::Availability)?;
+    let plan = MutableBootstrapPlanV2::build(inventory, availability)
+        .map_err(PlannerError::Availability)?;
+    plan.validate_for(inventory)
+        .map_err(PlannerError::Availability)?;
+    inventory
+        .validate_root(root)
+        .map_err(PlannerError::Availability)?;
+    Ok(plan)
 }
 
 pub(super) fn decide_recovery(request: RecoveryRequestV2<'_>) -> RecoveryDecisionV2 {
@@ -451,7 +473,7 @@ pub(super) fn decide_recovery(request: RecoveryRequestV2<'_>) -> RecoveryDecisio
         request.plan.channel,
     ) && request
         .fresh_release
-        .manifest
+        .manifest()
         .selected_preset(request.plan.target.preset)
         .is_ok();
 
@@ -501,46 +523,46 @@ fn validate_trusted_release(
     trusted: &TrustedRelease,
     expected_channel: BuildChannel,
 ) -> Result<(), PlannerError> {
-    if trusted.channel != expected_channel
-        || trusted.current.channel != expected_channel
-        || trusted.current.release_id != trusted.manifest.release.id
-        || trusted.tuf_root_version != trusted.evidence.roles.root
+    if trusted.channel() != expected_channel
+        || trusted.current().channel != expected_channel
+        || trusted.current().release_id != trusted.manifest().release.id
+        || trusted.tuf_root_version() != trusted.evidence().roles.root
     {
         return Err(PlannerError::TrustedRelease(
             "channel, current target, release or root version mismatch".into(),
         ));
     }
     trusted
-        .manifest
+        .manifest()
         .validate()
         .map_err(PlannerError::TrustedRelease)?;
     trusted
-        .runtime_lock
+        .runtime_lock()
         .validate()
         .map_err(PlannerError::TrustedRelease)?;
     trusted
-        .game_runtime_lock
+        .game_runtime_lock()
         .validate()
         .map_err(PlannerError::TrustedRelease)?;
     trusted
-        .manifest
-        .bind_runtime_lock(&trusted.runtime_lock)
+        .manifest()
+        .bind_runtime_lock(trusted.runtime_lock())
         .map_err(PlannerError::TrustedRelease)?;
     trusted
-        .manifest
-        .bind_game_runtime_lock(&trusted.runtime_lock, &trusted.game_runtime_lock)
+        .manifest()
+        .bind_game_runtime_lock(trusted.runtime_lock(), trusted.game_runtime_lock())
         .map_err(PlannerError::TrustedRelease)?;
     trusted
-        .evidence
+        .evidence()
         .validate_binding(
             expected_channel,
-            &trusted.manifest.release.id,
-            &trusted.current.manifest_target,
-            &trusted.manifest.runtime.java.runtime_target,
-            &trusted.manifest.runtime.game.runtime_target,
-            &trusted.evidence.release_manifest.sha256,
-            &trusted.manifest.runtime.java.runtime_lock_sha256,
-            &trusted.manifest.runtime.game.runtime_lock_sha256,
+            &trusted.manifest().release.id,
+            &trusted.current().manifest_target,
+            &trusted.manifest().runtime.java.runtime_target,
+            &trusted.manifest().runtime.game.runtime_target,
+            &trusted.evidence().release_manifest.sha256,
+            &trusted.manifest().runtime.java.runtime_lock_sha256,
+            &trusted.manifest().runtime.game.runtime_lock_sha256,
         )
         .map_err(PlannerError::TrustedRelease)
 }
@@ -556,12 +578,12 @@ fn active_target(
         install_id,
         channel,
         generation,
-        trusted.manifest.release.id.clone(),
+        trusted.manifest().release.id.clone(),
         preset,
-        trusted.evidence.release_manifest.sha256.clone(),
-        trusted.manifest.runtime.java.runtime_lock_sha256.clone(),
-        trusted.manifest.runtime.game.runtime_lock_sha256.clone(),
-        trusted.evidence.clone(),
+        trusted.evidence().release_manifest.sha256.clone(),
+        trusted.manifest().runtime.java.runtime_lock_sha256.clone(),
+        trusted.manifest().runtime.game.runtime_lock_sha256.clone(),
+        trusted.evidence().clone(),
     )
     .map_err(PlannerError::Plan)
 }
@@ -572,11 +594,11 @@ fn marker_binds_current_content(
     channel: BuildChannel,
 ) -> bool {
     marker.channel == channel
-        && marker.release_id == trusted.manifest.release.id
-        && marker.release_manifest_sha256 == trusted.evidence.release_manifest.sha256
-        && marker.runtime_lock_sha256 == trusted.manifest.runtime.java.runtime_lock_sha256
-        && marker.game_runtime_lock_sha256 == trusted.manifest.runtime.game.runtime_lock_sha256
-        && marker.trusted_release.is_monotonic_to(&trusted.evidence)
+        && marker.release_id == trusted.manifest().release.id
+        && marker.release_manifest_sha256 == trusted.evidence().release_manifest.sha256
+        && marker.runtime_lock_sha256 == trusted.manifest().runtime.java.runtime_lock_sha256
+        && marker.game_runtime_lock_sha256 == trusted.manifest().runtime.game.runtime_lock_sha256
+        && marker.trusted_release.is_monotonic_to(trusted.evidence())
 }
 
 fn build_desired_files(
@@ -838,143 +860,6 @@ fn plan_instance_mutations(
     })
 }
 
-fn required_artifacts(
-    desired: &[PlannedFileV2],
-    install_keys: &BTreeSet<String>,
-    trusted: &TrustedRelease,
-    availability: &VerifiedAvailabilityV2,
-    java_generation_verified: bool,
-    game_generation_verified: bool,
-) -> Result<u64, PlannerError> {
-    let spark_cache = availability_map(&availability.spark_cas, "Spark CAS")?;
-    let upstream_cache = availability_map(&availability.official_upstream, "upstream cache")?;
-    let mut spark_required = BTreeMap::new();
-    for file in desired {
-        if install_keys.contains(&path_key(&file.path)) {
-            insert_artifact(
-                &mut spark_required,
-                &file.signed_sha256,
-                file.signed_size,
-                "manifest object",
-            )?;
-        }
-    }
-    if !java_generation_verified {
-        insert_artifact(
-            &mut spark_required,
-            &trusted.manifest.runtime.java.archive.sha256,
-            trusted.manifest.runtime.java.archive.size,
-            "Java archive",
-        )?;
-    }
-
-    let mut upstream_required = BTreeMap::new();
-    if !game_generation_verified {
-        for file in &trusted.game_runtime_lock.files {
-            if let GameRuntimeSource::Official { size, sha256, .. } = &file.source {
-                insert_artifact(
-                    &mut upstream_required,
-                    sha256,
-                    *size,
-                    "official game artifact",
-                )?;
-            }
-        }
-    }
-    let spark_missing = remaining_bytes(&spark_required, &spark_cache, "Spark CAS")?;
-    let upstream_missing = remaining_bytes(&upstream_required, &upstream_cache, "upstream cache")?;
-    spark_missing
-        .checked_add(upstream_missing)
-        .ok_or(PlannerError::Overflow("missing download bytes"))
-}
-
-fn validate_runtime_availability(
-    availability: &VerifiedAvailabilityV2,
-) -> Result<(), PlannerError> {
-    for value in [
-        availability.java_generation_lock_sha256.as_deref(),
-        availability.game_generation_lock_sha256.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !is_sha256(value) {
-            return Err(PlannerError::Availability(
-                "verified runtime generation has an invalid lock SHA-256".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn availability_map<'a>(
-    entries: &'a [VerifiedCachedArtifactV2],
-    label: &str,
-) -> Result<BTreeMap<String, &'a VerifiedCachedArtifactV2>, PlannerError> {
-    let mut map = BTreeMap::new();
-    let mut previous: Option<&str> = None;
-    for entry in entries {
-        if !is_sha256(&entry.sha256)
-            || entry.partial_bytes > entry.size
-            || (entry.complete && entry.partial_bytes != 0)
-            || previous.is_some_and(|value| value >= entry.sha256.as_str())
-        {
-            return Err(PlannerError::Availability(format!(
-                "{label} entries are invalid or not canonical"
-            )));
-        }
-        map.insert(entry.sha256.clone(), entry);
-        previous = Some(&entry.sha256);
-    }
-    Ok(map)
-}
-
-fn remaining_bytes(
-    required: &BTreeMap<String, u64>,
-    available: &BTreeMap<String, &VerifiedCachedArtifactV2>,
-    label: &str,
-) -> Result<u64, PlannerError> {
-    required.iter().try_fold(0_u64, |total, (sha256, size)| {
-        let remaining = match available.get(sha256) {
-            Some(entry) if entry.size != *size => {
-                return Err(PlannerError::Availability(format!(
-                    "{label} size differs for {sha256}"
-                )))
-            }
-            Some(entry) if entry.complete => 0,
-            Some(entry) => size
-                .checked_sub(entry.partial_bytes)
-                .ok_or(PlannerError::Overflow("partial download bytes"))?,
-            None => *size,
-        };
-        total
-            .checked_add(remaining)
-            .ok_or(PlannerError::Overflow("download byte total"))
-    })
-}
-
-fn insert_artifact(
-    artifacts: &mut BTreeMap<String, u64>,
-    sha256: &str,
-    size: u64,
-    label: &str,
-) -> Result<(), PlannerError> {
-    if !is_sha256(sha256) {
-        return Err(PlannerError::Availability(format!(
-            "{label} has an invalid SHA-256"
-        )));
-    }
-    if artifacts
-        .insert(sha256.to_owned(), size)
-        .is_some_and(|existing| existing != size)
-    {
-        return Err(PlannerError::Availability(format!(
-            "{label} reuses one SHA-256 with conflicting sizes"
-        )));
-    }
-    Ok(())
-}
-
 fn sum_java_files(lock: &RuntimeLock) -> Result<u64, PlannerError> {
     lock.java
         .files
@@ -1127,12 +1012,13 @@ fn is_sha256(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::build_manager::{
         contracts::{self, GameRuntimeLock},
         reconciler::{ModifiedFile, ModifiedKind},
         release::{self, CurrentPointer, ReleaseManifest},
+        storage::select_install_directory,
         tuf::{TrustedReleaseEvidence, TrustedRoleVersions, TrustedTargetEvidence},
     };
     use sha2::{Digest, Sha256};
@@ -1144,7 +1030,7 @@ mod tests {
     const RUNTIME_HASH: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const GAME_HASH: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-    fn trusted(release_suffix: char, metadata_version: u64) -> TrustedRelease {
+    pub(crate) fn trusted(release_suffix: char, metadata_version: u64) -> TrustedRelease {
         let game_template = contracts::tests::game_runtime_lock();
         let mut runtime_json = contracts::tests::runtime_lock();
         runtime_json["minecraft"]["versionJsonUrl"] =
@@ -1230,15 +1116,15 @@ mod tests {
                 sha256: GAME_HASH.into(),
             },
         };
-        TrustedRelease {
-            channel: BuildChannel::Stable,
+        TrustedRelease::new_for_test(
+            BuildChannel::Stable,
             current,
             manifest,
             runtime_lock,
             game_runtime_lock,
-            tuf_root_version: 1,
+            1,
             evidence,
-        }
+        )
     }
 
     fn mutable(current_matches: bool) -> Vec<MutableMaterializationProofV2> {
@@ -1274,17 +1160,89 @@ mod tests {
         }
     }
 
-    fn ready_availability() -> VerifiedAvailabilityV2 {
-        VerifiedAvailabilityV2 {
-            java_generation_lock_sha256: Some(RUNTIME_HASH.into()),
-            game_generation_lock_sha256: Some(GAME_HASH.into()),
-            ..VerifiedAvailabilityV2::default()
+    fn test_inventory(
+        root: &super::super::storage::OwnedCasRoot,
+        trusted: &TrustedRelease,
+        install_id: Uuid,
+        operation_id: Uuid,
+    ) -> ArtifactInventoryV2 {
+        ArtifactInventoryV2::build(
+            root,
+            trusted,
+            install_id,
+            operation_id,
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .unwrap()
+    }
+
+    struct TestInstall {
+        directory: std::path::PathBuf,
+        root: Option<super::super::storage::OwnedCasRoot>,
+        install_id: Uuid,
+    }
+
+    impl TestInstall {
+        fn root(&self) -> &super::super::storage::OwnedCasRoot {
+            self.root.as_ref().expect("test root")
+        }
+
+        fn from_owner_marker(source: &TestInstall) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "fragment-planner-artifacts-rebound-{}",
+                Uuid::new_v4()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::copy(
+                source.directory.join(".fragment-launcher-root.json"),
+                directory.join(".fragment-launcher-root.json"),
+            )
+            .unwrap();
+            let selected = select_install_directory(&directory).unwrap();
+            assert_eq!(selected.install_id(), source.install_id);
+            Self {
+                directory,
+                root: Some(selected.into_owned_cas_root()),
+                install_id: source.install_id,
+            }
         }
     }
 
+    impl Drop for TestInstall {
+        fn drop(&mut self) {
+            drop(self.root.take());
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn test_install() -> TestInstall {
+        let directory =
+            std::env::temp_dir().join(format!("fragment-planner-artifacts-{}", Uuid::new_v4()));
+        let selected = select_install_directory(&directory).unwrap();
+        let install_id = selected.install_id();
+        TestInstall {
+            directory,
+            root: Some(selected.into_owned_cas_root()),
+            install_id,
+        }
+    }
+
+    fn ready_availability(inventory: &ArtifactInventoryV2) -> VerifiedAvailabilityV2 {
+        VerifiedAvailabilityV2::for_test(inventory, [], true, true)
+    }
+
+    fn missing_availability(inventory: &ArtifactInventoryV2) -> VerifiedAvailabilityV2 {
+        VerifiedAvailabilityV2::for_test(inventory, [], false, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn request<'a>(
         install_id: Uuid,
+        operation_id: Uuid,
         trusted_release: &'a TrustedRelease,
+        artifact_inventory: &'a ArtifactInventoryV2,
+        cas_root: &'a super::super::storage::OwnedCasRoot,
         installed: Option<&'a ActiveInstanceV2>,
         audit: &'a InstanceAudit,
         mutable_files: &'a [MutableMaterializationProofV2],
@@ -1294,8 +1252,10 @@ mod tests {
             install_id,
             channel: BuildChannel::Stable,
             preset: PresetId::Medium,
-            operation_id: Uuid::new_v4(),
+            operation_id,
             trusted_release,
+            artifact_inventory,
+            cas_root,
             installed,
             audit,
             mutable_files,
@@ -1305,14 +1265,20 @@ mod tests {
 
     #[test]
     fn plans_a_canonical_initial_download_with_pessimistic_disk_budget() {
-        let install_id = Uuid::new_v4();
+        let install = test_install();
+        let install_id = install.install_id;
+        let operation_id = Uuid::new_v4();
         let current_release = trusted('a', 1);
         let audit = missing_audit();
         let mutable = mutable(false);
-        let availability = VerifiedAvailabilityV2::default();
+        let inventory = test_inventory(install.root(), &current_release, install_id, operation_id);
+        let availability = missing_availability(&inventory);
         let planned = plan_build(request(
             install_id,
+            operation_id,
             &current_release,
+            &inventory,
+            install.root(),
             None,
             &audit,
             &mutable,
@@ -1323,10 +1289,13 @@ mod tests {
         let plan = planned.plan.unwrap();
         assert_eq!(plan.kind, OperationKind::Install);
         assert_eq!(plan.target.generation, 1);
-        assert_eq!(plan.target.release_id, current_release.manifest.release.id);
+        assert_eq!(
+            plan.target.release_id,
+            current_release.manifest().release.id
+        );
         assert_eq!(
             plan.target.release_manifest_sha256,
-            current_release.evidence.release_manifest.sha256
+            current_release.evidence().release_manifest.sha256
         );
         assert_eq!(plan.target.runtime_lock_sha256, RUNTIME_HASH);
         assert_eq!(plan.target.game_runtime_lock_sha256, GAME_HASH);
@@ -1345,7 +1314,9 @@ mod tests {
 
     #[test]
     fn returns_ready_only_for_fresh_binding_exact_audit_mutable_proof_and_runtimes() {
-        let install_id = Uuid::new_v4();
+        let install = test_install();
+        let install_id = install.install_id;
+        let operation_id = Uuid::new_v4();
         let installed_release = trusted('a', 1);
         let installed = active_target(
             install_id,
@@ -1358,10 +1329,14 @@ mod tests {
         let fresh = trusted('a', 2);
         let audit = ready_audit();
         let mutable = mutable(true);
-        let availability = ready_availability();
+        let inventory = test_inventory(install.root(), &fresh, install_id, operation_id);
+        let availability = ready_availability(&inventory);
         let planned = plan_build(request(
             install_id,
+            operation_id,
             &fresh,
+            &inventory,
+            install.root(),
             Some(&installed),
             &audit,
             &mutable,
@@ -1378,7 +1353,8 @@ mod tests {
 
     #[test]
     fn modified_current_release_is_repair_and_old_release_is_update() {
-        let install_id = Uuid::new_v4();
+        let install = test_install();
+        let install_id = install.install_id;
         let fresh = trusted('a', 1);
         let current = active_target(
             install_id,
@@ -1395,10 +1371,15 @@ mod tests {
             kind: ModifiedKind::Sha256,
         });
         let mutable = mutable(true);
-        let availability = ready_availability();
+        let repair_operation = Uuid::new_v4();
+        let repair_inventory = test_inventory(install.root(), &fresh, install_id, repair_operation);
+        let availability = ready_availability(&repair_inventory);
         let repair = plan_build(request(
             install_id,
+            repair_operation,
             &fresh,
+            &repair_inventory,
+            install.root(),
             Some(&current),
             &audit,
             &mutable,
@@ -1412,13 +1393,19 @@ mod tests {
         let old_marker =
             active_target(install_id, BuildChannel::Stable, 1, PresetId::Medium, &old).unwrap();
         let target_audit = ready_audit();
+        let update_operation = Uuid::new_v4();
+        let update_inventory = test_inventory(install.root(), &fresh, install_id, update_operation);
+        let update_availability = ready_availability(&update_inventory);
         let update = plan_build(request(
             install_id,
+            update_operation,
             &fresh,
+            &update_inventory,
+            install.root(),
             Some(&old_marker),
             &target_audit,
             &mutable,
-            &availability,
+            &update_availability,
         ))
         .unwrap();
         assert_eq!(update.state, PlannedBuildState::Update);
@@ -1427,7 +1414,9 @@ mod tests {
 
     #[test]
     fn never_trusts_a_mutable_candidate_without_named_materialization_proof() {
-        let install_id = Uuid::new_v4();
+        let install = test_install();
+        let install_id = install.install_id;
+        let operation_id = Uuid::new_v4();
         let current_release = trusted('a', 1);
         let installed = active_target(
             install_id,
@@ -1438,10 +1427,14 @@ mod tests {
         )
         .unwrap();
         let audit = ready_audit();
-        let availability = ready_availability();
+        let inventory = test_inventory(install.root(), &current_release, install_id, operation_id);
+        let availability = ready_availability(&inventory);
         let error = plan_build(request(
             install_id,
+            operation_id,
             &current_release,
+            &inventory,
+            install.root(),
             Some(&installed),
             &audit,
             &[],
@@ -1452,15 +1445,49 @@ mod tests {
     }
 
     #[test]
+    fn planner_and_mutable_bootstrap_require_the_live_inventory_root() {
+        let install = test_install();
+        let rebound = TestInstall::from_owner_marker(&install);
+        let install_id = install.install_id;
+        let operation_id = Uuid::new_v4();
+        let release = trusted('a', 1);
+        let inventory = test_inventory(install.root(), &release, install_id, operation_id);
+        let availability = missing_availability(&inventory);
+        let audit = missing_audit();
+        let mutable = mutable(false);
+        let error = plan_build(request(
+            install_id,
+            operation_id,
+            &release,
+            &inventory,
+            rebound.root(),
+            None,
+            &audit,
+            &mutable,
+            &availability,
+        ))
+        .unwrap_err();
+        assert!(matches!(error, PlannerError::Availability(_)));
+        assert!(plan_mutable_bootstrap(rebound.root(), &inventory, &availability).is_err());
+        assert!(plan_mutable_bootstrap(install.root(), &inventory, &availability).is_ok());
+    }
+
+    #[test]
     fn recovery_rolls_forward_only_with_current_target_and_exact_staging_proof() {
-        let install_id = Uuid::new_v4();
+        let install = test_install();
+        let install_id = install.install_id;
+        let operation_id = Uuid::new_v4();
         let current_release = trusted('a', 1);
         let audit = missing_audit();
         let mutable = mutable(false);
-        let availability = VerifiedAvailabilityV2::default();
+        let inventory = test_inventory(install.root(), &current_release, install_id, operation_id);
+        let availability = missing_availability(&inventory);
         let planned = plan_build(request(
             install_id,
+            operation_id,
             &current_release,
+            &inventory,
+            install.root(),
             None,
             &audit,
             &mutable,
@@ -1525,14 +1552,20 @@ mod tests {
 
     #[test]
     fn committed_target_requires_and_accepts_only_a_final_exact_audit() {
-        let install_id = Uuid::new_v4();
+        let install = test_install();
+        let install_id = install.install_id;
+        let operation_id = Uuid::new_v4();
         let trusted = trusted('a', 1);
         let audit = missing_audit();
         let mutable_before = mutable(false);
-        let availability = VerifiedAvailabilityV2::default();
+        let inventory = test_inventory(install.root(), &trusted, install_id, operation_id);
+        let availability = missing_availability(&inventory);
         let plan = plan_build(request(
             install_id,
+            operation_id,
             &trusted,
+            &inventory,
+            install.root(),
             None,
             &audit,
             &mutable_before,

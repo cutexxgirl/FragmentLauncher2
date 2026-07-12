@@ -2,6 +2,7 @@ use super::{
     contracts::{validate_manifest_path, RuntimeFile, RuntimeLock},
     storage::{
         inspect_existing_ancestors, open_or_create_regular_single_link, open_regular_single_link,
+        OwnedCasRoot,
     },
 };
 use fs2::FileExt;
@@ -190,6 +191,7 @@ pub(super) fn revalidate_runtime_installation(
     installed: &RuntimeInstallation,
     lock: &RuntimeLock,
 ) -> Result<RuntimeInstallation, String> {
+    inspect_existing_ancestors(&installed.generation)?;
     validate_sha256(&installed.runtime_lock_sha256)?;
     lock.validate()?;
     validate_generation(&installed.generation, &installed.runtime_lock_sha256, lock)?;
@@ -201,7 +203,48 @@ pub(super) fn revalidate_runtime_installation(
     if &verified != installed {
         return Err("Java runtime capability paths differ from the verified generation".into());
     }
+    inspect_existing_ancestors(&installed.generation)?;
+    validate_generation(&installed.generation, &installed.runtime_lock_sha256, lock)?;
+    inspect_existing_ancestors(&installed.generation)?;
     Ok(verified)
+}
+
+/// Audits the one canonical Java generation beneath an already validated Fragment install.
+/// Missing state is not an error, but an existing malformed/mismatched generation fails closed.
+/// This is deliberately the only path used by the artifact availability scanner to claim that
+/// the signed Java archive is no longer required.
+pub(super) fn audit_installed_runtime_generation(
+    owned_root: &OwnedCasRoot,
+    runtime_lock_sha256: &str,
+    lock: &RuntimeLock,
+) -> Result<Option<RuntimeInstallation>, String> {
+    owned_root.revalidate()?;
+    validate_sha256(runtime_lock_sha256)?;
+    lock.validate()?;
+    let generation = owned_root
+        .install_root()
+        .join("runtime")
+        .join("java")
+        .join("generations")
+        .join(runtime_lock_sha256);
+    inspect_existing_ancestors(&generation)?;
+    let result = match fs::symlink_metadata(&generation) {
+        Ok(_) if validate_generation(&generation, runtime_lock_sha256, lock).is_ok() => {
+            installation(generation, runtime_lock_sha256, lock).map(Some)
+        }
+        Ok(_) => {
+            // A real, in-root generation with ordinary marker/content damage is repairable: the
+            // installer will quarantine it before committing a fresh signed generation. Reject
+            // unsafe root/ancestor substitution, but do not dead-end planning on corrupt bytes.
+            validate_runtime_directory(&generation, "invalid Java generation")?;
+            inspect_existing_ancestors(&generation)?;
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot inspect Java runtime generation: {error}")),
+    }?;
+    owned_root.revalidate()?;
+    Ok(result)
 }
 
 fn installation(
@@ -894,6 +937,30 @@ mod tests {
         assert!(revalidate_runtime_installation(&forged, &lock).is_err());
         assert!(install_runtime(&install_root, &archive, &runtime_hash, &lock).is_ok());
         let _ = fs::remove_dir_all(archive.parent().unwrap());
+    }
+
+    #[test]
+    fn pre_spawn_revalidation_rejects_a_reparse_generation_ancestor() {
+        let (archive, lock, runtime_hash) = fixture(None);
+        let fixture_root = archive.parent().unwrap().to_path_buf();
+        let install_root = fixture_root.join("install");
+        let installed = install_runtime(&install_root, &archive, &runtime_hash, &lock).unwrap();
+        let generations = installed.generation.parent().unwrap().to_path_buf();
+        let relocated = generations.with_file_name("generations-relocated");
+        fs::rename(&generations, &relocated).unwrap();
+
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&relocated, &generations).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&relocated, &generations).is_ok();
+
+        if linked {
+            assert!(revalidate_runtime_installation(&installed, &lock).is_err());
+            fs::remove_dir(&generations).unwrap();
+        }
+        fs::rename(&relocated, &generations).unwrap();
+        assert!(revalidate_runtime_installation(&installed, &lock).is_ok());
+        let _ = fs::remove_dir_all(fixture_root);
     }
 
     #[test]

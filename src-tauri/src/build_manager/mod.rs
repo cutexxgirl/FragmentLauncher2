@@ -1,4 +1,8 @@
 #[allow(dead_code)]
+mod artifact_plan;
+#[allow(dead_code)]
+mod availability;
+#[allow(dead_code)]
 mod cas;
 #[allow(dead_code)]
 mod contracts;
