@@ -5,6 +5,10 @@ mod contracts;
 #[allow(dead_code)]
 mod game_runtime;
 #[allow(dead_code)]
+mod game_runtime_invocation;
+#[allow(dead_code)]
+mod game_runtime_materializer;
+#[allow(dead_code)]
 mod instance_state;
 #[allow(dead_code)]
 mod journal;
@@ -18,6 +22,8 @@ mod neoforge;
 mod planner;
 #[allow(dead_code)]
 mod process_supervisor;
+#[allow(dead_code)]
+mod reconcile_executor;
 #[allow(dead_code)]
 mod reconciler;
 #[allow(dead_code)]

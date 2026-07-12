@@ -24,13 +24,13 @@ const MAX_RUNTIME_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_GENERATION_MARKER_BYTES: u64 = 16 * 1024;
 const MAX_STAGING_CANDIDATES: usize = 32;
 
-#[derive(Debug, Clone)]
-pub struct RuntimeInstallation {
-    pub generation: PathBuf,
-    pub image: PathBuf,
-    pub java: PathBuf,
-    pub java_console: PathBuf,
-    pub runtime_lock_sha256: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RuntimeInstallation {
+    pub(super) generation: PathBuf,
+    pub(super) image: PathBuf,
+    pub(super) java: PathBuf,
+    pub(super) java_console: PathBuf,
+    pub(super) runtime_lock_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +43,7 @@ struct RuntimeGenerationMarker {
     file_count: usize,
 }
 
-pub fn install_runtime(
+pub(super) fn install_runtime(
     install_root: &Path,
     archive_path: &Path,
     runtime_lock_sha256: &str,
@@ -142,6 +142,27 @@ pub fn install_runtime(
 
     validate_generation(&generation, runtime_lock_sha256, lock)?;
     installation(generation, runtime_lock_sha256, lock)
+}
+
+/// Reconstructs the opaque runtime capability only after a complete marker/tree/entrypoint audit.
+/// Call this immediately before every processor or game spawn; a path-only value retained from an
+/// earlier install operation is never launch authority on its own.
+pub(super) fn revalidate_runtime_installation(
+    installed: &RuntimeInstallation,
+    lock: &RuntimeLock,
+) -> Result<RuntimeInstallation, String> {
+    validate_sha256(&installed.runtime_lock_sha256)?;
+    lock.validate()?;
+    validate_generation(&installed.generation, &installed.runtime_lock_sha256, lock)?;
+    let verified = installation(
+        installed.generation.clone(),
+        &installed.runtime_lock_sha256,
+        lock,
+    )?;
+    if &verified != installed {
+        return Err("Java runtime capability paths differ from the verified generation".into());
+    }
+    Ok(verified)
 }
 
 fn installation(
@@ -823,8 +844,15 @@ mod tests {
         let (archive, lock, runtime_hash) = fixture(None);
         let install_root = archive.parent().unwrap().join("install");
         let installed = install_runtime(&install_root, &archive, &runtime_hash, &lock).unwrap();
-        assert_eq!(fs::read(installed.java_console).unwrap(), b"java-console");
-        assert_eq!(fs::read(installed.java).unwrap(), b"java-window");
+        assert_eq!(fs::read(&installed.java_console).unwrap(), b"java-console");
+        assert_eq!(fs::read(&installed.java).unwrap(), b"java-window");
+        assert_eq!(
+            revalidate_runtime_installation(&installed, &lock).unwrap(),
+            installed
+        );
+        let mut forged = installed.clone();
+        forged.java_console = forged.image.join("bin/forged.exe");
+        assert!(revalidate_runtime_installation(&forged, &lock).is_err());
         assert!(install_runtime(&install_root, &archive, &runtime_hash, &lock).is_ok());
         let _ = fs::remove_dir_all(archive.parent().unwrap());
     }

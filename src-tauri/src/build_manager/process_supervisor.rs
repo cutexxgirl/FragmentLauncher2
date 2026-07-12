@@ -41,9 +41,11 @@ mod platform {
             Security::SECURITY_ATTRIBUTES,
             System::{
                 JobObjects::{
-                    CreateJobObjectW, IsProcessInJob, JobObjectExtendedLimitInformation,
+                    CreateJobObjectW, IsProcessInJob, JobObjectBasicAccountingInformation,
+                    JobObjectExtendedLimitInformation, QueryInformationJobObject,
                     SetInformationJobObject, TerminateJobObject,
-                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 },
                 Pipes::CreatePipe,
                 Threading::{
@@ -91,6 +93,22 @@ mod platform {
         fn terminate(&self) -> Result<(), String> {
             unsafe { TerminateJobObject(self.raw(), 1) }
                 .map_err(|error| format!("Cannot terminate processor job: {error}"))
+        }
+
+        fn active_processes(&self) -> Result<u32, String> {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            unsafe {
+                QueryInformationJobObject(
+                    Some(self.raw()),
+                    JobObjectBasicAccountingInformation,
+                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)
+                        .cast::<c_void>(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    None,
+                )
+            }
+            .map_err(|error| format!("Cannot query processor job state: {error}"))?;
+            Ok(accounting.ActiveProcesses)
         }
     }
 
@@ -232,19 +250,50 @@ mod platform {
                 errors.push(error);
             }
             let deadline = Instant::now() + timeout;
+            let mut root_reaped = false;
+            let mut job_empty = false;
             loop {
-                match self.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => std::thread::sleep(CLEANUP_POLL),
-                    Ok(None) => {
-                        errors.push("processor was not reaped before the cleanup deadline".into());
-                        break;
-                    }
-                    Err(error) => {
-                        errors.push(error);
-                        break;
+                if !root_reaped {
+                    match self.try_wait() {
+                        Ok(Some(_)) => root_reaped = true,
+                        Ok(None) => {}
+                        Err(error) => {
+                            errors.push(error);
+                            root_reaped = true;
+                        }
                     }
                 }
+                if !job_empty {
+                    match self.job.active_processes() {
+                        Ok(0) => job_empty = true,
+                        Ok(_) => {}
+                        Err(error) => {
+                            // A query failure is not equivalent to ACTIVE_PROCESS_ZERO. Record it
+                            // and stop polling this signal so cleanup cannot claim containment was
+                            // drained successfully.
+                            errors.push(error);
+                            job_empty = true;
+                        }
+                    }
+                }
+                if root_reaped && job_empty {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    if !root_reaped {
+                        errors.push(
+                            "processor root was not reaped before the cleanup deadline".into(),
+                        );
+                    }
+                    if !job_empty {
+                        errors.push(
+                            "processor job still had active processes at the cleanup deadline"
+                                .into(),
+                        );
+                    }
+                    break;
+                }
+                std::thread::sleep(CLEANUP_POLL);
             }
             if errors.is_empty() {
                 Ok(())
@@ -257,7 +306,19 @@ mod platform {
     impl Drop for ContainedProcess {
         fn drop(&mut self) {
             let _ = self.job.terminate();
-            let _ = unsafe { WaitForSingleObject(raw_handle(&self.process), 1000) };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match self.job.active_processes() {
+                    Ok(0) => break,
+                    Ok(_) if Instant::now() < deadline => std::thread::sleep(CLEANUP_POLL),
+                    Ok(_) | Err(_) => break,
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_millis = remaining.as_millis().min(u32::MAX as u128) as u32;
+            if wait_millis > 0 {
+                let _ = unsafe { WaitForSingleObject(raw_handle(&self.process), wait_millis) };
+            }
         }
     }
 
@@ -480,6 +541,29 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::{
+            fs,
+            io::Read,
+            process::Command,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        struct TempDirectory(std::path::PathBuf);
+
+        impl Drop for TempDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn encoded_argument(argument: &OsStr) -> String {
+            let units = argument.encode_wide().collect::<Vec<_>>();
+            let hex = units
+                .iter()
+                .map(|unit| format!("{unit:04x}"))
+                .collect::<String>();
+            format!("{}:{hex}", units.len())
+        }
 
         #[test]
         fn windows_quoting_escapes_quotes_and_trailing_backslashes() {
@@ -501,6 +585,85 @@ mod platform {
         fn environment_block_is_double_nul_terminated() {
             let block = environment_block(&[(OsString::from("B"), OsString::from("2"))]).unwrap();
             assert_eq!(&block[block.len() - 2..], &[0, 0]);
+        }
+
+        #[test]
+        fn create_process_round_trips_exact_windows_arguments() {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "fragment supervisor argv probe {} {nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).unwrap();
+            let directory = TempDirectory(directory);
+            let source = directory.0.join("argv probe.rs");
+            let executable = directory.0.join("argv probe.exe");
+            fs::write(
+                &source,
+                r#"
+use std::os::windows::ffi::OsStrExt;
+
+fn main() {
+    for argument in std::env::args_os().skip(1) {
+        let units = argument.encode_wide().collect::<Vec<_>>();
+        let hex = units
+            .iter()
+            .map(|unit| format!("{unit:04x}"))
+            .collect::<String>();
+        println!("{}:{hex}", units.len());
+    }
+}
+"#,
+            )
+            .unwrap();
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+            let compilation = Command::new(rustc)
+                .arg("--edition=2021")
+                .args(["--crate-name", "fragment_argv_probe"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                compilation.status.success(),
+                "argv probe compilation failed: {}",
+                String::from_utf8_lossy(&compilation.stderr)
+            );
+
+            let arguments = vec![
+                OsString::from(""),
+                OsString::from("plain"),
+                OsString::from("with spaces"),
+                OsString::from("quote\"inside"),
+                OsString::from(r#"slashes\\before\"quote"#),
+                OsString::from("single trailing\\"),
+                OsString::from(r"trailing\\"),
+                OsString::from("Фрагмент ✨"),
+            ];
+            let expected = arguments
+                .iter()
+                .map(|argument| encoded_argument(argument))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let (mut child, mut pipes) = spawn(ProcessSpec {
+                executable: &executable,
+                arguments: &arguments,
+                cwd: &directory.0,
+                environment: &[],
+            })
+            .unwrap();
+            let mut stdout = String::new();
+            pipes.stdout.read_to_string(&mut stdout).unwrap();
+            let mut stderr = String::new();
+            pipes.stderr.read_to_string(&mut stderr).unwrap();
+            child.terminate_and_reap(Duration::from_secs(5)).unwrap();
+            assert!(stderr.is_empty(), "argv probe stderr: {stderr}");
+            assert_eq!(stdout, expected);
         }
     }
 }

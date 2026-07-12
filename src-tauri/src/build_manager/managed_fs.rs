@@ -550,6 +550,128 @@ impl ImmutableManagedFile {
         Ok(bytes)
     }
 
+    /// Streams this already leased, single-link source into a newly-created exclusive file.
+    ///
+    /// Both signed digests are calculated over the exact bytes that are written. The source and
+    /// destination identities are checked again after EOF, so callers never need to materialize a
+    /// potentially large CAS object in memory and never need to hard-link the shared CAS into a
+    /// processor or instance workspace.
+    pub(super) fn copy_to_exclusive(
+        &mut self,
+        destination: &mut ExclusiveManagedFile,
+        limit: u64,
+    ) -> ManagedFsResult<FileDigests> {
+        if self.info.size > limit {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed file exceeds the copy limit: {}",
+                self.path.display()
+            )));
+        }
+        if self.info.identity == destination.info.identity {
+            return Err(ManagedFsError::UnsafeNode(
+                "Managed copy source and destination have the same filesystem identity".into(),
+            ));
+        }
+
+        let destination_before = node_info(&destination.file, &destination.path)?;
+        if destination_before.identity != destination.info.identity
+            || destination_before.kind != ManagedNodeKind::File
+            || destination_before.reparse_tag != 0
+            || destination_before.number_of_links != 1
+            || destination_before.size != 0
+        {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed copy destination is not a fresh exclusive file: {}",
+                destination.path.display()
+            )));
+        }
+
+        self.file.seek(SeekFrom::Start(0)).map_err(|error| {
+            ManagedFsError::io("Cannot rewind managed copy source", &self.path, error)
+        })?;
+        destination.file.seek(SeekFrom::Start(0)).map_err(|error| {
+            ManagedFsError::io(
+                "Cannot rewind managed copy destination",
+                &destination.path,
+                error,
+            )
+        })?;
+
+        let mut sha1 = Sha1::new();
+        let mut sha256 = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = self.file.read(&mut buffer).map_err(|error| {
+                ManagedFsError::io("Cannot read managed copy source", &self.path, error)
+            })?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read as u64)
+                .ok_or_else(|| ManagedFsError::UnsafeNode("Managed copy size overflow".into()))?;
+            if total > limit || total > self.info.size {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed copy source exceeded its signed size: {}",
+                    self.path.display()
+                )));
+            }
+            destination
+                .file
+                .write_all(&buffer[..read])
+                .map_err(|error| {
+                    ManagedFsError::io(
+                        "Cannot write managed copy destination",
+                        &destination.path,
+                        error,
+                    )
+                })?;
+            sha1.update(&buffer[..read]);
+            sha256.update(&buffer[..read]);
+        }
+        if total != self.info.size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed copy source size changed while it was read: {}",
+                self.path.display()
+            )));
+        }
+
+        verify_handle_path(&self.file, &self.path)?;
+        let source_after = node_info(&self.file, &self.path)?;
+        if source_after.identity != self.info.identity
+            || source_after.size != self.info.size
+            || source_after.kind != ManagedNodeKind::File
+            || source_after.number_of_links != 1
+            || source_after.reparse_tag != 0
+        {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed copy source identity changed while it was read: {}",
+                self.path.display()
+            )));
+        }
+        verify_handle_path(&destination.file, &destination.path)?;
+        let destination_after = node_info(&destination.file, &destination.path)?;
+        if destination_after.identity != destination.info.identity
+            || destination_after.identity == source_after.identity
+            || destination_after.size != total
+            || destination_after.kind != ManagedNodeKind::File
+            || destination_after.number_of_links != 1
+            || destination_after.reparse_tag != 0
+        {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed copy destination identity changed while it was written: {}",
+                destination.path.display()
+            )));
+        }
+
+        Ok(FileDigests {
+            size: total,
+            sha1: format!("{:x}", sha1.finalize()),
+            sha256: format!("{:x}", sha256.finalize()),
+        })
+    }
+
     pub(super) fn sha256(&mut self, limit: u64) -> ManagedFsResult<FileDigest> {
         if self.info.size > limit {
             return Err(ManagedFsError::UnsafeNode(format!(
@@ -1006,6 +1128,197 @@ pub(super) struct QuarantinedNode {
     pub(super) kind: ManagedNodeKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MovedManagedNode {
+    pub(super) source: RelativeManagedPath,
+    pub(super) destination: RelativeManagedPath,
+    pub(super) identity: FileIdentity,
+    pub(super) kind: ManagedNodeKind,
+}
+
+/// Moves one exact managed node to one deterministic, currently absent destination.
+///
+/// This is the reversible primitive used by numbered journal backup slots. It opens the source
+/// with no-follow semantics, performs a handle-based no-replace rename on Windows, and never
+/// recursively traverses or deletes the source. Calling it again with source/destination swapped
+/// restores the same filesystem object during rollback.
+pub(super) fn move_managed_node_no_replace(
+    root: &Path,
+    source: RelativeManagedPath,
+    destination: RelativeManagedPath,
+) -> ManagedFsResult<MovedManagedNode> {
+    if source.collision_key() == destination.collision_key() {
+        return Err(ManagedFsError::Conflict(
+            "Managed move source and destination collide on Windows".into(),
+        ));
+    }
+    if source.is_prefix_of(&destination) {
+        return Err(ManagedFsError::InvalidPath(
+            "Managed move destination cannot be inside the source node".into(),
+        ));
+    }
+
+    let source_parent = GuardedDirectoryChain::open_parent(root, &source)?;
+    let destination_parent = GuardedDirectoryChain::open_parent(root, &destination)?;
+    ensure_same_root_and_volume(&source_parent, &destination_parent)?;
+
+    let source_path = source.join_to(source_parent.root_path());
+    let source_file = open_for_handle_rename(&source_path)?;
+    let source_info = node_info(&source_file, &source_path)?;
+    if source_info.kind == ManagedNodeKind::File
+        && source_info.reparse_tag == 0
+        && source_info.number_of_links != 1
+    {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Hard-linked managed files cannot be moved automatically: {}",
+            source_path.display()
+        )));
+    }
+
+    let destination_path = destination.join_to(source_parent.root_path());
+    rename_handle(
+        &source_file,
+        &destination_path,
+        ManagedRenameMode::NoReplace,
+    )?;
+    if let Err(error) = verify_handle_path_allow_reparse(&source_file, &destination_path) {
+        return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: destination_path,
+            detail: format!("cannot verify moved managed handle: {error}"),
+        });
+    }
+    let after = node_info(&source_file, &destination_path).map_err(|error| {
+        ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: destination_path.clone(),
+            detail: format!("cannot inspect moved managed handle: {error}"),
+        }
+    })?;
+    if after.identity != source_info.identity || after.kind != source_info.kind {
+        return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: destination_path,
+            detail: "moved managed object identity changed".into(),
+        });
+    }
+    flush_rename_parents(
+        source_parent.leaf(),
+        destination_parent.leaf(),
+        &destination_path,
+    )?;
+    Ok(MovedManagedNode {
+        source,
+        destination,
+        identity: after.identity,
+        kind: after.kind,
+    })
+}
+
+/// Hashes and deletes one exact regular single-link file through the same exclusive handle.
+///
+/// The operation is intended for signed transient processor sidecars. It never follows links and
+/// never deletes a path merely because a prior path-based audit approved it. On Windows the file
+/// is marked for deletion by handle while replacement, rename and writers are denied.
+pub(super) fn remove_verified_managed_file(
+    root: &Path,
+    relative: &RelativeManagedPath,
+    expected: &FileDigests,
+) -> ManagedFsResult<()> {
+    let parent_chain = GuardedDirectoryChain::open_parent(root, relative)?;
+    let path = relative.join_to(parent_chain.root_path());
+    let mut file = open_file_for_verified_removal(&path)?;
+    let before = node_info(&file, &path)?;
+    before.require_regular_single_link(&path)?;
+    verify_handle_path(&file, &path)?;
+    if before.identity.volume_serial_number
+        != parent_chain.leaf().info.identity.volume_serial_number
+    {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed removal crossed a volume boundary: {}",
+            path.display()
+        )));
+    }
+    if before.size != expected.size {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed removal size does not match the signed value: {}",
+            path.display()
+        )));
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| ManagedFsError::io("Cannot rewind verified removal file", &path, error))?;
+    let mut sha1 = Sha1::new();
+    let mut sha256 = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            ManagedFsError::io("Cannot hash verified removal file", &path, error)
+        })?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| ManagedFsError::UnsafeNode("Managed removal size overflow".into()))?;
+        if total > expected.size {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed removal file exceeded its signed size: {}",
+                path.display()
+            )));
+        }
+        sha1.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
+    }
+    let actual = FileDigests {
+        size: total,
+        sha1: format!("{:x}", sha1.finalize()),
+        sha256: format!("{:x}", sha256.finalize()),
+    };
+    if &actual != expected {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed removal digests do not match the signed values: {}",
+            path.display()
+        )));
+    }
+    verify_handle_path(&file, &path)?;
+    let after = node_info(&file, &path)?;
+    if after.identity != before.identity
+        || after.kind != ManagedNodeKind::File
+        || after.size != before.size
+        || after.number_of_links != 1
+        || after.reparse_tag != 0
+    {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed removal file changed while it was hashed: {}",
+            path.display()
+        )));
+    }
+
+    delete_open_file(&file, &path)?;
+    drop(file);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "A filesystem node appeared at a just-deleted managed path: {}",
+                path.display()
+            )))
+        }
+        Err(error) => {
+            return Err(ManagedFsError::io(
+                "Cannot confirm verified managed removal",
+                &path,
+                error,
+            ))
+        }
+    }
+    parent_chain.leaf().sync_directory().map_err(|error| {
+        ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: path,
+            detail: format!("verified removal parent flush failed: {error}"),
+        }
+    })
+}
+
 /// Moves one exact filesystem object into an existing real quarantine directory. The source is
 /// opened with no-follow semantics and renamed by handle on Windows. Reparse points are moved as
 /// objects and are never traversed. This function never recursively deletes anything.
@@ -1019,58 +1332,16 @@ pub(super) fn quarantine_node(
             "Quarantine directory cannot be inside the quarantined node".into(),
         ));
     }
-    let source_parent = GuardedDirectoryChain::open_parent(root, &source)?;
-    let quarantine_parent = GuardedDirectoryChain::open(root, quarantine_directory)?;
-    ensure_same_root_and_volume(&source_parent, &quarantine_parent)?;
-
-    let source_path = source.join_to(source_parent.root_path());
-    let source_file = open_for_handle_rename(&source_path)?;
-    let source_info = node_info(&source_file, &source_path)?;
-    if source_info.kind == ManagedNodeKind::File
-        && source_info.reparse_tag == 0
-        && source_info.number_of_links != 1
-    {
-        return Err(ManagedFsError::UnsafeNode(format!(
-            "Hard-linked managed files are not quarantined automatically: {}",
-            source_path.display()
-        )));
-    }
-
+    // Open the quarantine directory before choosing the child name, both to enforce that it is a
+    // real directory and to avoid silently creating a misspelled/case-colliding destination.
+    let _quarantine_guard = GuardedDirectoryChain::open(root, quarantine_directory)?;
     let destination = quarantine_directory.join_component(&Uuid::new_v4().to_string())?;
-    let destination_path = destination.join_to(source_parent.root_path());
-    rename_handle(
-        &source_file,
-        &destination_path,
-        ManagedRenameMode::NoReplace,
-    )?;
-    if let Err(error) = verify_handle_path_allow_reparse(&source_file, &destination_path) {
-        return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
-            destination: destination_path,
-            detail: format!("cannot verify quarantined handle: {error}"),
-        });
-    }
-    let after = node_info(&source_file, &destination_path).map_err(|error| {
-        ManagedFsError::AppliedButDurabilityUnconfirmed {
-            destination: destination_path.clone(),
-            detail: format!("cannot inspect quarantined handle: {error}"),
-        }
-    })?;
-    if after.identity != source_info.identity {
-        return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
-            destination: destination_path,
-            detail: "quarantined object identity changed".into(),
-        });
-    }
-    flush_rename_parents(
-        source_parent.leaf(),
-        quarantine_parent.leaf(),
-        &destination_path,
-    )?;
+    let moved = move_managed_node_no_replace(root, source.clone(), destination.clone())?;
     Ok(QuarantinedNode {
         source,
         destination,
-        identity: after.identity,
-        kind: after.kind,
+        identity: moved.identity,
+        kind: moved.kind,
     })
 }
 
@@ -1328,6 +1599,63 @@ fn open_for_handle_rename(path: &Path) -> ManagedFsResult<File> {
     OpenOptions::new().read(true).open(path).map_err(|error| {
         ManagedFsError::io("Cannot open managed object for quarantine", path, error)
     })
+}
+
+#[cfg(windows)]
+fn open_file_for_verified_removal(path: &Path) -> ManagedFsResult<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, SYNCHRONIZE},
+    };
+    OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ.0 | DELETE.0 | SYNCHRONIZE.0)
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .map_err(|error| {
+            ManagedFsError::io("Cannot open managed file for verified removal", path, error)
+        })
+}
+
+#[cfg(not(windows))]
+fn open_file_for_verified_removal(path: &Path) -> ManagedFsResult<File> {
+    open_immutable_file_nofollow(path)
+}
+
+#[cfg(windows)]
+fn delete_open_file(file: &File, path: &Path) -> ManagedFsResult<()> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        },
+    };
+    let handle = HANDLE(file.as_raw_handle().cast());
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|error| {
+        ManagedFsError::io(
+            "Cannot mark verified managed file for deletion",
+            path,
+            windows_error_to_io(&error),
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn delete_open_file(_file: &File, path: &Path) -> ManagedFsResult<()> {
+    fs::remove_file(path)
+        .map_err(|error| ManagedFsError::io("Cannot delete verified managed file", path, error))
 }
 
 #[cfg(windows)]
@@ -1887,6 +2215,62 @@ mod tests {
     }
 
     #[test]
+    fn immutable_stream_copy_preserves_source_and_creates_an_independent_file() {
+        let root = temp_root("stream-copy");
+        fs::create_dir_all(root.join("cas")).unwrap();
+        fs::create_dir_all(root.join("staging")).unwrap();
+        let payload = vec![0x5a_u8; 2 * 1024 * 1024 + 17];
+        fs::write(root.join("cas/object"), &payload).unwrap();
+
+        let source_path = RelativeManagedPath::new("cas/object").unwrap();
+        let destination_path = RelativeManagedPath::new("staging/object.tmp").unwrap();
+        let mut source = ImmutableManagedFile::open(&root, &source_path).unwrap();
+        let source_identity = source.info().identity.clone();
+        let mut destination =
+            ExclusiveManagedFile::create(&root, destination_path.clone()).unwrap();
+        let destination_identity = destination.info.identity.clone();
+        let copied = source
+            .copy_to_exclusive(&mut destination, payload.len() as u64)
+            .unwrap();
+
+        assert_eq!(copied.size, payload.len() as u64);
+        assert_eq!(copied.sha1, format!("{:x}", Sha1::digest(&payload)));
+        assert_eq!(copied.sha256, format!("{:x}", Sha256::digest(&payload)));
+        assert_ne!(source_identity, destination_identity);
+        destination.sync().unwrap();
+        assert_eq!(fs::read(source_path.join_to(&root)).unwrap(), payload);
+        assert_eq!(
+            fs::read(destination_path.join_to(&root)).unwrap(),
+            fs::read(source_path.join_to(&root)).unwrap()
+        );
+
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn immutable_stream_copy_rejects_a_limit_below_the_source_size() {
+        let root = temp_root("stream-copy-limit");
+        fs::create_dir_all(root.join("cas")).unwrap();
+        fs::create_dir_all(root.join("staging")).unwrap();
+        fs::write(root.join("cas/object"), b"signed bytes").unwrap();
+        let mut source =
+            ImmutableManagedFile::open(&root, &RelativeManagedPath::new("cas/object").unwrap())
+                .unwrap();
+        let mut destination = ExclusiveManagedFile::create(
+            &root,
+            RelativeManagedPath::new("staging/object.tmp").unwrap(),
+        )
+        .unwrap();
+        assert!(source.copy_to_exclusive(&mut destination, 4).is_err());
+        assert_eq!(destination.info.size, 0);
+        assert_eq!(fs::read(root.join("cas/object")).unwrap(), b"signed bytes");
+        drop(destination);
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn no_replace_commit_preserves_existing_destination() {
         let root = temp_root("no-replace");
         fs::create_dir_all(root.join("staging")).unwrap();
@@ -1926,6 +2310,100 @@ mod tests {
             fs::read(moved.destination.join_to(&root)).unwrap(),
             b"foreign"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deterministic_managed_move_can_restore_the_same_object() {
+        let root = temp_root("move-restore");
+        fs::create_dir_all(root.join("instances")).unwrap();
+        fs::create_dir_all(root.join("backups/7")).unwrap();
+        fs::write(root.join("instances/current.jar"), b"current").unwrap();
+        let active = RelativeManagedPath::new("instances/current.jar").unwrap();
+        let backup = RelativeManagedPath::new("backups/7/current.jar").unwrap();
+
+        let moved = move_managed_node_no_replace(&root, active.clone(), backup.clone()).unwrap();
+        assert_eq!(moved.source, active);
+        assert_eq!(moved.destination, backup);
+        assert!(!active.join_to(&root).exists());
+        assert_eq!(fs::read(backup.join_to(&root)).unwrap(), b"current");
+
+        let restored = move_managed_node_no_replace(&root, backup.clone(), active.clone()).unwrap();
+        assert_eq!(restored.identity, moved.identity);
+        assert_eq!(fs::read(active.join_to(&root)).unwrap(), b"current");
+        assert!(!backup.join_to(&root).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deterministic_managed_move_never_replaces_an_existing_destination() {
+        let root = temp_root("move-no-replace");
+        fs::create_dir_all(root.join("instances")).unwrap();
+        fs::create_dir_all(root.join("backups/1")).unwrap();
+        fs::write(root.join("instances/source.jar"), b"source").unwrap();
+        fs::write(root.join("backups/1/source.jar"), b"backup").unwrap();
+        let source = RelativeManagedPath::new("instances/source.jar").unwrap();
+        let destination = RelativeManagedPath::new("backups/1/source.jar").unwrap();
+
+        assert!(move_managed_node_no_replace(&root, source.clone(), destination.clone()).is_err());
+        assert_eq!(fs::read(source.join_to(&root)).unwrap(), b"source");
+        assert_eq!(fs::read(destination.join_to(&root)).unwrap(), b"backup");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deterministic_managed_move_rejects_a_destination_inside_the_source() {
+        let root = temp_root("move-into-self");
+        fs::create_dir_all(root.join("instances/tree/child")).unwrap();
+        let source = RelativeManagedPath::new("instances/tree").unwrap();
+        let destination = RelativeManagedPath::new("instances/tree/child/moved").unwrap();
+        assert!(move_managed_node_no_replace(&root, source, destination).is_err());
+        assert!(root.join("instances/tree/child").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_managed_removal_hashes_and_deletes_the_exact_file() {
+        let root = temp_root("verified-remove");
+        fs::create_dir_all(root.join("outputs")).unwrap();
+        let relative = RelativeManagedPath::new("outputs/slim.jar.cache").unwrap();
+        let bytes = b"signed transient sidecar";
+        fs::write(relative.join_to(&root), bytes).unwrap();
+        let expected = FileDigests {
+            size: bytes.len() as u64,
+            sha1: format!("{:x}", Sha1::digest(bytes)),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+
+        remove_verified_managed_file(&root, &relative, &expected).unwrap();
+        assert!(!relative.join_to(&root).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_managed_removal_preserves_wrong_or_hardlinked_files() {
+        let root = temp_root("verified-remove-reject");
+        fs::create_dir_all(root.join("outputs")).unwrap();
+        let relative = RelativeManagedPath::new("outputs/extra.jar.cache").unwrap();
+        fs::write(relative.join_to(&root), b"unexpected").unwrap();
+        let expected = FileDigests {
+            size: 10,
+            sha1: "0".repeat(40),
+            sha256: "0".repeat(64),
+        };
+        assert!(remove_verified_managed_file(&root, &relative, &expected).is_err());
+        assert_eq!(fs::read(relative.join_to(&root)).unwrap(), b"unexpected");
+
+        let alias = root.join("outputs/alias.cache");
+        fs::hard_link(relative.join_to(&root), &alias).unwrap();
+        let actual = FileDigests {
+            size: 10,
+            sha1: format!("{:x}", Sha1::digest(b"unexpected")),
+            sha256: format!("{:x}", Sha256::digest(b"unexpected")),
+        };
+        assert!(remove_verified_managed_file(&root, &relative, &actual).is_err());
+        assert!(relative.join_to(&root).exists());
+        assert!(alias.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,4 +1,5 @@
 use super::{
+    managed_fs::RelativeManagedPath,
     spark_client::{is_retryable_status, retry_after, SparkClient, SparkClientError},
     storage::{
         inspect_existing_ancestors, open_or_create_regular_single_link, open_regular_single_link,
@@ -22,6 +23,15 @@ const MAX_OBJECT_AUTH_REPLANS: u8 = 1;
 const MAX_RANGE_RESETS: u8 = 1;
 const MAX_CLEAN_RETRIES: u8 = 1;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(125);
+
+/// Returns the one canonical managed path for a lowercase SHA-256 CAS object. Callers that
+/// consume a previously downloaded object should derive its location from the signed digest,
+/// rather than trusting a mutable absolute path carried in progress state.
+pub(super) fn cas_object_relative_path(sha256: &str) -> Result<RelativeManagedPath, String> {
+    validate_sha256(sha256)?;
+    RelativeManagedPath::new(&format!("sha256/{}/{sha256}", &sha256[..2]))
+        .map_err(|error| format!("Cannot construct canonical CAS object path: {error}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedObject {
@@ -262,12 +272,10 @@ struct CasPaths {
 
 impl CasPaths {
     fn new(root: &Path, sha256: &str) -> Result<Self, String> {
-        if sha256.len() != 64 {
-            return Err("CAS SHA-256 is invalid".into());
-        }
+        let relative = cas_object_relative_path(sha256)?;
         let directory = root.join("sha256").join(&sha256[..2]);
         Ok(Self {
-            final_path: directory.join(sha256),
+            final_path: relative.join_to(root),
             partial: directory.join(format!(".{sha256}.part")),
             lock: root.join("locks").join(format!("{sha256}.lock")),
             directory,
@@ -479,13 +487,17 @@ fn activate_partial(paths: &CasPaths, expected: &ExpectedObject) -> Result<(), S
 }
 
 fn validate_expected(expected: &ExpectedObject) -> Result<(), String> {
-    if expected.sha256.len() != 64
-        || !expected
-            .sha256
+    validate_sha256(&expected.sha256)
+        .map_err(|_| "CAS expectation has an invalid SHA-256".to_string())
+}
+
+fn validate_sha256(sha256: &str) -> Result<(), String> {
+    if sha256.len() != 64
+        || !sha256
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err("CAS expectation has an invalid SHA-256".into());
+        return Err("CAS SHA-256 is invalid".into());
     }
     Ok(())
 }
@@ -664,6 +676,12 @@ mod tests {
             paths.partial,
             Path::new("cache/sha256/ab").join(format!(".{hash}.part"))
         );
+        assert_eq!(
+            cas_object_relative_path(&hash).unwrap().as_str(),
+            format!("sha256/ab/{hash}")
+        );
+        assert!(cas_object_relative_path(&"AB".repeat(32)).is_err());
+        assert!(cas_object_relative_path("../object").is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
