@@ -148,6 +148,14 @@ pub(super) struct PlannedArtifactExecutionV2<'a> {
     planned: &'a PlannedArtifactV2,
 }
 
+/// Exact Java-install authority extracted from one sealed reconcile plan. The constructor is
+/// private and succeeds only when that plan actually reserved/verified the signed Java archive.
+pub(super) struct PlannedJavaArchiveV2<'a> {
+    binding: &'a ArtifactBindingV2,
+    inventory: &'a ArtifactInventoryV2,
+    planned: &'a PlannedArtifactV2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ArtifactExecutionSourceV2<'a> {
     SparkCas,
@@ -512,6 +520,47 @@ impl ArtifactPlanV2 {
         })
     }
 
+    pub(super) fn java_archive<'a>(
+        &'a self,
+        root: &OwnedCasRoot,
+        inventory: &'a ArtifactInventoryV2,
+    ) -> Result<PlannedJavaArchiveV2<'a>, String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        let planned = self
+            .requirements
+            .binary_search_by(|candidate| {
+                candidate
+                    .requirement
+                    .sha256
+                    .as_str()
+                    .cmp(&inventory.java_archive_sha256)
+            })
+            .ok()
+            .and_then(|index| self.requirements.get(index))
+            .ok_or_else(|| {
+                "Artifact plan does not authorize Java runtime installation".to_string()
+            })?;
+        let expected = inventory.requirement(&inventory.java_archive_sha256)?;
+        if &planned.requirement != expected
+            || expected.authority != ArtifactAuthorityV2::SparkCas
+            || expected.source != ArtifactSourceV2::SparkCas
+            || expected.provenances
+                != [ArtifactProvenanceV2 {
+                    kind: ArtifactProvenanceKindV2::JavaArchive,
+                    path: "runtime/java/archive".into(),
+                    role: None,
+                }]
+        {
+            return Err("Artifact plan Java archive authority is invalid".into());
+        }
+        Ok(PlannedJavaArchiveV2 {
+            binding: &self.binding,
+            inventory,
+            planned,
+        })
+    }
+
     pub(super) fn network_bytes(&self) -> u64 {
         self.network_bytes
     }
@@ -555,6 +604,38 @@ impl ArtifactPlanV2 {
             return Err("Artifact plan byte total changed".into());
         }
         Ok(())
+    }
+}
+
+impl PlannedJavaArchiveV2<'_> {
+    pub(super) fn validate_root(&self, root: &OwnedCasRoot) -> Result<(), String> {
+        self.inventory.validate_root(root)?;
+        if self.binding != &self.inventory.binding
+            || self.planned.requirement.sha256 != self.inventory.java_archive_sha256
+            || self
+                .inventory
+                .requirement(&self.planned.requirement.sha256)?
+                != &self.planned.requirement
+        {
+            return Err("Planned Java archive binding is invalid".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn sha256(&self) -> &str {
+        &self.planned.requirement.sha256
+    }
+
+    pub(super) fn size(&self) -> u64 {
+        self.planned.requirement.size
+    }
+
+    pub(super) fn runtime_lock(&self) -> &RuntimeLock {
+        &self.inventory.runtime_lock
+    }
+
+    pub(super) fn runtime_lock_sha256(&self) -> &str {
+        self.inventory.java_runtime_lock_sha256()
     }
 }
 
@@ -1197,6 +1278,39 @@ mod tests {
         let rebound = TestRoot::from_owner_marker("cached-runtime-rebound", &root);
         assert!(plan.execution_view(rebound.root(), &inventory).is_err());
         assert!(first.validate_root(rebound.root()).is_err());
+    }
+
+    #[test]
+    fn java_install_authority_is_plan_root_and_operation_bound() {
+        let root = TestRoot::new("java-authority");
+        let release = trusted('a', 1);
+        let sealed_inventory = inventory(&root, &release, Uuid::new_v4());
+        let availability = VerifiedAvailabilityV2::for_test(&sealed_inventory, [], false, false);
+        let plan = ArtifactPlanV2::for_reconcile(&sealed_inventory, &availability, []).unwrap();
+        let java = plan.java_archive(root.root(), &sealed_inventory).unwrap();
+        assert_eq!(java.sha256(), release.runtime_lock().java.archive.sha256);
+        assert_eq!(java.size(), release.runtime_lock().java.archive.size);
+        assert_eq!(
+            java.runtime_lock_sha256(),
+            sealed_inventory.java_runtime_lock_sha256()
+        );
+        java.validate_root(root.root()).unwrap();
+
+        let rebound = TestRoot::from_owner_marker("java-rebound", &root);
+        assert!(java.validate_root(rebound.root()).is_err());
+        assert!(plan
+            .java_archive(rebound.root(), &sealed_inventory)
+            .is_err());
+
+        let other_operation = inventory(&root, &release, Uuid::new_v4());
+        assert!(plan.java_archive(root.root(), &other_operation).is_err());
+
+        let runtime_ready = VerifiedAvailabilityV2::for_test(&sealed_inventory, [], true, false);
+        let without_java =
+            ArtifactPlanV2::for_reconcile(&sealed_inventory, &runtime_ready, []).unwrap();
+        assert!(without_java
+            .java_archive(root.root(), &sealed_inventory)
+            .is_err());
     }
 
     #[test]

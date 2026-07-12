@@ -444,6 +444,39 @@ impl GuardedDirectoryChain {
         Ok(chain)
     }
 
+    /// Creates one previously-absent directory and immediately opens every ancestor plus the leaf
+    /// through no-follow handles. Unlike `ensure`, a pre-existing random staging-name collision is
+    /// rejected. Callers must still perform their exact content/identity audit before publication.
+    pub(super) fn create_exclusive(
+        root: &Path,
+        relative: &RelativeManagedPath,
+    ) -> ManagedFsResult<Self> {
+        let parent_chain = Self::open_parent(root, relative)?;
+        let path = relative.join_to(parent_chain.root_path());
+        fs::create_dir(&path).map_err(|error| {
+            ManagedFsError::io("Cannot create exclusive managed directory", &path, error)
+        })?;
+        let child = parent_chain.leaf().open_child(relative.file_name())?;
+        parent_chain.leaf().sync_directory().map_err(|error| {
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: path.clone(),
+                detail: format!("exclusive directory parent flush failed: {error}"),
+            }
+        })?;
+        child.sync_directory().map_err(|error| {
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: path.clone(),
+                detail: format!("new exclusive directory flush failed: {error}"),
+            }
+        })?;
+
+        // Re-open as one complete root-to-leaf chain only after both durability barriers. The
+        // parent_chain remains live until this succeeds, so the lexical parent cannot be swapped.
+        let complete = Self::open(parent_chain.root_path(), relative)?;
+        complete.revalidate()?;
+        Ok(complete)
+    }
+
     fn open_parent(root: &Path, relative: &RelativeManagedPath) -> ManagedFsResult<Self> {
         match relative.parent() {
             Some(parent) => Self::open(root, &parent),
@@ -487,6 +520,16 @@ impl GuardedDirectoryChain {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn sync_leaf(&self) -> ManagedFsResult<()> {
+        self.revalidate()?;
+        self.leaf().sync_directory().map_err(|error| {
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: self.leaf().path().to_path_buf(),
+                detail: format!("managed directory flush failed: {error}"),
+            }
+        })
     }
 }
 
@@ -851,6 +894,22 @@ impl ImmutableManagedFile {
             sha1: format!("{:x}", sha1.finalize()),
             sha256: format!("{:x}", sha256.finalize()),
         })
+    }
+}
+
+// A leased immutable file is itself the authority to read the already-opened no-follow handle.
+// Implementing the standard cursor traits lets format readers (notably `zip`) consume that exact
+// handle without falling back to a caller-supplied path and reopening a potentially replaced
+// filesystem node.
+impl Read for ImmutableManagedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for ImmutableManagedFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
     }
 }
 
@@ -1279,6 +1338,38 @@ impl ExclusiveManagedFile {
             source_parent_chain: self.parent_chain,
         })
     }
+
+    /// Makes a newly-created file durable in place and turns its still-open exclusive handle into
+    /// a transient immutable lease. Its original Windows share mode remains zero, so callers must
+    /// drop it before reopening the final tree for consumers. This is for files published by
+    /// moving an ancestor directory: both bytes and the directory entry become durable first.
+    pub(super) fn seal_in_place(self) -> ManagedFsResult<ImmutableManagedFile> {
+        self.file.sync_all().map_err(|error| {
+            ManagedFsError::io("Cannot flush exclusive managed file", &self.path, error)
+        })?;
+        let after = node_info(&self.file, &self.path)?;
+        after.require_regular_single_link(&self.path)?;
+        verify_handle_path(&self.file, &self.path)?;
+        if after.identity != self.info.identity {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Exclusive managed file changed before in-place seal: {}",
+                self.path.display()
+            )));
+        }
+        self.parent_chain.leaf().sync_directory().map_err(|error| {
+            ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: self.path.clone(),
+                detail: format!("sealed file parent flush failed: {error}"),
+            }
+        })?;
+        self.parent_chain.revalidate()?;
+        Ok(ImmutableManagedFile {
+            path: self.path,
+            file: self.file,
+            info: after,
+            _parent_chain: self.parent_chain,
+        })
+    }
 }
 
 pub(super) struct SyncedExclusiveManagedFile {
@@ -1477,6 +1568,20 @@ impl ManagedLockFile {
 
     pub(super) fn info(&self) -> &NodeInfo {
         &self.info
+    }
+
+    pub(super) fn revalidate(&self) -> ManagedFsResult<()> {
+        self._parent_chain.revalidate()?;
+        verify_handle_path(&self.file, &self.path)?;
+        let current = node_info(&self.file, &self.path)?;
+        current.require_regular_single_link(&self.path)?;
+        if current.identity != self.info.identity {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed lock file identity changed: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2954,6 +3059,55 @@ mod tests {
         let result = fs::rename(root.join("instances"), root.join("moved"));
         assert!(result.is_err());
         drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclusive_directory_and_in_place_seal_keep_exact_managed_nodes() {
+        let root = temp_root("exclusive-directory-seal");
+        fs::create_dir_all(&root).unwrap();
+        let staging = RelativeManagedPath::new("staging").unwrap();
+        let guard = GuardedDirectoryChain::create_exclusive(&root, &staging).unwrap();
+        guard.revalidate().unwrap();
+        assert!(GuardedDirectoryChain::create_exclusive(&root, &staging).is_err());
+
+        let relative = RelativeManagedPath::new("staging/runtime.bin").unwrap();
+        let mut created = ExclusiveManagedFile::create(&root, relative.clone()).unwrap();
+        created.file_mut().write_all(b"sealed").unwrap();
+        let mut sealed = created.seal_in_place().unwrap();
+        assert_eq!(sealed.read_bounded(64).unwrap(), b"sealed");
+        let digest = sealed.sha256(64).unwrap();
+        assert_eq!(digest.size, 6);
+        assert_eq!(digest.sha256, format!("{:x}", Sha256::digest(b"sealed")));
+        sealed.revalidate().unwrap();
+
+        let mutation = fs::write(relative.join_to(&root), b"changed-and-longer");
+        if mutation.is_ok() {
+            assert!(sealed.revalidate().is_err());
+        } else {
+            sealed.revalidate().unwrap();
+        }
+        drop(sealed);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_lock_revalidation_prevents_or_detects_inode_replacement() {
+        let root = temp_root("lock-replacement");
+        fs::create_dir_all(root.join("locks")).unwrap();
+        let relative = RelativeManagedPath::new("locks/runtime.lock").unwrap();
+        let lock = open_or_create_lock_file(&root, &relative).unwrap();
+        lock.revalidate().unwrap();
+        let moved = root.join("locks/replaced.lock");
+        let replacement = fs::rename(relative.join_to(&root), &moved);
+        if replacement.is_ok() {
+            fs::write(relative.join_to(&root), b"replacement").unwrap();
+            assert!(lock.revalidate().is_err());
+        } else {
+            lock.revalidate().unwrap();
+        }
+        drop(lock);
         fs::remove_dir_all(root).unwrap();
     }
 
