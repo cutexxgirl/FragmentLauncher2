@@ -1,6 +1,6 @@
 use super::{
     contracts::{
-        is_sha256, valid_java25_version, valid_setting_id, validate_manifest_path,
+        is_sha256, valid_java25_version, valid_setting_id, validate_manifest_path, GameRuntimeLock,
         MutableSettingsFile, RuntimeLock, JAVA_DISTRIBUTION, JAVA_IMAGE_TYPE, JAVA_MAJOR, JAVA_VM,
     },
     neoforge::{
@@ -8,7 +8,7 @@ use super::{
     },
     types::{BuildChannel, PresetId},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
@@ -61,6 +61,7 @@ pub struct ReleaseRuntime {
     pub minecraft: String,
     pub loader: ReleaseLoader,
     pub java: ReleaseJava,
+    pub game: ReleaseGame,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +85,14 @@ pub struct ReleaseJava {
     pub runtime_target: String,
     pub runtime_lock_sha256: String,
     pub archive: ReleaseObject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseGame {
+    pub platform: String,
+    pub runtime_target: String,
+    pub runtime_lock_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -122,7 +131,7 @@ pub struct ReleaseJvm {
     pub extra_arguments: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilePolicy {
     Exact,
@@ -204,6 +213,41 @@ impl ReleaseManifest {
         Ok(())
     }
 
+    pub fn bind_game_runtime_lock(
+        &self,
+        java_lock: &RuntimeLock,
+        lock: &GameRuntimeLock,
+    ) -> Result<(), String> {
+        if self.runtime.game.platform != "windows-x64"
+            || lock.platform.os != "windows"
+            || lock.platform.architecture != "x64"
+            || lock.provenance.neo_forge_installer.url != self.runtime.loader.installer_url
+            || lock.provenance.neo_forge_installer.sha256 != self.runtime.loader.installer_sha256
+            || lock.id
+                != format!(
+                    "minecraft-{}-{}-{}-windows-x64",
+                    self.runtime.minecraft, self.runtime.loader.kind, self.runtime.loader.version
+                )
+        {
+            return Err("Game runtime lock does not match the signed release manifest".into());
+        }
+        if java_lock.minecraft.version != self.runtime.minecraft
+            || java_lock.minecraft.version_json_url != lock.provenance.minecraft_version_json.url
+            || java_lock.minecraft.version_json_sha1 != lock.provenance.minecraft_version_json.sha1
+        {
+            return Err(
+                "Managed Java and game runtime locks disagree on Minecraft metadata".into(),
+            );
+        }
+        lock.verification.offline_processors.bind_java_runtime(
+            &self.runtime.java.runtime_lock_sha256,
+            &java_lock.java.archive.sha256,
+            &java_lock.extracted_tree_sha256()?,
+            &java_lock.java.version,
+        )?;
+        Ok(())
+    }
+
     pub fn selected_preset(&self, preset: PresetId) -> Result<&ReleasePreset, String> {
         self.presets
             .iter()
@@ -232,6 +276,7 @@ impl ReleaseManifest {
 
     fn validate_runtime(&self) -> Result<(), String> {
         let java = &self.runtime.java;
+        let game = &self.runtime.game;
         if self.runtime.minecraft != MINECRAFT_VERSION
             || self.runtime.loader.kind != "neoforge"
             || self.runtime.loader.version != NEOFORGE_VERSION
@@ -246,12 +291,20 @@ impl ReleaseManifest {
             || java.archive.size == 0
             || !is_sha256(&java.archive.sha256)
             || !is_sha256(&java.runtime_lock_sha256)
+            || game.platform != "windows-x64"
+            || !is_sha256(&game.runtime_lock_sha256)
         {
             return Err("Release runtime identity is invalid or unsupported".into());
         }
         validate_manifest_path(&java.runtime_target)?;
         if java.runtime_target != format!("runtime-windows-x64-{}.json", java.runtime_lock_sha256) {
             return Err("Runtime target is not bound to its signed SHA-256".into());
+        }
+        validate_manifest_path(&game.runtime_target)?;
+        if game.runtime_target
+            != format!("game-runtime-windows-x64-{}.json", game.runtime_lock_sha256)
+        {
+            return Err("Game runtime target is not bound to its signed SHA-256".into());
         }
         Ok(())
     }
@@ -604,10 +657,10 @@ fn is_https_url(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn manifest() -> serde_json::Value {
+    pub(crate) fn manifest() -> serde_json::Value {
         let exact_file = serde_json::json!({
             "path": "mods/fragment-launch-guard.jar",
             "size": 4,
@@ -658,6 +711,11 @@ mod tests {
                     "runtimeTarget": format!("runtime-windows-x64-{runtime_hash}.json"),
                     "runtimeLockSha256": runtime_hash,
                     "archive": { "size": 123, "sha256": "d".repeat(64) }
+                },
+                "game": {
+                    "platform": "windows-x64",
+                    "runtimeTarget": format!("game-runtime-windows-x64-{runtime_hash}.json"),
+                    "runtimeLockSha256": runtime_hash
                 }
             },
             "integrity": {
@@ -723,6 +781,7 @@ mod tests {
         unknown["runtime"]["loader"]["mirrorUrls"] = serde_json::json!([]);
         unknown["runtime"]["java"]["vendorHint"] = serde_json::json!("future vendor metadata");
         unknown["runtime"]["java"]["archive"]["format"] = serde_json::json!("zip");
+        unknown["runtime"]["game"]["publisherHint"] = serde_json::json!("future metadata");
         unknown["integrity"]["repairPolicy"] = serde_json::json!("future-policy");
         unknown["integrity"]["mutableSettings"][0]["futureValidatorOption"] =
             serde_json::json!(true);
@@ -743,6 +802,13 @@ mod tests {
         mismatch["runtime"]["java"]["runtimeLockSha256"] = serde_json::json!("e".repeat(64));
         assert!(
             ReleaseManifest::parse_and_validate(&serde_json::to_vec(&mismatch).unwrap()).is_err()
+        );
+
+        let mut game_mismatch = manifest();
+        game_mismatch["runtime"]["game"]["runtimeLockSha256"] = serde_json::json!("e".repeat(64));
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&game_mismatch).unwrap())
+                .is_err()
         );
     }
 

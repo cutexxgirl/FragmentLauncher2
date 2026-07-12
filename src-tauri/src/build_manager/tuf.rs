@@ -1,5 +1,5 @@
 use super::{
-    contracts::RuntimeLock,
+    contracts::{GameRuntimeLock, RuntimeLock, MAX_GAME_RUNTIME_LOCK_BYTES},
     release::{CurrentPointer, ReleaseManifest},
     storage::{
         inspect_existing_ancestors, open_or_create_regular_single_link, open_regular_single_link,
@@ -15,7 +15,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     error::Error as StdError,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -48,13 +48,107 @@ const DATASTORE_FILES: [&str; 5] = [
     "latest_known_time.json",
 ];
 
+const TRUSTED_RELEASE_EVIDENCE_SCHEMA_VERSION: u8 = 1;
+
 #[derive(Debug)]
 pub struct TrustedRelease {
     pub channel: BuildChannel,
     pub current: CurrentPointer,
     pub manifest: ReleaseManifest,
     pub runtime_lock: RuntimeLock,
+    pub game_runtime_lock: GameRuntimeLock,
     pub tuf_root_version: u64,
+    pub evidence: TrustedReleaseEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrustedRoleVersions {
+    pub root: u64,
+    pub timestamp: u64,
+    pub snapshot: u64,
+    pub targets: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrustedTargetEvidence {
+    pub name: String,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrustedReleaseEvidence {
+    pub schema_version: u8,
+    pub channel: BuildChannel,
+    pub roles: TrustedRoleVersions,
+    pub current: TrustedTargetEvidence,
+    pub release_manifest: TrustedTargetEvidence,
+    pub java_runtime_lock: TrustedTargetEvidence,
+    pub game_runtime_lock: TrustedTargetEvidence,
+}
+
+impl TrustedReleaseEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_binding(
+        &self,
+        expected_channel: BuildChannel,
+        release_id: &str,
+        manifest_target: &str,
+        runtime_target: &str,
+        game_runtime_target: &str,
+        release_manifest_sha256: &str,
+        runtime_lock_sha256: &str,
+        game_runtime_lock_sha256: &str,
+    ) -> Result<(), String> {
+        if self.schema_version != TRUSTED_RELEASE_EVIDENCE_SCHEMA_VERSION
+            || self.channel != expected_channel
+            || self.roles.root == 0
+            || self.roles.timestamp == 0
+            || self.roles.snapshot == 0
+            || self.roles.targets == 0
+        {
+            return Err("Trusted release evidence identity or role versions are invalid".into());
+        }
+        validate_target_evidence(&self.current)?;
+        validate_target_evidence(&self.release_manifest)?;
+        validate_target_evidence(&self.java_runtime_lock)?;
+        validate_target_evidence(&self.game_runtime_lock)?;
+        if self.current.name != "current.json"
+            || self.current.length > 8 * 1024
+            || self.release_manifest.name != manifest_target
+            || self.release_manifest.name != format!("release-{release_id}.json")
+            || self.release_manifest.length > 16 * 1024 * 1024
+            || self.java_runtime_lock.name != runtime_target
+            || self.java_runtime_lock.length > MAX_RUNTIME_LOCK_BYTES as u64
+            || self.game_runtime_lock.name != game_runtime_target
+            || self.game_runtime_lock.length > MAX_GAME_RUNTIME_LOCK_BYTES as u64
+            || self.release_manifest.sha256 != release_manifest_sha256
+            || self.java_runtime_lock.sha256 != runtime_lock_sha256
+            || self.game_runtime_lock.sha256 != game_runtime_lock_sha256
+        {
+            return Err("Trusted release evidence does not match its release targets".into());
+        }
+        Ok(())
+    }
+
+    pub fn targets_match(&self, newer: &Self) -> bool {
+        self.channel == newer.channel
+            && self.current == newer.current
+            && self.release_manifest == newer.release_manifest
+            && self.java_runtime_lock == newer.java_runtime_lock
+            && self.game_runtime_lock == newer.game_runtime_lock
+    }
+
+    pub fn is_monotonic_to(&self, newer: &Self) -> bool {
+        self.targets_match(newer)
+            && newer.roles.root >= self.roles.root
+            && newer.roles.timestamp >= self.roles.timestamp
+            && newer.roles.snapshot >= self.roles.snapshot
+            && newer.roles.targets >= self.roles.targets
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -283,10 +377,16 @@ async fn read_trusted_release(
     channel: BuildChannel,
     root_version: u64,
 ) -> Result<TrustedRelease, String> {
+    let roles = TrustedRoleVersions::from(repository_versions(repository));
+    if roles.root != root_version {
+        return Err("Trusted TUF root version changed while reading the release".into());
+    }
     let current_bytes = read_verified_target(repository, "current.json", 8 * 1024).await?;
+    let current_evidence = target_evidence(repository, "current.json", &current_bytes)?;
     let current = CurrentPointer::parse_and_validate(&current_bytes, channel)?;
     let manifest_bytes =
         read_verified_target(repository, &current.manifest_target, 16 * 1024 * 1024).await?;
+    let manifest_evidence = target_evidence(repository, &current.manifest_target, &manifest_bytes)?;
     let manifest = ReleaseManifest::parse_and_validate(&manifest_bytes)?;
     if manifest.release.id != current.release_id {
         return Err("TUF current target and release manifest do not match".into());
@@ -302,12 +402,19 @@ async fn read_trusted_release(
         ));
     }
 
+    enforce_exact_release_targets(repository, &current, &manifest)?;
+
     let runtime_bytes = read_verified_target(
         repository,
         &manifest.runtime.java.runtime_target,
         MAX_RUNTIME_LOCK_BYTES,
     )
     .await?;
+    let runtime_evidence = target_evidence(
+        repository,
+        &manifest.runtime.java.runtime_target,
+        &runtime_bytes,
+    )?;
     let runtime_sha256 = format!("{:x}", Sha256::digest(&runtime_bytes));
     if runtime_sha256 != manifest.runtime.java.runtime_lock_sha256 {
         return Err("TUF runtime target hash does not match the release manifest".into());
@@ -315,13 +422,133 @@ async fn read_trusted_release(
     let runtime_lock = RuntimeLock::parse_and_validate(&runtime_bytes)?;
     manifest.bind_runtime_lock(&runtime_lock)?;
 
+    let game_runtime_bytes = read_verified_target(
+        repository,
+        &manifest.runtime.game.runtime_target,
+        MAX_GAME_RUNTIME_LOCK_BYTES,
+    )
+    .await?;
+    let game_runtime_evidence = target_evidence(
+        repository,
+        &manifest.runtime.game.runtime_target,
+        &game_runtime_bytes,
+    )?;
+    let game_runtime_sha256 = format!("{:x}", Sha256::digest(&game_runtime_bytes));
+    if game_runtime_sha256 != manifest.runtime.game.runtime_lock_sha256 {
+        return Err("TUF game runtime target hash does not match the release manifest".into());
+    }
+    let game_runtime_lock = GameRuntimeLock::parse_and_validate(&game_runtime_bytes)?;
+    manifest.bind_game_runtime_lock(&runtime_lock, &game_runtime_lock)?;
+
+    let evidence = TrustedReleaseEvidence {
+        schema_version: TRUSTED_RELEASE_EVIDENCE_SCHEMA_VERSION,
+        channel,
+        roles,
+        current: current_evidence,
+        release_manifest: manifest_evidence,
+        java_runtime_lock: runtime_evidence,
+        game_runtime_lock: game_runtime_evidence,
+    };
+    evidence.validate_binding(
+        channel,
+        &manifest.release.id,
+        &current.manifest_target,
+        &manifest.runtime.java.runtime_target,
+        &manifest.runtime.game.runtime_target,
+        &evidence.release_manifest.sha256,
+        &manifest.runtime.java.runtime_lock_sha256,
+        &manifest.runtime.game.runtime_lock_sha256,
+    )?;
+
     Ok(TrustedRelease {
         channel,
         current,
         manifest,
         runtime_lock,
+        game_runtime_lock,
         tuf_root_version: root_version,
+        evidence,
     })
+}
+
+fn target_evidence(
+    repository: &Repository,
+    name: &str,
+    bytes: &[u8],
+) -> Result<TrustedTargetEvidence, String> {
+    let target_name =
+        TargetName::new(name).map_err(|error| format!("Unsafe TUF target name {name}: {error}"))?;
+    let signed_length = repository
+        .all_targets()
+        .find_map(|(candidate, target)| (candidate == &target_name).then_some(target.length))
+        .ok_or_else(|| format!("Signed TUF target is missing: {name}"))?;
+    if signed_length != bytes.len() as u64 {
+        return Err(format!(
+            "Trusted TUF target evidence length mismatch: {name}"
+        ));
+    }
+    Ok(TrustedTargetEvidence {
+        name: name.to_owned(),
+        length: signed_length,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
+fn validate_target_evidence(evidence: &TrustedTargetEvidence) -> Result<(), String> {
+    if evidence.name.is_empty()
+        || evidence.name.len() > 1024
+        || evidence.length == 0
+        || evidence.length > MAX_GAME_RUNTIME_LOCK_BYTES as u64
+        || !is_sha256(&evidence.sha256)
+    {
+        return Err("Trusted TUF target evidence is invalid".into());
+    }
+    TargetName::new(&evidence.name)
+        .map_err(|error| format!("Trusted TUF target evidence name is unsafe: {error}"))?;
+    Ok(())
+}
+
+fn enforce_exact_release_targets(
+    repository: &Repository,
+    current: &CurrentPointer,
+    manifest: &ReleaseManifest,
+) -> Result<(), String> {
+    let expected = BTreeSet::from([
+        "current.json".to_owned(),
+        current.manifest_target.clone(),
+        manifest.runtime.java.runtime_target.clone(),
+        manifest.runtime.game.runtime_target.clone(),
+    ]);
+    if expected.len() != 4 {
+        return Err("Release TUF target bindings are not unique".into());
+    }
+    let actual_targets = repository
+        .all_targets()
+        .map(|(name, _)| name.raw().to_owned())
+        .collect::<Vec<_>>();
+    let actual = actual_targets.iter().cloned().collect::<BTreeSet<_>>();
+    if actual.len() != actual_targets.len() {
+        return Err("Signed TUF release target set contains duplicate names".into());
+    }
+    if actual == expected {
+        return Ok(());
+    }
+
+    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+    let extra = actual.difference(&expected).cloned().collect::<Vec<_>>();
+    Err(format!(
+        "Signed TUF release target set is not exact (missing: {}; extra: {})",
+        if missing.is_empty() {
+            "none".to_owned()
+        } else {
+            missing.join(", ")
+        },
+        if extra.is_empty() {
+            "none".to_owned()
+        } else {
+            extra.join(", ")
+        }
+    ))
 }
 
 async fn read_verified_target(
@@ -985,6 +1212,17 @@ impl RoleVersions {
     }
 }
 
+impl From<RoleVersions> for TrustedRoleVersions {
+    fn from(value: RoleVersions) -> Self {
+        Self {
+            root: value.root,
+            timestamp: value.timestamp,
+            snapshot: value.snapshot,
+            targets: value.targets,
+        }
+    }
+}
+
 impl DatastoreHashes {
     fn values(&self) -> impl Iterator<Item = &str> {
         [
@@ -1309,8 +1547,183 @@ fn prune_generations(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{contracts, release};
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        num::NonZeroU64,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tough::{
+        editor::{signed::PathExists, RepositoryEditor},
+        key_source::{KeySource, LocalKeySource},
+        FilesystemTransport,
+    };
+
+    const TEST_TUF_ROOT: &[u8] = include_bytes!("../../tests/fixtures/tuf-test-root.json");
+    // Fixed PKCS#8 v1 Ed25519 key used only for the local test root above. `tough` 0.24 accepts
+    // this DER form directly; no production root or online signer is involved.
+    const TEST_TUF_KEY: &[u8] = &[
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20, 0xd9, 0xa8, 0xeb, 0xc3, 0x17, 0x44, 0xd7, 0x33, 0x2b, 0x1c, 0xc2, 0x7c, 0xe0, 0x35,
+        0x7b, 0x9e, 0x1e, 0xb8, 0x33, 0x24, 0x73, 0xef, 0x7e, 0x5c, 0x7d, 0x15, 0x27, 0x03, 0x69,
+        0x92, 0xeb, 0x3f,
+    ];
+
+    struct ReleasePayloads {
+        current: Vec<u8>,
+        manifest: Vec<u8>,
+        java: Vec<u8>,
+        game: Vec<u8>,
+        manifest_target: String,
+        java_target: String,
+        game_target: String,
+        java_sha256: String,
+        game_sha256: String,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureShape {
+        Exact,
+        MissingGame,
+        SignedExtra,
+    }
+
+    fn release_payloads() -> ReleasePayloads {
+        let mut java = contracts::tests::runtime_lock();
+        let game_template = contracts::tests::game_runtime_lock();
+        java["minecraft"]["versionJsonUrl"] =
+            game_template["provenance"]["minecraftVersionJson"]["url"].clone();
+        java["minecraft"]["versionJsonSha1"] =
+            game_template["provenance"]["minecraftVersionJson"]["sha1"].clone();
+        let java_archive_size = java["java"]["archive"]["size"].clone();
+        let java_archive_sha256 = java["java"]["archive"]["sha256"].clone();
+        let java = serde_json::to_vec(&java).expect("Java runtime fixture must serialize");
+        let java_sha256 = format!("{:x}", Sha256::digest(&java));
+        let runtime_lock = contracts::RuntimeLock::parse_and_validate(&java)
+            .expect("Java runtime fixture must validate");
+        let game = contracts::tests::verified_game_runtime_lock_for(
+            &java_sha256,
+            &runtime_lock.java.archive.sha256,
+            &runtime_lock
+                .extracted_tree_sha256()
+                .expect("Java runtime tree digest must compute"),
+        );
+        let game = serde_json::to_vec(&game).expect("game runtime fixture must serialize");
+        let game_sha256 = format!("{:x}", Sha256::digest(&game));
+        let java_target = format!("runtime-windows-x64-{java_sha256}.json");
+        let game_target = format!("game-runtime-windows-x64-{game_sha256}.json");
+
+        let mut manifest = release::tests::manifest();
+        manifest["runtime"]["java"]["runtimeTarget"] =
+            serde_json::Value::String(java_target.clone());
+        manifest["runtime"]["java"]["runtimeLockSha256"] =
+            serde_json::Value::String(java_sha256.clone());
+        manifest["runtime"]["java"]["archive"]["size"] = java_archive_size;
+        manifest["runtime"]["java"]["archive"]["sha256"] = java_archive_sha256;
+        manifest["runtime"]["game"]["runtimeTarget"] =
+            serde_json::Value::String(game_target.clone());
+        manifest["runtime"]["game"]["runtimeLockSha256"] =
+            serde_json::Value::String(game_sha256.clone());
+        let release_id = manifest["release"]["id"]
+            .as_str()
+            .expect("release fixture must have an ID");
+        let manifest_target = format!("release-{release_id}.json");
+        let current = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "channel": "stable",
+            "releaseId": release_id,
+            "manifestTarget": manifest_target,
+        }))
+        .expect("current fixture must serialize");
+
+        ReleasePayloads {
+            current,
+            manifest: serde_json::to_vec(&manifest).expect("release fixture must serialize"),
+            java,
+            game,
+            manifest_target,
+            java_target,
+            game_target,
+            java_sha256,
+            game_sha256,
+        }
+    }
+
+    async fn signed_release_repository(
+        directory: &Path,
+        payloads: &ReleasePayloads,
+        shape: FixtureShape,
+    ) -> (Repository, PathBuf) {
+        let source = directory.join("source-targets");
+        let metadata = directory.join("metadata");
+        let published = directory.join("targets");
+        fs::create_dir_all(&source).expect("fixture source directory must be created");
+        let root_path = directory.join("root.json");
+        let key_path = directory.join("test-key.pk8");
+        fs::write(&root_path, TEST_TUF_ROOT).expect("test root must be written");
+        fs::write(&key_path, TEST_TUF_KEY).expect("test key must be written");
+
+        let current_path = source.join("current.json");
+        let manifest_path = source.join(&payloads.manifest_target);
+        let java_path = source.join(&payloads.java_target);
+        let game_path = source.join(&payloads.game_target);
+        fs::write(&current_path, &payloads.current).expect("current target must be written");
+        fs::write(&manifest_path, &payloads.manifest).expect("manifest target must be written");
+        fs::write(&java_path, &payloads.java).expect("Java target must be written");
+        fs::write(&game_path, &payloads.game).expect("game target must be written");
+        let mut target_paths = vec![current_path, manifest_path, java_path];
+        if !matches!(shape, FixtureShape::MissingGame) {
+            target_paths.push(game_path);
+        }
+        if matches!(shape, FixtureShape::SignedExtra) {
+            let extra = source.join("unexpected-signed-target.json");
+            fs::write(&extra, br#"{"unexpected":true}"#).expect("extra target must be written");
+            target_paths.push(extra);
+        }
+
+        let keys: Vec<Box<dyn KeySource>> = vec![Box::new(LocalKeySource { path: key_path })];
+        let one = NonZeroU64::new(1).expect("one is non-zero");
+        let expires = || timestamp("2999-01-01T00:00:00Z");
+        let mut editor = RepositoryEditor::new(&root_path)
+            .await
+            .expect("test root must authenticate");
+        editor
+            .targets_version(one)
+            .expect("targets version must be set")
+            .targets_expires(expires())
+            .expect("targets expiration must be set")
+            .snapshot_version(one)
+            .snapshot_expires(expires())
+            .timestamp_version(one)
+            .timestamp_expires(expires())
+            .add_target_paths(target_paths)
+            .await
+            .expect("fixture targets must be indexed");
+        let signed = editor
+            .sign(&keys)
+            .await
+            .expect("fixture metadata must be signed");
+        signed
+            .write(&metadata)
+            .await
+            .expect("fixture metadata must be published");
+        signed
+            .copy_targets(&source, &published, PathExists::Fail)
+            .await
+            .expect("fixture targets must be published");
+
+        let repository = RepositoryLoader::new(
+            &TEST_TUF_ROOT,
+            Url::from_directory_path(&metadata).expect("metadata path must form a file URL"),
+            Url::from_directory_path(&published).expect("target path must form a file URL"),
+        )
+        .transport(FilesystemTransport)
+        .expiration_enforcement(ExpirationEnforcement::Safe)
+        .load()
+        .await
+        .expect("signed fixture repository must authenticate");
+        (repository, published)
+    }
 
     fn temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1357,6 +1770,118 @@ mod tests {
         )
         .unwrap();
         sync_and_pin_datastore(&directory, generation, versions(version)).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_release_requires_an_untampered_exact_four_target_repository() {
+        let directory = temp_root("signed-release-e2e");
+        fs::create_dir_all(&directory).expect("fixture root must be created");
+        let payloads = release_payloads();
+
+        let (repository, published) =
+            signed_release_repository(&directory.join("exact"), &payloads, FixtureShape::Exact)
+                .await;
+        fs::write(
+            published.join("unsigned-historical-target.bin"),
+            b"not present in signed targets metadata",
+        )
+        .expect("an unsigned historical object must be materialized");
+        assert_eq!(repository.all_targets().count(), 4);
+        let signed_versions = repository_versions(&repository);
+        assert_eq!(signed_versions, versions(1));
+        let trusted = read_trusted_release(&repository, BuildChannel::Stable, signed_versions.root)
+            .await
+            .expect("the exact signed release must be trusted");
+        assert_eq!(trusted.tuf_root_version, 1);
+        assert_eq!(trusted.channel, BuildChannel::Stable);
+        assert_eq!(trusted.current.manifest_target, payloads.manifest_target);
+        assert_eq!(
+            trusted.manifest.runtime.java.runtime_target,
+            payloads.java_target
+        );
+        assert_eq!(
+            trusted.manifest.runtime.java.runtime_lock_sha256,
+            payloads.java_sha256
+        );
+        assert_eq!(
+            trusted.manifest.runtime.game.runtime_target,
+            payloads.game_target
+        );
+        assert_eq!(
+            trusted.manifest.runtime.game.runtime_lock_sha256,
+            payloads.game_sha256
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&payloads.java)),
+            trusted.manifest.runtime.java.runtime_lock_sha256
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&payloads.game)),
+            trusted.manifest.runtime.game.runtime_lock_sha256
+        );
+        assert_eq!(trusted.runtime_lock.java.major, 25);
+        assert_eq!(
+            trusted.game_runtime_lock.id,
+            "minecraft-1.21.1-neoforge-21.1.235-windows-x64"
+        );
+
+        let published_game =
+            published.join(format!("{}.{}", payloads.game_sha256, payloads.game_target));
+        let mut tampered = fs::read(&published_game).expect("published game target must exist");
+        let midpoint = tampered.len() / 2;
+        tampered[midpoint] ^= 1;
+        fs::write(&published_game, tampered).expect("published target must be tampered");
+        let tamper_error =
+            read_trusted_release(&repository, BuildChannel::Stable, signed_versions.root)
+                .await
+                .expect_err("TUF must reject tampered target bytes");
+        let normalized = tamper_error.to_ascii_lowercase();
+        assert!(
+            normalized.contains("hash") || normalized.contains("verif"),
+            "unexpected tamper error: {tamper_error}"
+        );
+
+        fs::write(&published_game, &payloads.game).expect("game target must be restored");
+        fs::remove_file(&published_game).expect("published game target must be removed");
+        let missing_file_error =
+            read_trusted_release(&repository, BuildChannel::Stable, signed_versions.root)
+                .await
+                .expect_err("TUF must reject a missing signed target file");
+        assert!(
+            missing_file_error.contains(&payloads.game_target),
+            "unexpected missing-file error: {missing_file_error}"
+        );
+        drop(repository);
+
+        let (missing, _) = signed_release_repository(
+            &directory.join("missing"),
+            &payloads,
+            FixtureShape::MissingGame,
+        )
+        .await;
+        assert_eq!(missing.all_targets().count(), 3);
+        let missing_error = read_trusted_release(&missing, BuildChannel::Stable, 1)
+            .await
+            .expect_err("a referenced missing target must fail closed");
+        assert!(missing_error.contains("target set is not exact"));
+        assert!(missing_error.contains(&payloads.game_target));
+        drop(missing);
+
+        let (extra, _) = signed_release_repository(
+            &directory.join("extra"),
+            &payloads,
+            FixtureShape::SignedExtra,
+        )
+        .await;
+        assert_eq!(extra.all_targets().count(), 5);
+        let extra_error = read_trusted_release(&extra, BuildChannel::Stable, 1)
+            .await
+            .expect_err("a signed fifth target must fail closed");
+        assert!(extra_error.contains("target set is not exact"));
+        assert!(extra_error.contains("unexpected-signed-target.json"));
+        drop(extra);
+
+        fs::remove_dir_all(directory).expect("fixture root must be removed");
     }
 
     #[test]

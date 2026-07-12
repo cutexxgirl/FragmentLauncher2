@@ -3,9 +3,23 @@ mod cas;
 #[allow(dead_code)]
 mod contracts;
 #[allow(dead_code)]
+mod game_runtime;
+#[allow(dead_code)]
+mod instance_state;
+#[allow(dead_code)]
+mod journal;
+#[allow(dead_code)]
+mod managed_fs;
+#[allow(dead_code)]
 mod mutable;
 #[allow(dead_code)]
 mod neoforge;
+#[allow(dead_code)]
+mod planner;
+#[allow(dead_code)]
+mod process_supervisor;
+#[allow(dead_code)]
+mod reconciler;
 #[allow(dead_code)]
 mod release;
 #[allow(dead_code)]
