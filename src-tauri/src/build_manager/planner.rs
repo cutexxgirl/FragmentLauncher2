@@ -1553,7 +1553,7 @@ fn unique_parent_directory_count<'a>(
 
 /// Pessimistic peak space retained while building a missing immutable game generation.
 ///
-/// The final 4,028-file generation and missing CAS objects are budgeted separately. This reserve
+/// The final 4,012-file generation and missing CAS objects are budgeted separately. This reserve
 /// covers the independent processor-input copies, embedded patch, signed output/write-set,
 /// executor-bounded scratch/state, a physically preallocated emergency recovery reserve, and one
 /// largest-file incoming copy that can coexist with the completed staging tree immediately before

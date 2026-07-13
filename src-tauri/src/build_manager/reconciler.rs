@@ -1,6 +1,8 @@
 use super::{
     journal::ReconcilePlanV2,
-    managed_fs::{GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath},
+    managed_fs::{
+        GuardedDirectoryChain, ImmutableManagedFile, RecursiveChangeSentinel, RelativeManagedPath,
+    },
     release::{FilePolicy, ManifestFile, ReleaseManifest},
     tuf::TrustedRelease,
     types::{BuildChannel, PresetId},
@@ -11,6 +13,8 @@ use std::{
     fs,
     path::Path,
 };
+
+const MAX_UNKNOWN_INSTANCE_AUDIT_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DesiredFilePolicy {
@@ -85,6 +89,126 @@ pub(super) struct InstanceAudit {
     pub unknown_files: Vec<String>,
     pub unknown_directories: Vec<String>,
     pub unsafe_entries: Vec<UnsafeEntry>,
+}
+
+/// Handle-bound launch authority for the exact, signed part of one channel instance.
+///
+/// Exact files are opened with write/delete sharing disabled and remain leased for the whole game
+/// process. Signed mutable settings are sealed through admission and process creation, then
+/// released as the final suspended-child gate action immediately before `ResumeThread`. Sticky
+/// recursive notifications reject late namespace, metadata and NTFS stream changes without a
+/// second admission-window enumeration.
+pub(super) struct LaunchInstanceLease {
+    instance_root: std::path::PathBuf,
+    anchor: GuardedDirectoryChain,
+    desired: DesiredTree,
+    exact_files: BTreeMap<String, ImmutableManagedFile>,
+    mutable_seals: BTreeMap<String, ImmutableManagedFile>,
+    change_sentinel: RecursiveChangeSentinel,
+}
+
+impl std::fmt::Debug for LaunchInstanceLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchInstanceLease")
+            .field("instance_root", &self.instance_root)
+            .field("exact_file_count", &self.exact_files.len())
+            .field("mutable_seal_count", &self.mutable_seals.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LaunchInstanceLease {
+    pub(super) fn instance_root(&self) -> &Path {
+        &self.instance_root
+    }
+
+    /// Full content audit. This may read every exact file and therefore must run before the
+    /// short-lived server launch admission is requested.
+    pub(super) fn revalidate_full(&self) -> Result<InstanceAudit, String> {
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| error.to_string())?;
+        self.anchor
+            .revalidate()
+            .map_err(|error| error.to_string())?;
+        for file in self.exact_files.values() {
+            file.revalidate().map_err(|error| error.to_string())?;
+        }
+        for file in self.mutable_seals.values() {
+            file.revalidate().map_err(|error| error.to_string())?;
+        }
+        let audit = audit_instance_directory(&self.instance_root, &self.desired)?;
+        if audit.needs_reconciliation() {
+            return Err("Instance changed after launch preparation and must be repaired".into());
+        }
+        self.anchor
+            .revalidate()
+            .map_err(|error| error.to_string())?;
+        for file in self.exact_files.values() {
+            file.revalidate().map_err(|error| error.to_string())?;
+        }
+        for file in self.mutable_seals.values() {
+            file.revalidate().map_err(|error| error.to_string())?;
+        }
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| error.to_string())?;
+        Ok(audit)
+    }
+
+    /// Content-size-independent final audit. The sticky recursive sentinel was armed before the
+    /// full baseline audit, so this performs only O(1) handle/notification checks and never
+    /// re-enumerates or hashes the instance inside the short admission-to-CreateProcessW window.
+    pub(super) fn revalidate_fast(&self) -> Result<(), String> {
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| error.to_string())?;
+        // Exact files remain protected by their immutable handles and the sticky metadata
+        // sentinel. Mutable files are the only handles intentionally released at ResumeThread,
+        // so explicitly re-prove their retained identities at that boundary.
+        for file in self.mutable_seals.values() {
+            file.revalidate().map_err(|error| error.to_string())?;
+        }
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Releases only signed mutable-setting files at the suspended-process boundary. Exact mods,
+    /// resources and configs remain sealed for the complete game lifetime.
+    pub(super) fn release_mutable_seals_for_resume(&mut self) -> Result<(), String> {
+        self.revalidate_fast()?;
+        self.mutable_seals.clear();
+        Ok(())
+    }
+}
+
+/// Fresh post-game authority. It accepts a damaged namespace so the planner can classify Repair,
+/// but a Ready result is possible only when every verified exact and mutable candidate remains
+/// handle-sealed across capture and planning.
+pub(super) struct PostGameInstanceLease {
+    anchor: GuardedDirectoryChain,
+    exact_files: BTreeMap<String, ImmutableManagedFile>,
+    mutable_seals: BTreeMap<String, ImmutableManagedFile>,
+    change_sentinel: RecursiveChangeSentinel,
+}
+
+impl PostGameInstanceLease {
+    pub(super) fn revalidate(&self) -> Result<(), String> {
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| error.to_string())?;
+        self.anchor
+            .revalidate()
+            .map_err(|error| error.to_string())?;
+        for file in self.exact_files.values().chain(self.mutable_seals.values()) {
+            file.revalidate().map_err(|error| error.to_string())?;
+        }
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Non-serializable proof that an instance audit was built from the exact immutable pending plan,
@@ -329,6 +453,127 @@ pub(super) fn audit_release_instance(
     audit_desired_instance(install_root, channel, &desired)
 }
 
+/// Builds the non-cloneable launch lease only after two complete audits around acquisition of
+/// every exact-file handle. This closes the audit/open race for signed mods, resources and
+/// configuration files: once acquired on Windows, another same-user process cannot overwrite,
+/// truncate, rename or delete those files until the game exits and the lease is dropped.
+pub(super) fn lease_release_instance(
+    install_root: &Path,
+    channel: BuildChannel,
+    release: &ReleaseManifest,
+    preset: PresetId,
+) -> Result<LaunchInstanceLease, String> {
+    let desired = DesiredTree::from_release(release, preset)?;
+    let instance_relative = RelativeManagedPath::new(&format!("instances/{}", channel.as_str()))
+        .map_err(|error| error.to_string())?;
+    let anchor = GuardedDirectoryChain::open(install_root, &instance_relative)
+        .map_err(|error| error.to_string())?;
+    let instance_root = anchor.leaf().path().to_path_buf();
+    let change_sentinel =
+        RecursiveChangeSentinel::arm(&instance_root).map_err(|error| error.to_string())?;
+    let first = audit_instance_directory(&instance_root, &desired)?;
+    if first.needs_reconciliation() {
+        return Err("Instance is not launch-ready and must be repaired".into());
+    }
+    let mut exact_files = BTreeMap::new();
+    let mut mutable_seals = BTreeMap::new();
+    for (key, file) in &desired.files {
+        let opened = ImmutableManagedFile::open(&instance_root, &file.relative)
+            .map_err(|error| error.to_string())?;
+        match file.policy {
+            DesiredFilePolicy::Exact => {
+                if exact_files.insert(key.clone(), opened).is_some() {
+                    return Err("Launch lease exact-file identity map is duplicated".into());
+                }
+            }
+            DesiredFilePolicy::ValidatedMutable => {
+                if mutable_seals.insert(key.clone(), opened).is_some() {
+                    return Err("Launch lease mutable-file identity map is duplicated".into());
+                }
+            }
+        }
+    }
+    if exact_files.len() != first.verified_exact.len() {
+        return Err("Launch lease exact-file coverage disagrees with the signed audit".into());
+    }
+    if mutable_seals.len() != first.validated_mutable_candidates.len() {
+        return Err("Launch lease mutable-file coverage disagrees with the signed audit".into());
+    }
+
+    let lease = LaunchInstanceLease {
+        instance_root,
+        anchor,
+        desired,
+        exact_files,
+        mutable_seals,
+        change_sentinel,
+    };
+    let _ = lease.revalidate_full()?;
+    Ok(lease)
+}
+
+/// Audits and seals the local instance without requiring it to be Ready. This is used only after
+/// the contained game Job is proven empty: allowed mutable values can be captured, while unknown
+/// or disallowed content remains an explicit Repair classification.
+pub(super) fn lease_post_game_instance(
+    install_root: &Path,
+    channel: BuildChannel,
+    release: &ReleaseManifest,
+    preset: PresetId,
+) -> Result<(InstanceAudit, PostGameInstanceLease), String> {
+    let desired = DesiredTree::from_release(release, preset)?;
+    let instance_relative = RelativeManagedPath::new(&format!("instances/{}", channel.as_str()))
+        .map_err(|error| error.to_string())?;
+    let anchor = GuardedDirectoryChain::open(install_root, &instance_relative)
+        .map_err(|error| error.to_string())?;
+    let instance_root = anchor.leaf().path().to_path_buf();
+    let change_sentinel =
+        RecursiveChangeSentinel::arm(&instance_root).map_err(|error| error.to_string())?;
+    let first = audit_instance_directory(&instance_root, &desired)?;
+
+    let verified = first
+        .verified_exact
+        .iter()
+        .map(|path| path_key(path))
+        .collect::<BTreeSet<_>>();
+    let mutable = first
+        .validated_mutable_candidates
+        .iter()
+        .map(|path| path_key(path))
+        .collect::<BTreeSet<_>>();
+    let mut exact_files = BTreeMap::new();
+    let mut mutable_seals = BTreeMap::new();
+    for (key, file) in &desired.files {
+        let destination = match file.policy {
+            DesiredFilePolicy::Exact if verified.contains(key) => &mut exact_files,
+            DesiredFilePolicy::ValidatedMutable if mutable.contains(key) => &mut mutable_seals,
+            _ => continue,
+        };
+        let opened = ImmutableManagedFile::open(&instance_root, &file.relative)
+            .map_err(|error| error.to_string())?;
+        if destination.insert(key.clone(), opened).is_some() {
+            return Err("Post-game instance seal map is duplicated".into());
+        }
+    }
+    if exact_files.len() != first.verified_exact.len()
+        || mutable_seals.len() != first.validated_mutable_candidates.len()
+    {
+        return Err("Post-game instance seals disagree with the baseline audit".into());
+    }
+
+    // The confirming audit runs only after every baseline-approved file is write/delete sealed.
+    // A same-size overwrite in the first audit/open gap is therefore either denied or rehashed.
+    let second = audit_instance_directory(&instance_root, &desired)?;
+    let lease = PostGameInstanceLease {
+        anchor,
+        exact_files,
+        mutable_seals,
+        change_sentinel,
+    };
+    lease.revalidate()?;
+    Ok((second, lease))
+}
+
 /// Audits the exact desired tree serialized in one immutable pending plan only while a freshly
 /// trusted TUF release still binds that exact target. A stale plan cannot obtain this capability;
 /// it must be atomically superseded by a fresh-current plan instead.
@@ -505,8 +750,53 @@ pub(super) fn audit_instance_directory(
     instance_root: &Path,
     desired: &DesiredTree,
 ) -> Result<InstanceAudit, String> {
+    audit_instance_directory_with_mode(instance_root, desired, &ExactFileAudit::FullContent)
+}
+
+enum ExactFileAudit<'a> {
+    FullContent,
+    RetainedIdentity(&'a BTreeMap<String, ImmutableManagedFile>),
+}
+
+struct DirectoryScanContext<'scan, 'retained> {
+    instance_root: &'scan Path,
+    desired: &'scan DesiredTree,
+    exact_audit: &'scan ExactFileAudit<'retained>,
+}
+
+fn audit_instance_directory_fast(
+    instance_root: &Path,
+    desired: &DesiredTree,
+    retained: &BTreeMap<String, ImmutableManagedFile>,
+) -> Result<InstanceAudit, String> {
+    audit_instance_directory_with_mode(
+        instance_root,
+        desired,
+        &ExactFileAudit::RetainedIdentity(retained),
+    )
+}
+
+fn audit_instance_directory_with_mode(
+    instance_root: &Path,
+    desired: &DesiredTree,
+    exact_audit: &ExactFileAudit<'_>,
+) -> Result<InstanceAudit, String> {
     let mut audit = InstanceAudit::default();
     let mut encountered = BTreeSet::new();
+    let mut namespace_budget = NamespaceAuditBudget {
+        seen: 0,
+        maximum: desired
+            .files
+            .len()
+            .checked_add(desired.directories.len())
+            .and_then(|authorized| {
+                authorized.checked_add(match exact_audit {
+                    ExactFileAudit::FullContent => MAX_UNKNOWN_INSTANCE_AUDIT_ENTRIES,
+                    ExactFileAudit::RetainedIdentity(_) => 0,
+                })
+            })
+            .ok_or_else(|| "Signed instance namespace limit overflowed".to_string())?,
+    };
 
     match fs::symlink_metadata(instance_root) {
         Ok(metadata) => {
@@ -528,11 +818,16 @@ pub(super) fn audit_instance_directory(
             } else {
                 let root_guard = GuardedDirectoryChain::root_only(instance_root)
                     .map_err(|error| error.to_string())?;
-                scan_directory(
+                let context = DirectoryScanContext {
                     instance_root,
+                    desired,
+                    exact_audit,
+                };
+                scan_directory(
+                    &context,
                     None,
                     &root_guard,
-                    desired,
+                    &mut namespace_budget,
                     &mut encountered,
                     &mut audit,
                 )?;
@@ -565,15 +860,29 @@ pub(super) fn audit_instance_directory(
 }
 
 fn scan_directory(
-    instance_root: &Path,
+    context: &DirectoryScanContext<'_, '_>,
     relative_parent: Option<&RelativeManagedPath>,
     directory_guard: &GuardedDirectoryChain,
-    desired: &DesiredTree,
+    namespace_budget: &mut NamespaceAuditBudget,
     encountered: &mut BTreeSet<String>,
     audit: &mut InstanceAudit,
 ) -> Result<(), String> {
+    let DirectoryScanContext {
+        instance_root,
+        desired,
+        exact_audit,
+    } = context;
     let guarded_path = directory_guard.leaf().path();
-    let initial_names = sorted_directory_names(guarded_path)?;
+    let initial_names = sorted_directory_names_bounded(
+        guarded_path,
+        namespace_budget
+            .maximum
+            .saturating_sub(namespace_budget.seen),
+    )?;
+    namespace_budget.seen = namespace_budget
+        .seen
+        .checked_add(initial_names.len())
+        .ok_or_else(|| "Instance namespace entry count overflowed".to_string())?;
 
     let mut names_by_key = BTreeMap::<String, String>::new();
     let mut decoded = Vec::with_capacity(initial_names.len());
@@ -690,10 +999,10 @@ fn scan_directory(
                 audit.unknown_directories.push(relative.clone());
             }
             scan_directory(
-                instance_root,
+                context,
                 Some(&managed_relative),
                 &child_guard,
-                desired,
+                namespace_budget,
                 encountered,
                 audit,
             )?;
@@ -751,24 +1060,26 @@ fn scan_directory(
                         .push(expected.path.clone());
                 }
             }
-            DesiredFilePolicy::Exact => match hash_exact_file(instance_root, expected) {
-                Ok(None) => audit.verified_exact.push(expected.path.clone()),
-                Ok(Some(kind)) => audit.modified_files.push(ModifiedFile {
-                    path: expected.path.clone(),
-                    kind,
-                }),
-                Err(HashFailure::UnsafeFile) => audit.unsafe_entries.push(UnsafeEntry {
-                    path: relative,
-                    kind: UnsafeEntryKind::UnsafeRegularFile,
-                }),
-                Err(HashFailure::ChangedDuringRead) => audit.unsafe_entries.push(UnsafeEntry {
-                    path: relative,
-                    kind: UnsafeEntryKind::ChangedDuringRead,
-                }),
-            },
+            DesiredFilePolicy::Exact => {
+                match audit_exact_file(instance_root, &key, expected, exact_audit) {
+                    Ok(None) => audit.verified_exact.push(expected.path.clone()),
+                    Ok(Some(kind)) => audit.modified_files.push(ModifiedFile {
+                        path: expected.path.clone(),
+                        kind,
+                    }),
+                    Err(HashFailure::UnsafeFile) => audit.unsafe_entries.push(UnsafeEntry {
+                        path: relative,
+                        kind: UnsafeEntryKind::UnsafeRegularFile,
+                    }),
+                    Err(HashFailure::ChangedDuringRead) => audit.unsafe_entries.push(UnsafeEntry {
+                        path: relative,
+                        kind: UnsafeEntryKind::ChangedDuringRead,
+                    }),
+                }
+            }
         }
     }
-    if sorted_directory_names(guarded_path)? != initial_names {
+    if sorted_directory_names_bounded(guarded_path, initial_names.len())? != initial_names {
         return Err(format!(
             "Managed directory contents changed during audit: {}",
             guarded_path.display()
@@ -783,10 +1094,46 @@ enum HashFailure {
     ChangedDuringRead,
 }
 
+fn audit_exact_file(
+    instance_root: &Path,
+    key: &str,
+    expected: &DesiredFile,
+    mode: &ExactFileAudit<'_>,
+) -> Result<Option<ModifiedKind>, HashFailure> {
+    match mode {
+        ExactFileAudit::FullContent => hash_exact_file(instance_root, expected),
+        ExactFileAudit::RetainedIdentity(retained) => {
+            let retained = retained.get(key).ok_or(HashFailure::UnsafeFile)?;
+            retained
+                .revalidate()
+                .map_err(|_| HashFailure::ChangedDuringRead)?;
+            let reopened = ImmutableManagedFile::open(instance_root, &expected.relative)
+                .map_err(|_| HashFailure::UnsafeFile)?;
+            if reopened.info().size != expected.size {
+                return Ok(Some(ModifiedKind::Size));
+            }
+            if retained.info().size != expected.size
+                || reopened.info().identity != retained.info().identity
+                || reopened.info().size != retained.info().size
+            {
+                return Err(HashFailure::ChangedDuringRead);
+            }
+            reopened
+                .revalidate()
+                .map_err(|_| HashFailure::ChangedDuringRead)?;
+            retained
+                .revalidate()
+                .map_err(|_| HashFailure::ChangedDuringRead)?;
+            Ok(None)
+        }
+    }
+}
+
 fn hash_exact_file(
     instance_root: &Path,
     expected: &DesiredFile,
 ) -> Result<Option<ModifiedKind>, HashFailure> {
+    exact_content_read_started();
     let mut file = ImmutableManagedFile::open(instance_root, &expected.relative)
         .map_err(|_| HashFailure::UnsafeFile)?;
     if file.info().size != expected.size {
@@ -800,6 +1147,25 @@ fn hash_exact_file(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static FORBID_EXACT_CONTENT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn exact_content_read_started() {
+    FORBID_EXACT_CONTENT_READ.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "admission-window exact audit attempted to read file contents"
+        );
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn exact_content_read_started() {}
 
 fn recheck_guarded_directory(
     root: &Path,
@@ -830,22 +1196,39 @@ fn unsafe_directory_kind(path: &Path) -> UnsafeEntryKind {
     }
 }
 
-fn sorted_directory_names(path: &Path) -> Result<Vec<std::ffi::OsString>, String> {
-    let mut names = fs::read_dir(path)
-        .map_err(|error| {
-            format!(
-                "Cannot enumerate managed directory {}: {error}",
+struct NamespaceAuditBudget {
+    seen: usize,
+    maximum: usize,
+}
+
+fn sorted_directory_names_bounded(
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<std::ffi::OsString>, String> {
+    let mut names = Vec::with_capacity(maximum.min(4096));
+    for entry in fs::read_dir(path).map_err(|error| {
+        format!(
+            "Cannot enumerate managed directory {}: {error}",
+            path.display()
+        )
+    })? {
+        if names.len() == maximum {
+            return Err(format!(
+                "Managed instance namespace exceeds its signed entry bound at {}",
                 path.display()
-            )
-        })?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            format!(
-                "Cannot enumerate managed directory {}: {error}",
-                path.display()
-            )
-        })?;
+            ));
+        }
+        names.push(
+            entry
+                .map_err(|error| {
+                    format!(
+                        "Cannot enumerate managed directory {}: {error}",
+                        path.display()
+                    )
+                })?
+                .file_name(),
+        );
+    }
     names.sort();
     Ok(names)
 }
@@ -903,23 +1286,31 @@ mod tests {
     use super::*;
     use std::{io::Write, path::PathBuf};
 
-    struct TestDirectory(PathBuf);
+    struct TestDirectory {
+        container: PathBuf,
+        path: PathBuf,
+    }
 
     impl TestDirectory {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("fragment-reconciler-{}", uuid::Uuid::new_v4()));
+            // The sentinel also watches the exact root's parent non-recursively. Give every test
+            // a private parent so unrelated parallel temp-directory activity cannot dirty it.
+            let container = std::env::temp_dir().join(format!(
+                "fragment-reconciler-container-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let path = container.join("instance");
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self { container, path }
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            &self.path
         }
 
         fn write(&self, relative: &str, bytes: &[u8]) {
             let path = self
-                .0
+                .path
                 .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut file = fs::File::create(path).unwrap();
@@ -928,7 +1319,7 @@ mod tests {
 
         fn directory(&self, relative: &str) {
             fs::create_dir_all(
-                self.0
+                self.path
                     .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)),
             )
             .unwrap();
@@ -937,7 +1328,7 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(&self.container);
         }
     }
 
@@ -971,6 +1362,39 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    fn launch_lease(
+        root: &TestDirectory,
+        desired: DesiredTree,
+        exact_files: BTreeMap<String, ImmutableManagedFile>,
+    ) -> LaunchInstanceLease {
+        let change_sentinel = RecursiveChangeSentinel::arm(root.path()).unwrap();
+        LaunchInstanceLease {
+            instance_root: root.path().to_path_buf(),
+            anchor: GuardedDirectoryChain::root_only(root.path()).unwrap(),
+            desired,
+            exact_files,
+            mutable_seals: BTreeMap::new(),
+            change_sentinel,
+        }
+    }
+
+    struct ForbidExactContentRead;
+
+    impl ForbidExactContentRead {
+        fn arm() -> Self {
+            FORBID_EXACT_CONTENT_READ.with(|forbidden| {
+                assert!(!forbidden.replace(true));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ForbidExactContentRead {
+        fn drop(&mut self) {
+            FORBID_EXACT_CONTENT_READ.with(|forbidden| forbidden.set(false));
+        }
     }
 
     #[test]
@@ -1066,6 +1490,164 @@ mod tests {
 
         assert_eq!(audit.validated_mutable_candidates, ["options.txt"]);
         assert!(audit.modified_files.is_empty());
+    }
+
+    #[test]
+    fn final_fast_audit_never_reads_large_exact_file_contents() {
+        const LARGE_LOGICAL_SIZE: u64 = 512 * 1024 * 1024;
+        let root = TestDirectory::new();
+        root.directory("mods");
+        let absolute = root.path().join("mods/large.jar");
+        fs::File::create(&absolute)
+            .unwrap()
+            .set_len(LARGE_LOGICAL_SIZE)
+            .unwrap();
+        let tree = desired(
+            vec![ManifestFile {
+                path: "mods/large.jar".into(),
+                size: LARGE_LOGICAL_SIZE,
+                // Deliberately not the sparse file's digest: this lease models content which was
+                // authenticated before admission. The armed hook proves the final pass cannot
+                // fall back to the slow content reader.
+                sha256: "0".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            }],
+            &["mods"],
+            &[],
+        );
+        let relative = RelativeManagedPath::new("mods/large.jar").unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            path_key("mods/large.jar"),
+            ImmutableManagedFile::open(root.path(), &relative).unwrap(),
+        );
+        let lease = launch_lease(&root, tree, files);
+
+        let _forbid_slow_reader = ForbidExactContentRead::arm();
+        lease.revalidate_fast().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mutable_write_is_denied_until_the_suspended_resume_boundary_releases_its_seal() {
+        use std::io::{Seek, SeekFrom};
+
+        let root = TestDirectory::new();
+        root.write("options.txt", b"baseline");
+        let tree = desired(vec![mutable("options.txt", b"baseline")], &[], &[]);
+        let relative = RelativeManagedPath::new("options.txt").unwrap();
+        let mut mutable_seals = BTreeMap::new();
+        mutable_seals.insert(
+            path_key("options.txt"),
+            ImmutableManagedFile::open(root.path(), &relative).unwrap(),
+        );
+        let change_sentinel = RecursiveChangeSentinel::arm(root.path()).unwrap();
+        let mut lease = LaunchInstanceLease {
+            instance_root: root.path().to_path_buf(),
+            anchor: GuardedDirectoryChain::root_only(root.path()).unwrap(),
+            desired: tree,
+            exact_files: BTreeMap::new(),
+            mutable_seals,
+            change_sentinel,
+        };
+        lease.revalidate_fast().unwrap();
+
+        let path = root.path().join("options.txt");
+        assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
+        lease.release_mutable_seals_for_resume().unwrap();
+
+        let mut writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(b"modified").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        assert_eq!(fs::read(&path).unwrap(), b"modified");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mutable_named_stream_injection_dirties_the_sticky_gate() {
+        let root = TestDirectory::new();
+        root.write("options.txt", b"baseline");
+        let tree = desired(vec![mutable("options.txt", b"baseline")], &[], &[]);
+        let relative = RelativeManagedPath::new("options.txt").unwrap();
+        let mut mutable_seals = BTreeMap::new();
+        mutable_seals.insert(
+            path_key("options.txt"),
+            ImmutableManagedFile::open(root.path(), &relative).unwrap(),
+        );
+        let change_sentinel = RecursiveChangeSentinel::arm(root.path()).unwrap();
+        let lease = LaunchInstanceLease {
+            instance_root: root.path().to_path_buf(),
+            anchor: GuardedDirectoryChain::root_only(root.path()).unwrap(),
+            desired: tree,
+            exact_files: BTreeMap::new(),
+            mutable_seals,
+            change_sentinel,
+        };
+        let path = root.path().join("options.txt");
+        fs::write(format!("{}:payload", path.display()), b"hidden").unwrap();
+        assert!(lease
+            .change_sentinel
+            .wait_until_dirty(std::time::Duration::from_secs(2)));
+        assert!(lease.revalidate_fast().is_err());
+        assert!(lease.revalidate_fast().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_game_settlement_lease_fails_closed_on_concurrent_instance_mutation() {
+        let root = TestDirectory::new();
+        root.write("options.txt", b"baseline");
+        let relative = RelativeManagedPath::new("options.txt").unwrap();
+        let mut mutable_seals = BTreeMap::new();
+        mutable_seals.insert(
+            path_key("options.txt"),
+            ImmutableManagedFile::open(root.path(), &relative).unwrap(),
+        );
+        let lease = PostGameInstanceLease {
+            anchor: GuardedDirectoryChain::root_only(root.path()).unwrap(),
+            exact_files: BTreeMap::new(),
+            mutable_seals,
+            change_sentinel: RecursiveChangeSentinel::arm(root.path()).unwrap(),
+        };
+        lease.revalidate().unwrap();
+        root.write("late-foreign.jar", b"foreign");
+        assert!(lease
+            .change_sentinel
+            .wait_until_dirty(std::time::Duration::from_secs(2)));
+        assert!(lease.revalidate().is_err());
+    }
+
+    #[test]
+    fn final_fast_audit_rejects_late_unknown_entries_stickily() {
+        let root = TestDirectory::new();
+        root.write("mods/guard.jar", b"guard");
+        let tree = desired(vec![exact("mods/guard.jar", b"guard")], &["mods"], &[]);
+        let relative = RelativeManagedPath::new("mods/guard.jar").unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            path_key("mods/guard.jar"),
+            ImmutableManagedFile::open(root.path(), &relative).unwrap(),
+        );
+        let lease = launch_lease(&root, tree, files);
+        for index in 0..64 {
+            root.write(&format!("late-{index:02}.bin"), b"unknown");
+        }
+
+        assert!(lease
+            .change_sentinel
+            .wait_until_dirty(std::time::Duration::from_secs(2)));
+        let error = lease.revalidate_fast().unwrap_err();
+        assert!(
+            error.contains("changed after its baseline audit"),
+            "{error}"
+        );
+        assert!(
+            lease.revalidate_fast().is_err(),
+            "a signaled notification must remain sticky"
+        );
     }
 
     #[test]

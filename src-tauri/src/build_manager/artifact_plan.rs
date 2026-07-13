@@ -158,7 +158,7 @@ pub(super) struct PlannedJavaArchiveV2<'a> {
     planned: &'a PlannedArtifactV2,
 }
 
-/// Non-serializable authority for assembling the immutable 4,028-file game generation. It can
+/// Non-serializable authority for assembling the immutable 4,012-file game generation. It can
 /// only be extracted from a sealed reconcile plan which contains every official game requirement,
 /// and it owns the exact post-download, root-bound CAS capabilities for that set.
 pub(super) struct PlannedGameGenerationV2<'a> {
@@ -1672,7 +1672,7 @@ mod tests {
                 .iter()
                 .filter(|artifact| artifact.authority() == ArtifactAuthorityV2::OfficialHttps)
                 .count(),
-            4_022
+            4_006
         );
         assert!(inventory
             .artifacts()
@@ -1888,7 +1888,7 @@ mod tests {
         plan.validate_for(&inventory).unwrap();
         let view = plan.execution_view(root.root(), &inventory).unwrap();
         let items = view.items().collect::<Vec<_>>();
-        assert_eq!(items.len(), 4_023);
+        assert_eq!(items.len(), 4_007);
         assert!(items
             .iter()
             .all(|item| item.availability() == ArtifactAvailabilityStateV2::Complete));
@@ -2028,7 +2028,7 @@ mod tests {
             |object| object.live.then_some(()).ok_or_else(|| "wrong root".into()),
         )
         .unwrap();
-        assert_eq!(exact.len(), 4_022);
+        assert_eq!(exact.len(), 4_006);
 
         let already_ready = VerifiedAvailabilityV2::for_test(&sealed_inventory, [], false, true);
         let no_generation_authority =

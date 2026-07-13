@@ -9,9 +9,10 @@ use url::Url;
 
 use super::types::{
     AdmissionChannel, ApiErrorResponse, BeginChallengeRequest, ContractError,
-    LauncherAdmissionReason, LauncherAdmissionResponse, LauncherProfile, LogoutResponse,
-    NicknameRequest, PollChallengeRequest, RefreshRequest, Secret, SessionResponse,
-    TelegramChallengeResponse, TelegramPollOutcome, TelegramPollResponse, MAX_RESPONSE_BYTES,
+    LauncherAdmissionReason, LauncherAdmissionResponse, LauncherProfile,
+    LauncherSpawnAdmissionRequest, LauncherSpawnAdmissionResponse, LogoutResponse, NicknameRequest,
+    PollChallengeRequest, RefreshRequest, Secret, SessionResponse, TelegramChallengeResponse,
+    TelegramPollOutcome, TelegramPollResponse, MAX_RESPONSE_BYTES,
 };
 
 const API_BASE_URL: &str = "https://fragmc.ru/fragment-api/";
@@ -91,6 +92,11 @@ pub(crate) trait AuthApi: Send + Sync {
         access_token: &Secret,
         channel: AdmissionChannel,
     ) -> Result<LauncherAdmissionResponse, ApiError>;
+    async fn launcher_spawn_admission_v1(
+        &self,
+        access_token: &Secret,
+        channel: AdmissionChannel,
+    ) -> Result<LauncherSpawnAdmissionResponse, ApiError>;
 }
 
 pub(crate) struct FragmentApiClient {
@@ -123,6 +129,17 @@ impl FragmentApiClient {
         self.base_url
             .join(relative)
             .map_err(|_| ApiError::InvalidOrigin)
+    }
+
+    fn launcher_admission_endpoint(&self, channel: AdmissionChannel) -> Result<Url, ApiError> {
+        let mut url = self.endpoint("auth/launcher/admission")?;
+        url.query_pairs_mut()
+            .append_pair("channel", channel.as_str());
+        Ok(url)
+    }
+
+    fn launcher_spawn_admission_endpoint(&self) -> Result<Url, ApiError> {
+        self.endpoint("auth/launcher/spawn-admission/v1")
     }
 
     async fn json<T, B>(
@@ -304,14 +321,33 @@ impl AuthApi for FragmentApiClient {
         access_token: &Secret,
         channel: AdmissionChannel,
     ) -> Result<LauncherAdmissionResponse, ApiError> {
-        let mut url = self.endpoint("auth/launcher/admission")?;
-        url.query_pairs_mut()
-            .append_pair("channel", channel.as_str());
+        let url = self.launcher_admission_endpoint(channel)?;
         let response: LauncherAdmissionResponse = self
             .json_at_url::<LauncherAdmissionResponse, serde_json::Value>(
                 Method::GET,
                 url,
                 None,
+                Some(access_token),
+                &[access_token],
+            )
+            .await?;
+        response.validate()?;
+        if response.channel != channel {
+            return Err(ApiError::Contract(ContractError::InvalidField("channel")));
+        }
+        Ok(response)
+    }
+
+    async fn launcher_spawn_admission_v1(
+        &self,
+        access_token: &Secret,
+        channel: AdmissionChannel,
+    ) -> Result<LauncherSpawnAdmissionResponse, ApiError> {
+        let response: LauncherSpawnAdmissionResponse = self
+            .json_at_url(
+                Method::POST,
+                self.launcher_spawn_admission_endpoint()?,
+                Some(&LauncherSpawnAdmissionRequest { channel }),
                 Some(access_token),
                 &[access_token],
             )
@@ -453,5 +489,28 @@ mod tests {
         let error = http_error(StatusCode::BAD_REQUEST, body.as_bytes(), &[&secret]);
         assert!(!format!("{error:?}").contains(secret.expose()));
         assert!(!error.to_string().contains(secret.expose()));
+    }
+
+    #[test]
+    fn preview_and_spawn_admission_use_distinct_versioned_contracts() {
+        let client = FragmentApiClient::new().unwrap();
+        let status = client
+            .launcher_admission_endpoint(AdmissionChannel::Stable)
+            .unwrap();
+        let spawn = client.launcher_spawn_admission_endpoint().unwrap();
+
+        assert_eq!(status.query(), Some("channel=stable"));
+        assert_eq!(
+            spawn.path(),
+            "/fragment-api/auth/launcher/spawn-admission/v1"
+        );
+        assert_eq!(spawn.query(), None);
+        assert_eq!(
+            serde_json::to_value(LauncherSpawnAdmissionRequest {
+                channel: AdmissionChannel::Dev,
+            })
+            .unwrap(),
+            serde_json::json!({ "channel": "dev" })
+        );
     }
 }

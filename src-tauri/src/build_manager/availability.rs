@@ -213,6 +213,23 @@ impl VerifiedAvailabilityV2 {
         self.game_installation.as_ref()
     }
 
+    /// Consumes a freshly verified availability snapshot into the two non-cloneable launch
+    /// capabilities. A caller cannot manufacture either installation or detach it from the
+    /// inventory/root identity that produced the scan.
+    pub(super) fn into_launch_installations(
+        self,
+        inventory: &ArtifactInventoryV2,
+    ) -> Result<(RuntimeInstallation, GameRuntimeInstallation), String> {
+        self.validate_for(inventory)?;
+        let java = self
+            .java_installation
+            .ok_or_else(|| "Verified Java runtime is unavailable for launch".to_string())?;
+        let game = self
+            .game_installation
+            .ok_or_else(|| "Verified Minecraft runtime is unavailable for launch".to_string())?;
+        Ok((java, game))
+    }
+
     #[cfg(test)]
     pub(super) fn for_test(
         inventory: &ArtifactInventoryV2,

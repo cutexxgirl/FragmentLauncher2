@@ -11,11 +11,9 @@
 		logoutNativeAuth,
 		pollNativeTelegramLogin,
 		refreshNativeProfile,
-		requestNativeAdmission,
 		restoreNativeAuth,
 		updateNativeNickname,
 		type AuthSnapshot,
-		type LauncherAdmissionReason,
 		type LauncherProfile,
 	} from '$lib/native-auth';
 	import {
@@ -29,6 +27,7 @@
 		installTgWsProxy,
 		setBuildInstallDirectory,
 		startBuildOperation,
+		startGame,
 		type BuildChannel,
 		type BuildStatus,
 		type ObservedBuildOperationStatus,
@@ -948,47 +947,37 @@
 			return;
 		}
 		if (buildStatus.primaryAction === 'play') {
+			if (activeBuildOperation || buildOperationStartPending) return;
 			const requestGeneration = ++buildStatusRequestGeneration;
 			const channel = activeChannel;
 			const preset = activeBuild.preset;
+			stopBuildStatusPolling(true);
+			buildOperationStartPending = true;
 			buildStatus = {
 				...buildStatus,
 				phase: 'authorizing',
 				primaryAction: 'busy',
-				message: 'Проверяем право на запуск через FragmentApi…',
-				operationActive: true,
+				message: 'Передаём запуск нативному координатору…',
+				operationActive: false,
 			};
 			try {
-				const admission = await requestNativeAdmission(channel);
+				const localStatus = await startGame(channel, preset);
+				if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return;
+				if (localStatus.operationActive && localStatus.operationId) {
+					scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+				} else if (isPendingBuildInspection(localStatus)) {
+					scheduleBuildInspectionPoll(requestGeneration, channel, preset, 0);
+				}
+			} catch (error) {
 				if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
-				if (!admission.allowed) {
-					if (admission.reason === 'invalid_session') {
-						authSnapshot = null;
-						authState = 'signed-out';
-					}
-					buildStatus = admissionDeniedBuildStatus(channel, preset, admission.reason);
-					return;
-				}
-				if (admission.profile) {
-					authSnapshot = { authenticated: true, profile: admission.profile };
-				}
+				stopBuildStatusPolling(true);
 				buildStatus = errorBuildStatus(
 					channel,
 					preset,
-					'FragmentApi подтвердил доступ, но запуск Java пока не подключён.',
-					'blocked',
+					error instanceof Error ? error.message : 'Не удалось запустить Minecraft.',
 				);
-			} catch (error) {
-				if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
-				buildStatus = {
-					...errorBuildStatus(
-						channel,
-						preset,
-						error instanceof Error ? error.message : 'FragmentApi не подтвердил право на запуск.',
-						'blocked',
-					),
-					phase: 'authUnavailable',
-				};
+			} finally {
+				buildOperationStartPending = false;
 			}
 			return;
 		}
@@ -998,40 +987,6 @@
 			'Операция ещё не подключена в этой dev-ветке лаунчера.',
 			'blocked',
 		);
-	}
-
-	function admissionDeniedBuildStatus(
-		channel: BuildChannel,
-		preset: PresetId,
-		reason: LauncherAdmissionReason | null,
-	): BuildStatus {
-		const denied = (phase: BuildStatus['phase'], message: string) => ({
-			...errorBuildStatus(channel, preset, message, 'blocked'),
-			phase,
-		});
-		switch (reason) {
-			case 'subscription_required':
-				return denied(
-					'subscriptionRequired',
-					'Для запуска нужна активная подписка либо подаренный доступ.',
-				);
-			case 'dev_access_required':
-				return denied('devForbidden', 'Dev-сборку могут запускать только тестеры и разработчики.');
-			case 'launcher_nickname_required':
-				return denied('error', 'Перед запуском укажите игровой ник в профиле лаунчера.');
-			case 'account_banned':
-				return denied('error', 'Для этого аккаунта запуск Fragment запрещён.');
-			case 'invalid_session':
-				return denied('authUnavailable', 'Сессия завершена. Войдите через Telegram снова.');
-			case 'entitlement_verification_unavailable':
-			case 'launcher_admission_busy':
-			case 'launcher_admission_unavailable':
-			default:
-				return denied(
-					'authUnavailable',
-					'Не удалось подтвердить право на запуск через FragmentApi. Попробуйте ещё раз.',
-				);
-		}
 	}
 
 	function submitSupportRequest(event: SubmitEvent) {

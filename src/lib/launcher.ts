@@ -161,6 +161,13 @@ export async function startBuildOperation(
 	return invoke<BuildStatus>('start_build_operation', { channel, preset });
 }
 
+export async function startGame(
+	channel: BuildChannel,
+	preset: BuildPreset,
+): Promise<BuildStatus> {
+	return invoke<BuildStatus>('start_game', { channel, preset });
+}
+
 export async function cancelBuildOperation(operationId: string): Promise<BuildStatus> {
 	return invoke<BuildStatus>('cancel_build_operation', { operationId });
 }

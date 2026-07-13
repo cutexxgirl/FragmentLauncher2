@@ -11,7 +11,7 @@ use super::{
         remove_bounded_managed_directory_tree, ConditionalManagedDirectoryMoveOutcome,
         ExclusiveManagedFile, FileIdentity, GuardedDirectoryChain, ImmutableManagedFile,
         ManagedDirectoryRemovalLimits, ManagedFsError, ManagedLockFile, ManagedNodeKind,
-        RelativeManagedPath,
+        RecursiveChangeSentinel, RelativeManagedPath,
     },
     storage::{is_windows_reparse_point, OwnedCasRoot},
 };
@@ -47,8 +47,8 @@ const GAME_QUARANTINE_GC_LIMITS: ManagedDirectoryRemovalLimits = ManagedDirector
     max_allocated_bytes: 64 * 1024 * 1024 * 1024,
     max_depth: 256,
 };
-const PINNED_FILE_COUNT: usize = 4_028;
-const PINNED_OFFICIAL_COUNT: usize = 4_022;
+const PINNED_FILE_COUNT: usize = 4_012;
+const PINNED_OFFICIAL_COUNT: usize = 4_006;
 const PINNED_DERIVED_COUNT: usize = 6;
 
 #[derive(Debug)]
@@ -191,7 +191,7 @@ impl ExpectedGameTree {
             || official_count != PINNED_OFFICIAL_COUNT
             || derived_count != PINNED_DERIVED_COUNT
         {
-            return Err("Game generation is not the pinned 4,022+6 file set".into());
+            return Err("Game generation is not the pinned 4,006+6 file set".into());
         }
         let tree_sha256 = domain_digest(TREE_DIGEST_DOMAIN, &canonical)?;
         let OfflineProcessorVerification::Verified {
@@ -296,14 +296,16 @@ struct GenerationAuditLease {
     image: PathBuf,
     expected: ExpectedGameTree,
     marker: ImmutableManagedFile,
-    files: Vec<ImmutableManagedFile>,
+    files: BTreeMap<String, ImmutableManagedFile>,
     _generation_guard: GuardedDirectoryChain,
     _image_guard: GuardedDirectoryChain,
     namespace_guards: Vec<GuardedDirectoryChain>,
+    change_sentinel: RecursiveChangeSentinel,
 }
 
 impl GenerationAuditLease {
     fn revalidate(&self, expected_marker: &[u8]) -> Result<(), String> {
+        self.revalidate_sentinel()?;
         self._generation_guard
             .revalidate()
             .map_err(|error| format!("Game generation root changed: {error}"))?;
@@ -331,19 +333,51 @@ impl GenerationAuditLease {
         {
             return Err("Game generation namespace changed while leased".into());
         }
-        if self
-            .marker
-            .read_bounded_shared(MAX_MARKER_BYTES)
-            .map_err(|error| format!("Cannot re-read game generation marker: {error}"))?
-            != expected_marker
+        self.marker
+            .revalidate()
+            .map_err(|error| format!("Game generation marker changed: {error}"))?;
+        let marker_relative = RelativeManagedPath::new(GENERATION_MARKER)
+            .expect("static generation marker path is valid");
+        let reopened_marker = ImmutableManagedFile::open(&self.generation, &marker_relative)
+            .map_err(|error| format!("Cannot reopen game generation marker: {error}"))?;
+        if reopened_marker.info().identity != self.marker.info().identity
+            || reopened_marker.info().size != self.marker.info().size
+            || self.marker.info().size != expected_marker.len() as u64
         {
-            return Err("Game generation marker changed".into());
+            return Err("Game generation marker identity/size changed".into());
         }
-        for file in &self.files {
+        if self.files.len() != self.expected.files.len() {
+            return Err("Game generation file lease coverage changed".into());
+        }
+        for (key, expected) in &self.expected.files {
+            let file = self
+                .files
+                .get(key)
+                .ok_or_else(|| format!("Game generation lease is missing: {}", expected.path))?;
             file.revalidate()
                 .map_err(|error| format!("Game generation lease changed: {error}"))?;
+            let relative = RelativeManagedPath::new(&expected.path)
+                .map_err(|error| format!("Signed game path is unsafe: {error}"))?;
+            let reopened = ImmutableManagedFile::open(&self.image, &relative)
+                .map_err(|error| format!("Cannot reopen game file {}: {error}", expected.path))?;
+            if file.info().size != expected.size
+                || reopened.info().size != expected.size
+                || reopened.info().identity != file.info().identity
+            {
+                return Err(format!(
+                    "Game generation file identity/size changed: {}",
+                    expected.path
+                ));
+            }
         }
+        self.revalidate_sentinel()?;
         Ok(())
+    }
+
+    fn revalidate_sentinel(&self) -> Result<(), String> {
+        self.change_sentinel
+            .revalidate_clean()
+            .map_err(|error| format!("Game generation changed after full audit: {error}"))
     }
 }
 
@@ -395,6 +429,55 @@ impl GameRuntimeInstallation {
 
     pub(super) fn inventory_fingerprint(&self) -> &str {
         &self.inventory_fingerprint
+    }
+
+    /// Revalidates the handle-bound generation and proves that `lock` describes the same exact
+    /// game tree. This deliberately accepts no filesystem root: callers cannot transplant the
+    /// live installation authority onto another directory.
+    pub(super) fn revalidate_against_lock(&self, lock: &GameRuntimeLock) -> Result<(), String> {
+        let expected = ExpectedGameTree::from_lock(lock)?;
+        if expected.tree_sha256 != self.lease.expected.tree_sha256
+            || expected.total_bytes != self.lease.expected.total_bytes
+            || expected.processor_receipt_sha256 != self.lease.expected.processor_receipt_sha256
+            || expected.processor_outputs_sha256 != self.lease.expected.processor_outputs_sha256
+            || expected.files.len() != self.lease.expected.files.len()
+            || expected.directories.len() != self.lease.expected.directories.len()
+        {
+            return Err("Game runtime lock does not describe this installed generation".into());
+        }
+        self.lease.revalidate(&self.marker_bytes)
+    }
+
+    /// Returns the launcher-owned install root only after proving the canonical generation
+    /// layout. The root is derived from the sealed installation, never supplied by a caller.
+    pub(super) fn install_root(&self) -> Result<&Path, String> {
+        use std::ffi::OsStr;
+
+        if self.image != self.generation.join("image")
+            || self.generation.file_name() != Some(OsStr::new(&self.game_runtime_lock_sha256))
+        {
+            return Err("Game runtime installation path binding is invalid".into());
+        }
+        let generations = self
+            .generation
+            .parent()
+            .filter(|path| path.file_name() == Some(OsStr::new("generations")))
+            .ok_or_else(|| "Game runtime generation is outside its canonical layout".to_string())?;
+        let minecraft = generations
+            .parent()
+            .filter(|path| path.file_name() == Some(OsStr::new("minecraft")))
+            .ok_or_else(|| "Game runtime generation is outside its canonical layout".to_string())?;
+        let runtime = minecraft
+            .parent()
+            .filter(|path| path.file_name() == Some(OsStr::new("runtime")))
+            .ok_or_else(|| "Game runtime generation is outside its canonical layout".to_string())?;
+        let root = runtime
+            .parent()
+            .ok_or_else(|| "Game runtime install root is missing".to_string())?;
+        if !root.is_absolute() {
+            return Err("Game runtime install root is not absolute".into());
+        }
+        Ok(root)
     }
 }
 
@@ -565,7 +648,7 @@ struct ImageScan<'a> {
     expected: &'a ExpectedGameTree,
     seen_files: BTreeSet<String>,
     seen_directories: BTreeSet<String>,
-    leases: Vec<ImmutableManagedFile>,
+    leases: BTreeMap<String, ImmutableManagedFile>,
     entries: usize,
     hash_files: bool,
 }
@@ -620,7 +703,7 @@ impl ImageScan<'_> {
                     .files
                     .get(&key)
                     .ok_or_else(|| format!("Unexpected file in game image: {relative}"))?;
-                if expected.path != managed.as_str() || !self.seen_files.insert(key) {
+                if expected.path != managed.as_str() || !self.seen_files.insert(key.clone()) {
                     return Err(format!(
                         "Game image file casing/collision mismatch: {relative}"
                     ));
@@ -637,7 +720,9 @@ impl ImageScan<'_> {
                     {
                         return Err(format!("Game image file identity mismatch: {relative}"));
                     }
-                    self.leases.push(file);
+                    if self.leases.insert(key, file).is_some() {
+                        return Err("Game image file lease map is duplicated".into());
+                    }
                 }
             } else {
                 return Err(format!(
@@ -661,7 +746,7 @@ fn scan_image<'a>(
         expected,
         seen_files: BTreeSet::new(),
         seen_directories: BTreeSet::new(),
-        leases: Vec::with_capacity(if hash_files { expected.files.len() } else { 0 }),
+        leases: BTreeMap::new(),
         entries: 0,
         hash_files,
     };
@@ -770,6 +855,8 @@ fn audit_complete_generation(
     let image_guard = GuardedDirectoryChain::open(install_root, &image_relative)
         .map_err(|error| format!("Game generation image is unsafe: {error}"))?;
     let image = image_guard.leaf().path().to_path_buf();
+    let change_sentinel = RecursiveChangeSentinel::arm(&absolute)
+        .map_err(|error| format!("Cannot arm game generation change sentinel: {error}"))?;
     let first = scan_image(&image, expected, true)?;
     let expected_files = expected.files.keys().cloned().collect::<BTreeSet<_>>();
     let expected_directories = expected
@@ -801,6 +888,7 @@ fn audit_complete_generation(
         _generation_guard: generation_guard,
         _image_guard: image_guard,
         namespace_guards,
+        change_sentinel,
     };
     lease.revalidate(&marker_bytes)?;
     Ok(Some((lease, marker_bytes)))
@@ -1705,6 +1793,26 @@ pub(super) fn revalidate_game_runtime_installation(
         .ok_or_else(|| "Game runtime installation disappeared during revalidation".into())
 }
 
+/// O(1) final launch-window validation of a generation fully hashed before admission. The sticky
+/// recursive sentinel spans that audit and the API await; retained exact handles deny writes and
+/// replacement, so no file iteration, reopen, namespace scan, or content read occurs here.
+pub(super) fn revalidate_game_runtime_installation_fast(
+    installed: &GameRuntimeInstallation,
+    root: &OwnedCasRoot,
+    inventory: &ArtifactInventoryV2,
+) -> Result<(), String> {
+    inventory.validate_root(root)?;
+    if installed.install_id != inventory.install_id()
+        || installed.root_binding_nonce != inventory.root_binding_nonce()
+        || installed.inventory_fingerprint != inventory.fingerprint()
+        || installed.game_runtime_lock_sha256 != inventory.game_runtime_lock_sha256()
+    {
+        return Err("Game runtime installation belongs to another inventory/root".into());
+    }
+    installed.lease.revalidate_sentinel()?;
+    inventory.validate_root(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2056,7 +2164,7 @@ mod tests {
             PINNED_DERIVED_COUNT
         );
         assert_eq!(expected.directories.len(), 535);
-        assert_eq!(expected.total_bytes, 1_013_945_971);
+        assert_eq!(expected.total_bytes, 1_009_196_756);
         assert_eq!(expected.tree_sha256.len(), 64);
         assert_eq!(expected.processor_receipt_sha256.len(), 64);
         assert_eq!(expected.processor_outputs_sha256.len(), 64);

@@ -10,7 +10,9 @@ use super::{
     },
     game_generation::{
         begin_game_generation, merge_processor_outputs, publish_game_generation,
-        stage_official_game_files, BeginGameGeneration, StagedGameGeneration,
+        revalidate_game_runtime_installation, revalidate_game_runtime_installation_fast,
+        stage_official_game_files, BeginGameGeneration, GameRuntimeInstallation,
+        StagedGameGeneration,
     },
     game_runtime_executor::{execute_game_runtime_processors, ProcessorExecutionError},
     game_runtime_materializer::materialize_processor_workspace,
@@ -44,12 +46,13 @@ use super::{
         TrustedReconcileStagingAuthorityV2, UntrustedPendingIdentityV2,
     },
     reconciler::{
-        audit_current_reconcile_plan_instance, audit_release_instance, InstanceAudit,
-        ReconcilePlanAuditV2,
+        audit_current_reconcile_plan_instance, audit_release_instance, lease_post_game_instance,
+        lease_release_instance, InstanceAudit, LaunchInstanceLease, ReconcilePlanAuditV2,
     },
     release::FilePolicy,
     runtime::{
-        install_runtime_with_control, RuntimeInstallControl, RuntimeInstallError,
+        install_runtime_with_control, revalidate_runtime_installation_fast_for_root,
+        revalidate_runtime_installation_for_root, RuntimeInstallControl, RuntimeInstallError,
         RuntimeInstallProgress, RuntimeInstallation,
     },
     settings_store::SettingsStore,
@@ -136,6 +139,13 @@ impl BuildCoordinator {
         )
         .await
     }
+
+    pub(super) async fn prepare_game_launch(
+        &self,
+        request: PrepareGameLaunchRequest<'_>,
+    ) -> Result<PrepareGameLaunchOutcome, CoordinatorError> {
+        prepare_game_launch_operation(&self.config, request).await
+    }
 }
 
 #[derive(Clone)]
@@ -210,6 +220,16 @@ impl CoordinatorProgress {
 }
 
 pub(super) type ProgressObserver = Arc<dyn Fn(CoordinatorProgress) + Send + Sync>;
+
+pub(super) struct PrepareGameLaunchRequest<'a> {
+    pub(super) install_directory: &'a Path,
+    pub(super) install_id: Uuid,
+    pub(super) launch_id: Uuid,
+    pub(super) channel: BuildChannel,
+    pub(super) preset: PresetId,
+    pub(super) auth: &'a Arc<AuthSessionManager>,
+    pub(super) observer: &'a ProgressObserver,
+}
 
 struct CoordinatorDownloadObserver {
     observer: ProgressObserver,
@@ -335,6 +355,226 @@ impl CoordinatorSnapshot {
             PlannedBuildState::Repair => (BuildPhase::RepairNeeded, PrimaryAction::Repair),
             PlannedBuildState::Ready => (BuildPhase::Ready, PrimaryAction::Play),
         }
+    }
+}
+
+pub(super) enum PrepareGameLaunchOutcome {
+    Ready(Box<PreparedGameLaunch>),
+    NotReady(CoordinatorSnapshot),
+}
+
+/// Non-cloneable aggregate of every local capability needed for one exact game launch. The
+/// install-wide and channel locks deliberately remain owned for the complete Java process so no
+/// second launcher can update or repair files behind the running game.
+pub(super) struct PreparedGameLaunch {
+    authority: OperationAuthority,
+    install_lock: CoordinatorOperationLock,
+    channel_lock: InstanceOperationLock,
+    trusted: TrustedRelease,
+    inventory: ArtifactInventoryV2,
+    active: ActiveInstanceV2,
+    runtime: RuntimeInstallation,
+    game: GameRuntimeInstallation,
+    instance: LaunchInstanceLease,
+    mutable_defaults: BTreeMap<String, VerifiedCasObject>,
+    channel: BuildChannel,
+    preset: PresetId,
+}
+
+impl fmt::Debug for PreparedGameLaunch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedGameLaunch")
+            .field("install_id", &self.authority.install_id)
+            .field("channel", &self.channel)
+            .field("preset", &self.preset)
+            .field("release_id", &self.active.release_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedGameLaunch {
+    pub(super) fn trusted(&self) -> &TrustedRelease {
+        &self.trusted
+    }
+
+    pub(super) fn runtime(&self) -> &RuntimeInstallation {
+        &self.runtime
+    }
+
+    pub(super) fn game(&self) -> &GameRuntimeInstallation {
+        &self.game
+    }
+
+    pub(super) fn instance_root(&self) -> &Path {
+        self.instance.instance_root()
+    }
+
+    pub(super) fn channel(&self) -> BuildChannel {
+        self.channel
+    }
+
+    pub(super) fn preset(&self) -> PresetId {
+        self.preset
+    }
+
+    fn revalidate_control_plane(&self) -> Result<(), CoordinatorError> {
+        self.install_lock.revalidate(&self.authority.root)?;
+        self.channel_lock
+            .validate_scope(
+                &self.authority.install_root,
+                self.authority.install_id,
+                self.channel,
+            )
+            .map_err(|error| CoordinatorError::Failed(error.to_string()))?;
+        let current =
+            InstanceStateStore::new(&self.authority.install_root, self.authority.install_id)
+                .load_locked(&self.channel_lock)
+                .map_err(|error| CoordinatorError::Failed(error.to_string()))?
+                .ok_or_else(|| {
+                    CoordinatorError::Failed("Active instance disappeared before launch".into())
+                })?;
+        if current != self.active {
+            return Err(CoordinatorError::Failed(
+                "Active instance changed before launch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Full synchronous content/policy boundary. This intentionally runs before requesting the
+    /// short-lived server admission because it may hash the complete exact instance and runtime.
+    pub(super) fn revalidate_before_admission(&mut self) -> Result<(), CoordinatorError> {
+        self.revalidate_control_plane()?;
+        let audit = self
+            .instance
+            .revalidate_full()
+            .map_err(CoordinatorError::Failed)?;
+        let (mutable, _) = prepare_mutable_proofs(MutableProofRequest {
+            root: &self.authority.root,
+            inventory: &self.inventory,
+            trusted: &self.trusted,
+            channel: self.channel,
+            target_preset: self.preset,
+            installed: Some(&self.active),
+            audit: &audit,
+            defaults: &self.mutable_defaults,
+            capture_local: false,
+        })?;
+        if mutable.iter().any(|proof| !proof.current_matches) {
+            return Err(CoordinatorError::Failed(
+                "Mutable game settings changed and must be repaired before launch".into(),
+            ));
+        }
+        self.runtime = revalidate_runtime_installation_for_root(
+            &self.runtime,
+            self.trusted.runtime_lock(),
+            &self.authority.root,
+        )
+        .map_err(CoordinatorError::Failed)?;
+        self.game =
+            revalidate_game_runtime_installation(&self.game, &self.authority.root, &self.inventory)
+                .map_err(CoordinatorError::Failed)?;
+        self.instance
+            .revalidate_fast()
+            .map_err(CoordinatorError::Failed)?;
+        self.revalidate_control_plane()?;
+        self.install_lock.revalidate(&self.authority.root)
+    }
+
+    /// Content-size-independent final boundary after server admission. It polls sticky recursive
+    /// notifications, retained roots/control markers, and the small signed set of mutable-file
+    /// seals; it performs no namespace enumeration or content hashing. Callers must spawn
+    /// immediately after this returns and must not await.
+    pub(super) fn revalidate_for_spawn(&self) -> Result<(), CoordinatorError> {
+        self.revalidate_control_plane()?;
+        self.instance
+            .revalidate_fast()
+            .map_err(CoordinatorError::Failed)?;
+        revalidate_runtime_installation_fast_for_root(
+            &self.runtime,
+            self.trusted.runtime_lock(),
+            &self.authority.root,
+        )
+        .map_err(CoordinatorError::Failed)?;
+        revalidate_game_runtime_installation_fast(
+            &self.game,
+            &self.authority.root,
+            &self.inventory,
+        )
+        .map_err(CoordinatorError::Failed)?;
+        self.instance
+            .revalidate_fast()
+            .map_err(CoordinatorError::Failed)?;
+        self.revalidate_control_plane()?;
+        self.install_lock.revalidate(&self.authority.root)
+    }
+
+    /// The final action in the suspended-process gate. Once these handles are dropped Minecraft
+    /// may persist only the signed mutable-setting paths; all exact files remain immutable.
+    pub(super) fn release_mutable_seals_for_resume(&mut self) -> Result<(), CoordinatorError> {
+        self.instance
+            .release_mutable_seals_for_resume()
+            .map_err(CoordinatorError::Failed)
+    }
+
+    /// Completion-safe, network-free settlement after the contained Job is proven empty.
+    /// Everything needed to interpret mutable settings is retained from the launch's signed TUF
+    /// transaction; an API/TUF outage after exit therefore cannot erase a player's allowed
+    /// controls or graphics choices.
+    pub(super) fn settle_after_game(&self) -> Result<CoordinatorSnapshot, CoordinatorError> {
+        self.revalidate_control_plane()?;
+        let (audit, settlement_lease) = lease_post_game_instance(
+            &self.authority.install_root,
+            self.channel,
+            self.trusted.manifest(),
+            self.preset,
+        )
+        .map_err(CoordinatorError::Failed)?;
+        settlement_lease
+            .revalidate()
+            .map_err(CoordinatorError::Failed)?;
+        let (mutable, _) = prepare_post_game_mutable_proofs(MutableProofRequest {
+            root: &self.authority.root,
+            inventory: &self.inventory,
+            trusted: &self.trusted,
+            channel: self.channel,
+            target_preset: self.preset,
+            installed: Some(&self.active),
+            audit: &audit,
+            defaults: &self.mutable_defaults,
+            capture_local: true,
+        })?;
+        settlement_lease
+            .revalidate()
+            .map_err(CoordinatorError::Failed)?;
+        let availability = VerifiedAvailabilityV2::scan(&self.authority.root, &self.inventory)
+            .map_err(CoordinatorError::Failed)?;
+        let planned = plan_build(PlannerRequestV2 {
+            install_id: self.authority.install_id,
+            channel: self.channel,
+            preset: self.preset,
+            operation_id: Uuid::new_v4(),
+            trusted_release: &self.trusted,
+            artifact_inventory: &self.inventory,
+            cas_root: &self.authority.root,
+            installed: Some(&self.active),
+            audit: &audit,
+            mutable_files: &mutable,
+            availability: &availability,
+        })
+        .map_err(|error| CoordinatorError::Failed(error.to_string()))?;
+        settlement_lease
+            .revalidate()
+            .map_err(CoordinatorError::Failed)?;
+        self.revalidate_control_plane()?;
+        let free = current_free_space(&self.authority.root)?;
+        Ok(snapshot_from_plan(
+            &planned,
+            Some(&self.active),
+            &self.trusted,
+            free,
+        ))
     }
 }
 
@@ -1082,6 +1322,39 @@ fn reset_mutable_policy_state(
     }
 }
 
+fn prepare_mutable_state(
+    signed_default: &[u8],
+    local: Option<&[u8]>,
+    policy: &super::contracts::MutableSettingsFile,
+    capture_preset: &str,
+    target_preset: &str,
+    loaded: &super::mutable::MutableSettingsState,
+    capture_local: bool,
+) -> Result<(super::mutable::MutableSettingsState, Vec<u8>), String> {
+    let mut state = loaded.clone();
+    if capture_local {
+        if let Some(local) = local {
+            if capture_minecraft_options_state(local, policy, capture_preset, &mut state).is_err() {
+                // Malformed/oversized local content is never allowed to poison the durable store.
+                state = loaded.clone();
+            }
+        }
+    }
+    let canonical = match materialize_minecraft_options_state(
+        signed_default,
+        policy,
+        target_preset,
+        &mut state,
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            reset_mutable_policy_state(&mut state, policy);
+            materialize_minecraft_options_state(signed_default, policy, target_preset, &mut state)?
+        }
+    };
+    Ok((state, canonical))
+}
+
 struct MutableProofRequest<'a> {
     root: &'a OwnedCasRoot,
     inventory: &'a ArtifactInventoryV2,
@@ -1103,6 +1376,37 @@ fn prepare_mutable_proofs(
     ),
     CoordinatorError,
 > {
+    prepare_mutable_proofs_with_persistence(request, CapturePersistence::Immediate)
+}
+
+fn prepare_post_game_mutable_proofs(
+    request: MutableProofRequest<'_>,
+) -> Result<
+    (
+        Vec<MutableMaterializationProofV2>,
+        BTreeMap<String, super::mutable::MutableSettingsState>,
+    ),
+    CoordinatorError,
+> {
+    prepare_mutable_proofs_with_persistence(request, CapturePersistence::OnlyIfAllCurrentMatch)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapturePersistence {
+    Immediate,
+    OnlyIfAllCurrentMatch,
+}
+
+fn prepare_mutable_proofs_with_persistence(
+    request: MutableProofRequest<'_>,
+    persistence: CapturePersistence,
+) -> Result<
+    (
+        Vec<MutableMaterializationProofV2>,
+        BTreeMap<String, super::mutable::MutableSettingsState>,
+    ),
+    CoordinatorError,
+> {
     let MutableProofRequest {
         root,
         inventory,
@@ -1117,6 +1421,7 @@ fn prepare_mutable_proofs(
     let store = SettingsStore::new(root.install_root(), inventory.install_id());
     let mut proofs = Vec::new();
     let mut states = BTreeMap::new();
+    let mut loaded_states = BTreeMap::new();
     for policy in &trusted.manifest().integrity.mutable_settings {
         let sha256 = inventory
             .mutable_default_sha256(&policy.path)
@@ -1145,40 +1450,20 @@ fn prepare_mutable_proofs(
         let loaded = store
             .load(channel, policy)
             .map_err(CoordinatorError::Failed)?;
-        let mut state = loaded.state.clone();
-        if capture_local {
-            if let (Some(installed), Some(local)) = (installed, local.as_deref()) {
-                if capture_minecraft_options_state(
-                    local,
-                    policy,
-                    installed.preset.as_str(),
-                    &mut state,
-                )
-                .is_err()
-                {
-                    state = loaded.state.clone();
-                }
-            }
-        }
-        let canonical = match materialize_minecraft_options_state(
+        let capture_preset = installed
+            .map(|active| active.preset.as_str())
+            .unwrap_or_else(|| target_preset.as_str());
+        let (state, canonical) = prepare_mutable_state(
             &signed_default,
+            local.as_deref(),
             policy,
+            capture_preset,
             target_preset.as_str(),
-            &mut state,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                reset_mutable_policy_state(&mut state, policy);
-                materialize_minecraft_options_state(
-                    &signed_default,
-                    policy,
-                    target_preset.as_str(),
-                    &mut state,
-                )
-                .map_err(CoordinatorError::Failed)?
-            }
-        };
-        if capture_local && state != loaded.state {
+            &loaded.state,
+            capture_local && installed.is_some(),
+        )
+        .map_err(CoordinatorError::Failed)?;
+        if capture_local && persistence == CapturePersistence::Immediate && state != loaded.state {
             let persisted = state.clone();
             store
                 .update(channel, policy, move |current| {
@@ -1187,6 +1472,7 @@ fn prepare_mutable_proofs(
                 })
                 .map_err(CoordinatorError::Failed)?;
         }
+        loaded_states.insert(policy.path.clone(), loaded.state);
         let sha256 = format!("{:x}", Sha256::digest(&canonical));
         proofs.push(MutableMaterializationProofV2 {
             path: policy.path.clone(),
@@ -1202,6 +1488,31 @@ fn prepare_mutable_proofs(
         })?;
     }
     proofs.sort_by_key(|proof| proof.path.to_lowercase());
+    if capture_local
+        && persistence == CapturePersistence::OnlyIfAllCurrentMatch
+        && proofs.iter().all(|proof| proof.current_matches)
+    {
+        // Validate every signed mutable file before the first durable write. In particular, one
+        // unknown/invalid value makes the settlement Repair and preserves the previous store
+        // unchanged instead of partially capturing a compromised local file.
+        for policy in &trusted.manifest().integrity.mutable_settings {
+            let state = states.get(&policy.path).ok_or_else(|| {
+                CoordinatorError::Failed("Post-game mutable state set is incomplete".into())
+            })?;
+            let loaded = loaded_states.get(&policy.path).ok_or_else(|| {
+                CoordinatorError::Failed("Post-game mutable baseline set is incomplete".into())
+            })?;
+            if state != loaded {
+                let persisted = state.clone();
+                store
+                    .update(channel, policy, move |current| {
+                        *current = persisted;
+                        Ok(())
+                    })
+                    .map_err(CoordinatorError::Failed)?;
+            }
+        }
+    }
     root.revalidate().map_err(CoordinatorError::Failed)?;
     Ok((proofs, states))
 }
@@ -1766,6 +2077,147 @@ pub(super) async fn inspect_operation(
         &prepared.trusted,
         free,
     ))
+}
+
+async fn prepare_game_launch_operation(
+    config: &CoordinatorConfig,
+    request: PrepareGameLaunchRequest<'_>,
+) -> Result<PrepareGameLaunchOutcome, CoordinatorError> {
+    let PrepareGameLaunchRequest {
+        install_directory,
+        install_id,
+        launch_id,
+        channel,
+        preset,
+        auth,
+        observer,
+    } = request;
+    let authority = validate_operation_root(install_directory, install_id)?;
+    let install_lock = CoordinatorOperationLock::acquire(&authority.root)?;
+    observer(CoordinatorProgress::checking(
+        "Refreshing signed Spark2 metadata for launch",
+    ));
+    let trusted = refresh_trusted_release(config, channel, auth).await?;
+    install_lock.revalidate(&authority.root)?;
+
+    let inventory = ArtifactInventoryV2::build(
+        &authority.root,
+        &trusted,
+        install_id,
+        launch_id,
+        channel,
+        preset,
+    )
+    .map_err(CoordinatorError::Failed)?;
+    let state_store = InstanceStateStore::new(&authority.install_root, install_id);
+    let channel_lock = state_store
+        .acquire_operation_lock(channel)
+        .map_err(|error| {
+            CoordinatorError::Failed(format!("Cannot lock instance for launch: {error}"))
+        })?;
+    install_lock.revalidate(&authority.root)?;
+
+    let pending = detect_pending(&authority.install_root, install_id, channel, &channel_lock)
+        .map_err(CoordinatorError::Failed)?;
+    let active = state_store
+        .load_locked(&channel_lock)
+        .map_err(|error| CoordinatorError::Failed(error.to_string()))?;
+    if pending.is_some() {
+        let state = if active
+            .as_ref()
+            .is_some_and(|installed| installed.release_id == trusted.manifest().release.id)
+        {
+            PlannedBuildState::Repair
+        } else {
+            PlannedBuildState::Update
+        };
+        return Ok(PrepareGameLaunchOutcome::NotReady(CoordinatorSnapshot {
+            state,
+            installed_release_id: active.as_ref().map(|value| value.release_id.clone()),
+            available_release_id: trusted.manifest().release.id.clone(),
+            disk_free_bytes: current_free_space(&authority.root)?,
+            disk_required_bytes: 0,
+            message: "An interrupted operation must be recovered before launch".into(),
+        }));
+    }
+
+    observer(CoordinatorProgress::checking(
+        "Auditing the installed build for launch",
+    ));
+    let availability = VerifiedAvailabilityV2::scan(&authority.root, &inventory)
+        .map_err(CoordinatorError::Failed)?;
+    let Some(defaults) = cached_mutable_defaults(&authority.root, &inventory, &availability)?
+    else {
+        return Ok(PrepareGameLaunchOutcome::NotReady(CoordinatorSnapshot {
+            state: conservative_state(active.as_ref(), &trusted, preset),
+            installed_release_id: active.as_ref().map(|value| value.release_id.clone()),
+            available_release_id: trusted.manifest().release.id.clone(),
+            disk_free_bytes: current_free_space(&authority.root)?,
+            disk_required_bytes: 0,
+            message: "Signed settings defaults must be restored before launch".into(),
+        }));
+    };
+    let audit =
+        audit_release_instance(&authority.install_root, channel, trusted.manifest(), preset)
+            .map_err(CoordinatorError::Failed)?;
+    let (mutable_proofs, _) = prepare_mutable_proofs(MutableProofRequest {
+        root: &authority.root,
+        inventory: &inventory,
+        trusted: &trusted,
+        channel,
+        target_preset: preset,
+        installed: active.as_ref(),
+        audit: &audit,
+        defaults: &defaults,
+        capture_local: false,
+    })?;
+    let planned = plan_build(PlannerRequestV2 {
+        install_id,
+        channel,
+        preset,
+        operation_id: launch_id,
+        trusted_release: &trusted,
+        artifact_inventory: &inventory,
+        cas_root: &authority.root,
+        installed: active.as_ref(),
+        audit: &audit,
+        mutable_files: &mutable_proofs,
+        availability: &availability,
+    })
+    .map_err(|error| CoordinatorError::Failed(error.to_string()))?;
+    if planned.state != PlannedBuildState::Ready {
+        return Ok(PrepareGameLaunchOutcome::NotReady(snapshot_from_plan(
+            &planned,
+            active.as_ref(),
+            &trusted,
+            current_free_space(&authority.root)?,
+        )));
+    }
+    let active = active.ok_or_else(|| {
+        CoordinatorError::Failed("Ready launch plan has no active instance marker".into())
+    })?;
+    let instance =
+        lease_release_instance(&authority.install_root, channel, trusted.manifest(), preset)
+            .map_err(CoordinatorError::Failed)?;
+    let (runtime, game) = availability
+        .into_launch_installations(&inventory)
+        .map_err(CoordinatorError::Failed)?;
+    let prepared = Box::new(PreparedGameLaunch {
+        authority,
+        install_lock,
+        channel_lock,
+        trusted,
+        inventory,
+        active,
+        runtime,
+        game,
+        instance,
+        mutable_defaults: defaults,
+        channel,
+        preset,
+    });
+    prepared.revalidate_for_spawn()?;
+    Ok(PrepareGameLaunchOutcome::Ready(prepared))
 }
 
 fn require_fresh_budget(
@@ -4394,6 +4846,122 @@ mod tests {
         assert!(!state.profile.contains_key("graphics"));
         assert!(state.profile.contains_key("controls"));
         assert!(!state.presets["high"].contains_key("graphics"));
+    }
+
+    fn post_game_policy() -> super::super::contracts::MutableSettingsFile {
+        serde_json::from_value(serde_json::json!({
+            "path": "options.txt",
+            "validator": "minecraft-options-v1",
+            "maxBytes": 4096,
+            "unknownKeyPolicy": "drop",
+            "duplicateKeyPolicy": "reject",
+            "invalidValuePolicy": "use-default",
+            "fields": [
+                {
+                    "settingId": "minecraft.controls.keybindings",
+                    "scope": "profile",
+                    "selector": { "kind": "prefix", "prefix": "key_" },
+                    "value": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "allowedPrefixes": ["key.keyboard."]
+                    },
+                    "renamedFrom": []
+                },
+                {
+                    "settingId": "minecraft.video.render-distance",
+                    "scope": "preset",
+                    "selector": { "kind": "exact", "key": "renderDistance" },
+                    "value": { "type": "integer", "minimum": 2, "maximum": 32 },
+                    "renamedFrom": []
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn local_post_game_settlement_captures_allowed_change_after_crash_without_network() {
+        let install = TestInstall::new();
+        let install_id = Uuid::new_v4();
+        let store = SettingsStore::new(&install.0, install_id);
+        let policy = post_game_policy();
+        let signed_default = b"key_forward:key.keyboard.w\nrenderDistance:8\n";
+        let local = b"key_forward:key.keyboard.up\nrenderDistance:20\n";
+        let loaded = store.load(BuildChannel::Stable, &policy).unwrap();
+        let (captured, canonical) = prepare_mutable_state(
+            signed_default,
+            Some(local),
+            &policy,
+            "medium",
+            "medium",
+            &loaded.state,
+            true,
+        )
+        .unwrap();
+        assert_eq!(canonical, local);
+        store
+            .update(BuildChannel::Stable, &policy, move |state| {
+                *state = captured;
+                Ok(())
+            })
+            .unwrap();
+
+        let reloaded = store.load(BuildChannel::Stable, &policy).unwrap();
+        let (_, repeated_canonical) = prepare_mutable_state(
+            signed_default,
+            None,
+            &policy,
+            "medium",
+            "medium",
+            &reloaded.state,
+            false,
+        )
+        .unwrap();
+        assert_eq!(repeated_canonical, local);
+        assert_eq!(local.as_slice(), repeated_canonical.as_slice());
+    }
+
+    #[test]
+    fn local_post_game_settlement_keeps_disallowed_change_out_of_store_and_requires_repair() {
+        let install = TestInstall::new();
+        let install_id = Uuid::new_v4();
+        let store = SettingsStore::new(&install.0, install_id);
+        let policy = post_game_policy();
+        let signed_default = b"key_forward:key.keyboard.w\nrenderDistance:8\n";
+        let local = b"key_forward:key.keyboard.w\nrenderDistance:8\ncheat:true\n";
+        let loaded = store.load(BuildChannel::Stable, &policy).unwrap();
+        let (_captured, canonical) = prepare_mutable_state(
+            signed_default,
+            Some(local),
+            &policy,
+            "medium",
+            "medium",
+            &loaded.state,
+            true,
+        )
+        .unwrap();
+        assert_ne!(canonical, local, "unknown content must classify as Repair");
+        assert_eq!(canonical, signed_default);
+
+        let reloaded = store.load(BuildChannel::Stable, &policy).unwrap();
+        assert_eq!(
+            reloaded.generation, 0,
+            "Repair must not persist local state"
+        );
+        let serialized_state = serde_json::to_vec(&reloaded.state).unwrap();
+        assert!(!serialized_state.windows(5).any(|bytes| bytes == b"cheat"));
+        let (_, repair_canonical) = prepare_mutable_state(
+            signed_default,
+            None,
+            &policy,
+            "medium",
+            "medium",
+            &reloaded.state,
+            false,
+        )
+        .unwrap();
+        assert_eq!(repair_canonical, signed_default);
     }
 
     #[tokio::test]

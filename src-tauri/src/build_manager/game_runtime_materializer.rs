@@ -297,7 +297,7 @@ struct ProcessorWorkspaceBinding<'a> {
     java_runtime_lock_sha256: &'a str,
 }
 
-/// Lightweight live-root check for processor steps. The 4,022 official CAS objects were sealed by
+/// Lightweight live-root check for processor steps. The 4,006 official CAS objects were sealed by
 /// `PlannedGameGenerationV2`; each of the 26 processor inputs is independently reopened and hashed
 /// while materializing it. Rehashing the entire ~1 GiB official set before every processor spawn
 /// would add no binding strength and would make status/repair paths unusably expensive.

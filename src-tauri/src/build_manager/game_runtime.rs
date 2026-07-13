@@ -1997,17 +1997,15 @@ mod tests {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // Deliberately do not wait here: the integration test proves the enclosing Job Object
         // terminates this inherited-pipe descendant when its direct parent exits.
-        drop(
-            Command::new(std::env::current_exe().unwrap())
-                .args(child_arguments())
-                .env(CHILD_MODE_ENV, "descendant-sleep")
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn()
-                .unwrap(),
-        );
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(child_arguments())
+            .env(CHILD_MODE_ENV, "descendant-sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .creation_flags(CREATE_NO_WINDOW);
+        drop(crate::build_manager::spawn_command_with_inheritance_lock(&mut command).unwrap());
     }
 
     fn small_output_specs() -> Vec<(&'static str, &'static [u8])> {

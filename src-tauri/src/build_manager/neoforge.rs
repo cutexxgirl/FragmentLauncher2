@@ -48,8 +48,8 @@ pub fn install_client(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let status = command
-        .status()
+    let status = super::process_supervisor::spawn_command_with_inheritance_lock(&mut command)
+        .and_then(|mut child| child.wait())
         .map_err(|error| format!("Не удалось запустить установщик NeoForge: {error}"))?;
     if !status.success() {
         return Err(format!(

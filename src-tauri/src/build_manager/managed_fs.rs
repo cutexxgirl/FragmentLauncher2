@@ -1001,6 +1001,211 @@ impl Seek for ImmutableManagedFile {
     }
 }
 
+/// One-shot recursive structural/stream change detector used across the short server-admission
+/// window. It is armed before the expensive baseline audit and deliberately never reset: any
+/// matching mutation leaves the kernel notification permanently signalled and therefore fails
+/// closed. Default-stream writes are excluded because Windows reports read-only `read_dir` as
+/// `LAST_WRITE`; every admitted exact/mutable file is instead held without share-write. NTFS ADS
+/// creation/write/resize remains covered explicitly by the STREAM_* notification bits.
+///
+/// Win32 does not report changes to the watched directory itself, so root ADS coverage uses a
+/// non-recursive watch on its parent. That notification has no filename and deliberately treats a
+/// sibling stream mutation as dirty too. Production callers must therefore retain the
+/// install-wide operation lock which serializes every launcher-owned sibling for the lease; an
+/// external same-user mutation remains an intentional fail-closed denial of launch.
+#[cfg(windows)]
+pub(super) struct RecursiveChangeSentinel {
+    root: PathBuf,
+    root_info: NodeInfo,
+    root_guard: GuardedDirectoryChain,
+    parent_guard: GuardedDirectoryChain,
+    root_change: StickyChangeNotification,
+    parent_change: StickyChangeNotification,
+}
+
+#[cfg(windows)]
+struct StickyChangeNotification {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+// Kernel change-notification handles may be waited and closed from a different worker thread.
+unsafe impl Send for StickyChangeNotification {}
+
+#[cfg(windows)]
+impl StickyChangeNotification {
+    fn arm(
+        path: &Path,
+        recursive: bool,
+        filter: windows::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE,
+    ) -> ManagedFsResult<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{core::PCWSTR, Win32::Storage::FileSystem::FindFirstChangeNotificationW};
+
+        if !path.is_absolute() {
+            return Err(ManagedFsError::InvalidPath(
+                "Change-notification path is not absolute".into(),
+            ));
+        }
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle =
+            unsafe { FindFirstChangeNotificationW(PCWSTR(wide.as_ptr()), recursive, filter) }
+                .map_err(|error| {
+                    ManagedFsError::io(
+                        "Cannot arm recursive filesystem change notification",
+                        path,
+                        windows_error_to_io(&error),
+                    )
+                })?;
+        Ok(Self { handle })
+    }
+
+    fn require_clean(&self, path: &Path, scope: &str) -> ManagedFsResult<()> {
+        use windows::Win32::{
+            Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::WaitForSingleObject,
+        };
+
+        match unsafe { WaitForSingleObject(self.handle, 0) } {
+            WAIT_TIMEOUT => Ok(()),
+            WAIT_OBJECT_0 => Err(ManagedFsError::UnsafeNode(format!(
+                "Managed filesystem changed after its baseline audit ({scope} notification): {}",
+                path.display(),
+            ))),
+            WAIT_FAILED => Err(ManagedFsError::io(
+                "Cannot poll filesystem change notification",
+                path,
+                std::io::Error::last_os_error(),
+            )),
+            other => Err(ManagedFsError::Unsupported(format!(
+                "Unexpected filesystem change wait result {} for {}",
+                other.0,
+                path.display()
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_signalled(&self, timeout: std::time::Duration) -> bool {
+        use windows::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject};
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        (unsafe { WaitForSingleObject(self.handle, milliseconds) }) == WAIT_OBJECT_0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StickyChangeNotification {
+    fn drop(&mut self) {
+        use windows::Win32::Storage::FileSystem::FindCloseChangeNotification;
+        let _ = unsafe { FindCloseChangeNotification(self.handle) };
+    }
+}
+
+#[cfg(windows)]
+impl RecursiveChangeSentinel {
+    pub(super) fn arm(root: &Path) -> ManagedFsResult<Self> {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_NOTIFY_CHANGE, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+            FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SECURITY,
+            FILE_NOTIFY_CHANGE_SIZE,
+        };
+        // The windows crate version pinned by Tauri does not expose the three NTFS stream filter
+        // constants, but their Win32 ABI values are stable in `winnt.h`.
+        const FILE_NOTIFY_CHANGE_STREAM_NAME_BITS: u32 = 0x0000_0200;
+        const FILE_NOTIFY_CHANGE_STREAM_SIZE_BITS: u32 = 0x0000_0400;
+        const FILE_NOTIFY_CHANGE_STREAM_WRITE_BITS: u32 = 0x0000_0800;
+
+        let root_guard = GuardedDirectoryChain::root_only(root)?;
+        let stable_root = root_guard.leaf().path().to_path_buf();
+        let parent = stable_root.parent().ok_or_else(|| {
+            ManagedFsError::Unsupported("Cannot watch a filesystem root for launch changes".into())
+        })?;
+        let parent_guard = GuardedDirectoryChain::root_only(parent)?;
+        let parent_filter = FILE_NOTIFY_CHANGE(
+            FILE_NOTIFY_CHANGE_DIR_NAME.0
+                | FILE_NOTIFY_CHANGE_ATTRIBUTES.0
+                | FILE_NOTIFY_CHANGE_SECURITY.0
+                // FindFirstChangeNotificationW does not report changes to the watched directory
+                // itself. Root ADS mutations therefore belong to the non-recursive parent watch;
+                // the recursive root watch covers streams on descendants only.
+                | FILE_NOTIFY_CHANGE_STREAM_NAME_BITS
+                | FILE_NOTIFY_CHANGE_STREAM_SIZE_BITS
+                | FILE_NOTIFY_CHANGE_STREAM_WRITE_BITS,
+        );
+        // Arm the parent first so a rename/attribute/security change to the watched root cannot
+        // hide in the small interval before the exact recursive root notification is installed.
+        let parent_change =
+            StickyChangeNotification::arm(parent_guard.leaf().path(), false, parent_filter)?;
+        let root_filter = FILE_NOTIFY_CHANGE(
+            FILE_NOTIFY_CHANGE_FILE_NAME.0
+                | FILE_NOTIFY_CHANGE_DIR_NAME.0
+                | FILE_NOTIFY_CHANGE_ATTRIBUTES.0
+                | FILE_NOTIFY_CHANGE_SIZE.0
+                | FILE_NOTIFY_CHANGE_CREATION.0
+                | FILE_NOTIFY_CHANGE_SECURITY.0
+                | FILE_NOTIFY_CHANGE_STREAM_NAME_BITS
+                | FILE_NOTIFY_CHANGE_STREAM_SIZE_BITS
+                | FILE_NOTIFY_CHANGE_STREAM_WRITE_BITS,
+        );
+        let root_change = StickyChangeNotification::arm(&stable_root, true, root_filter)?;
+        let sentinel = Self {
+            root: stable_root,
+            root_info: root_guard.leaf().info().clone(),
+            root_guard,
+            parent_guard,
+            root_change,
+            parent_change,
+        };
+        sentinel.revalidate_clean()?;
+        Ok(sentinel)
+    }
+
+    /// O(1) sticky-state and root-identity audit. No directory enumeration or file read occurs.
+    pub(super) fn revalidate_clean(&self) -> ManagedFsResult<()> {
+        self.parent_change.require_clean(&self.root, "parent")?;
+        self.root_change
+            .require_clean(&self.root, "recursive root")?;
+        self.parent_guard.revalidate()?;
+        self.root_guard.revalidate()?;
+        let reopened = GuardedDirectoryChain::root_only(&self.root)?;
+        if reopened.leaf().info() != &self.root_info {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed sentinel root metadata changed: {}",
+                self.root.display()
+            )));
+        }
+        self.parent_change.require_clean(&self.root, "parent")?;
+        self.root_change.require_clean(&self.root, "recursive root")
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_until_dirty(&self, timeout: std::time::Duration) -> bool {
+        self.root_change.wait_signalled(timeout) || self.parent_change.wait_signalled(timeout)
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) struct RecursiveChangeSentinel;
+
+#[cfg(not(windows))]
+impl RecursiveChangeSentinel {
+    pub(super) fn arm(_root: &Path) -> ManagedFsResult<Self> {
+        Err(ManagedFsError::Unsupported(
+            "Recursive launch change sentinels require Windows".into(),
+        ))
+    }
+
+    pub(super) fn revalidate_clean(&self) -> ManagedFsResult<()> {
+        Err(ManagedFsError::Unsupported(
+            "Recursive launch change sentinels require Windows".into(),
+        ))
+    }
+}
+
 pub(super) struct ExclusiveManagedFile {
     root: PathBuf,
     relative: RelativeManagedPath,
@@ -5154,6 +5359,219 @@ mod tests {
         assert_ne!(left, right);
     }
 
+    #[cfg(windows)]
+    fn assert_recursive_sentinel_dirty(label: &str, mutate: impl FnOnce(&Path)) {
+        let container = temp_root(&format!("sentinel-{label}"));
+        let root = container.join("instance");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let file = root.join("nested/file.bin");
+        fs::write(&file, b"baseline").unwrap();
+        let original_file_attributes = windows_file_attributes(&file);
+        let original_root_attributes = windows_file_attributes(&root);
+        let sentinel = RecursiveChangeSentinel::arm(&root).unwrap();
+        sentinel.revalidate_clean().unwrap();
+
+        mutate(&root);
+        assert!(
+            sentinel.wait_until_dirty(std::time::Duration::from_secs(2)),
+            "{label} did not signal the recursive change sentinel"
+        );
+        let first = sentinel.revalidate_clean().unwrap_err().to_string();
+        assert!(
+            first.contains("changed after its baseline audit"),
+            "{first}"
+        );
+        assert!(
+            sentinel.revalidate_clean().is_err(),
+            "{label} notification was reset instead of staying sticky"
+        );
+
+        // A read-only mutation is itself expected to dirty the sentinel, but must not make the
+        // test fixture undeletable after the notification handle is closed. Restore the exact
+        // original Win32 attributes rather than broadening permissions.
+        if fs::symlink_metadata(&file).is_ok() {
+            set_windows_file_attributes(&file, original_file_attributes);
+        }
+        if fs::symlink_metadata(&root).is_ok() {
+            set_windows_file_attributes(&root, original_root_attributes);
+        }
+        drop(sentinel);
+        fs::remove_dir_all(&container).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn windows_file_attributes(path: &Path) -> u32 {
+        use std::os::windows::fs::MetadataExt;
+
+        fs::metadata(path).unwrap().file_attributes()
+    }
+
+    #[cfg(windows)]
+    fn set_windows_file_attributes(path: &Path, attributes: u32) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            core::PCWSTR,
+            Win32::Storage::FileSystem::{SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES},
+        };
+
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(attributes)) }
+            .unwrap();
+        assert_eq!(windows_file_attributes(path), attributes);
+    }
+
+    #[cfg(windows)]
+    fn ensure_archive_attribute(path: &Path) -> u32 {
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_ARCHIVE;
+
+        let attributes = windows_file_attributes(path) | FILE_ATTRIBUTE_ARCHIVE.0;
+        set_windows_file_attributes(path, attributes);
+        attributes
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_change_sentinel_ignores_benign_reads_and_closes_on_drop() {
+        let container = temp_root("sentinel-benign-read");
+        let root = container.join("instance");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file.bin"), b"baseline").unwrap();
+        let sentinel = RecursiveChangeSentinel::arm(&root).unwrap();
+
+        assert_eq!(fs::read(root.join("nested/file.bin")).unwrap(), b"baseline");
+        for directory in [&root, &root.join("nested")] {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let _ = fs::symlink_metadata(entry.path()).unwrap();
+            }
+        }
+        sentinel.revalidate_clean().unwrap();
+        assert!(
+            fs::rename(&root, container.join("replacement")).is_err(),
+            "the retained exact-root guard must deny a root path swap"
+        );
+        sentinel.revalidate_clean().unwrap();
+
+        drop(sentinel);
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&container).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_change_sentinel_is_sticky_for_every_launch_mutation_class() {
+        assert_recursive_sentinel_dirty("create", |root| {
+            fs::write(root.join("nested/created.bin"), b"new").unwrap();
+        });
+        assert_recursive_sentinel_dirty("rename", |root| {
+            fs::rename(
+                root.join("nested/file.bin"),
+                root.join("nested/renamed.bin"),
+            )
+            .unwrap();
+        });
+        assert_recursive_sentinel_dirty("delete", |root| {
+            fs::remove_file(root.join("nested/file.bin")).unwrap();
+        });
+        assert_recursive_sentinel_dirty("attributes", |root| {
+            let path = root.join("nested/file.bin");
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        });
+        assert_recursive_sentinel_dirty("named-stream", |root| {
+            let path = root.join("nested/file.bin");
+            fs::write(format!("{}:payload", path.display()), b"hidden").unwrap();
+        });
+        assert_recursive_sentinel_dirty("root-attributes", |root| {
+            let mut permissions = fs::metadata(root).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(root, permissions).unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_change_sentinel_sticks_on_transient_root_stream_with_archive_preset() {
+        use std::{os::windows::fs::MetadataExt, time::Duration};
+
+        let container = temp_root("sentinel-transient-root-stream");
+        let root = container.join("instance");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file.bin"), b"baseline").unwrap();
+
+        let archive_attributes = ensure_archive_attribute(&root);
+
+        let sentinel = RecursiveChangeSentinel::arm(&root).unwrap();
+        sentinel.revalidate_clean().unwrap();
+        let mut stream = root.as_os_str().to_os_string();
+        stream.push(":payload");
+        let stream = PathBuf::from(stream);
+        fs::write(&stream, b"transient hidden payload").unwrap();
+        fs::remove_file(&stream).unwrap();
+
+        assert_eq!(
+            fs::metadata(&root).unwrap().file_attributes(),
+            archive_attributes,
+            "the sticky proof must come from STREAM_* rather than an Archive-bit transition"
+        );
+        assert!(!stream.exists(), "the injected stream must already be gone");
+        assert!(
+            sentinel
+                .parent_change
+                .wait_signalled(Duration::from_secs(2)),
+            "the parent STREAM_* watch must observe a transient ADS on the watched root"
+        );
+        assert!(sentinel.revalidate_clean().is_err());
+        assert!(
+            sentinel.revalidate_clean().is_err(),
+            "a transient root stream notification must remain sticky"
+        );
+
+        drop(sentinel);
+        fs::remove_dir_all(&container).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_change_sentinel_fails_closed_on_sibling_stream_in_lease_parent() {
+        use std::{os::windows::fs::MetadataExt, time::Duration};
+
+        let container = temp_root("sentinel-sibling-stream");
+        let parent = container.join("exclusive-parent");
+        let root = parent.join("instance");
+        let sibling = parent.join("sibling.bin");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file.bin"), b"baseline").unwrap();
+        fs::write(&sibling, b"sibling").unwrap();
+        let sibling_attributes = ensure_archive_attribute(&sibling);
+
+        let sentinel = RecursiveChangeSentinel::arm(&root).unwrap();
+        sentinel.revalidate_clean().unwrap();
+        let mut stream = sibling.as_os_str().to_os_string();
+        stream.push(":payload");
+        let stream = PathBuf::from(stream);
+        fs::write(&stream, b"transient sibling payload").unwrap();
+        fs::remove_file(&stream).unwrap();
+
+        assert_eq!(
+            fs::metadata(&sibling).unwrap().file_attributes(),
+            sibling_attributes,
+            "the parent proof must come from STREAM_* rather than an Archive-bit transition"
+        );
+        assert!(
+            sentinel
+                .parent_change
+                .wait_signalled(Duration::from_secs(2)),
+            "a sibling stream in the serialized lease parent must fail closed"
+        );
+        assert!(sentinel.revalidate_clean().is_err());
+
+        drop(sentinel);
+        fs::remove_dir_all(&container).unwrap();
+    }
+
     #[test]
     fn ensure_directory_chain_creates_and_guards_each_component() {
         let root = temp_root("ensure-directory");
@@ -5887,7 +6305,6 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[allow(clippy::permissions_set_readonly_false)]
     fn bounded_recursive_removal_rejects_unsafe_descendants_without_partial_deletion() {
         // Hard links are rejected even when both names are inside the otherwise-safe tree.
         let (root, relative, identity) = recursive_removal_fixture("bounded-tree-hardlink");
@@ -5930,9 +6347,10 @@ mod tests {
         // later sibling can never be the first place that reveals the attribute.
         let (root, relative, identity) = recursive_removal_fixture("bounded-tree-readonly");
         let read_only = relative.join_to(&root).join("root.bin");
-        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&read_only, permissions).unwrap();
+        let original_attributes = windows_file_attributes(&read_only);
+        let read_only_attributes =
+            original_attributes | windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY.0;
+        set_windows_file_attributes(&read_only, read_only_attributes);
         assert!(remove_bounded_managed_directory_tree(
             &root,
             &relative,
@@ -5944,9 +6362,7 @@ mod tests {
             fs::read(relative.join_to(&root).join("nested/child.bin")).unwrap(),
             b"child"
         );
-        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(&read_only, permissions).unwrap();
+        set_windows_file_attributes(&read_only, original_attributes);
         fs::remove_dir_all(&root).unwrap();
 
         // Symlink creation is privilege-dependent on Windows developer mode. When available, a
@@ -6692,9 +7108,16 @@ mod tests {
         fs::write(root.join("instances/locked.jar"), b"locked").unwrap();
         let relative = RelativeManagedPath::new("instances/locked.jar").unwrap();
         let immutable = ImmutableManagedFile::open(&root, &relative).unwrap();
-        let writer = OpenOptions::new().write(true).open(relative.join_to(&root));
+        let path = relative.join_to(&root);
+        let writer = OpenOptions::new().write(true).open(&path);
         assert!(writer.is_err());
+        // NTFS share access is per stream. The base handle cannot prevent creation of a new ADS,
+        // so launch code additionally retains the recursive STREAM_* notification sentinel.
+        fs::write(format!("{}:payload", path.display()), b"hidden").unwrap();
+        assert!(immutable.revalidate().is_err());
         drop(immutable);
+        fs::write(&path, b"change").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"change");
         fs::remove_dir_all(root).unwrap();
     }
 

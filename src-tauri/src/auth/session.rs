@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::path::PathBuf;
 
-use tokio::sync::Mutex;
+use jiff::Timestamp;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use uuid::Uuid;
 
 use super::client::{ApiError, AuthApi, FragmentApiClient};
 #[cfg(windows)]
@@ -15,8 +18,9 @@ use super::process_lock::WindowsRefreshProcessLock;
 use super::process_lock::{ProcessLockError, RefreshProcessLease, RefreshProcessLock};
 use super::types::{
     normalize_device_name, normalize_nickname, validate_refresh_token, AdmissionChannel,
-    AuthSnapshot, ContractError, LauncherAdmissionSnapshot, LauncherProfile, Secret,
-    SessionResponse, TelegramLoginSnapshot, TelegramPollOutcome, TelegramPollSnapshot,
+    AuthSnapshot, ContractError, LauncherAdmissionReason, LauncherAdmissionResponse,
+    LauncherAdmissionSnapshot, LauncherProfile, Secret, SessionResponse, TelegramLoginSnapshot,
+    TelegramPollOutcome, TelegramPollSnapshot, VerifiedLaunchAdmission,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -41,10 +45,28 @@ pub enum AuthError {
     SessionChanged,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LaunchAdmissionError {
+    #[error("Fragment launch admission was denied ({0:?})")]
+    Denied(LauncherAdmissionReason),
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NativeAccessFailure {
     Authentication,
     Failed(String),
+}
+
+enum AdmissionRequestError {
+    Auth(AuthError),
+    Api(ApiError),
+}
+
+enum SessionBoundRequestError {
+    Auth(AuthError),
+    Api(ApiError),
 }
 
 impl AuthError {
@@ -62,7 +84,7 @@ pub struct AuthSessionManager {
     link_opener: Arc<dyn TelegramLinkOpener>,
     process_lock: Arc<dyn RefreshProcessLock>,
     state: Mutex<SessionState>,
-    refresh_gate: Mutex<()>,
+    refresh_gate: Arc<Mutex<()>>,
     poll_gate: Mutex<()>,
 }
 
@@ -90,6 +112,35 @@ impl std::fmt::Debug for NativeAccessToken {
     }
 }
 
+/// Native-only linearization lease for the final FragmentApi decision and one exact process
+/// creation. It deliberately owns both session lifecycle locks and is neither cloneable nor
+/// serializable, so logout, refresh, account replacement and nickname mutation cannot cross the
+/// admission-to-CreateProcess boundary.
+#[must_use = "the admission lease must remain alive until CreateProcess returns"]
+pub(crate) struct LaunchAdmissionLease {
+    admission: VerifiedLaunchAdmission,
+    _local_lifecycle: OwnedMutexGuard<()>,
+    _process_lifecycle: RefreshProcessLease,
+}
+
+impl LaunchAdmissionLease {
+    pub(crate) const fn channel(&self) -> AdmissionChannel {
+        self.admission.channel()
+    }
+
+    pub(crate) fn minecraft_uuid(&self) -> String {
+        self.admission.minecraft_uuid()
+    }
+
+    pub(crate) fn launcher_nick(&self) -> &str {
+        self.admission.launcher_nick()
+    }
+
+    pub(crate) fn revalidate_fresh(&self, now: Timestamp) -> Result<(), AuthError> {
+        self.admission.revalidate_fresh(now)
+    }
+}
+
 struct SessionState {
     access: Option<AccessSession>,
     profile: Option<LauncherProfile>,
@@ -99,6 +150,12 @@ struct SessionState {
 struct AccessSession {
     token: Arc<Secret>,
     refresh_at: Instant,
+    refresh_fingerprint: [u8; 32],
+}
+
+struct LockedSessionIdentity {
+    user_id: Uuid,
+    launcher_nick: Option<String>,
 }
 
 struct ChallengeState {
@@ -238,7 +295,7 @@ impl AuthSessionManager {
                 profile: None,
                 challenge: None,
             }),
-            refresh_gate: Mutex::new(()),
+            refresh_gate: Arc::new(Mutex::new(())),
             poll_gate: Mutex::new(()),
         }
     }
@@ -396,17 +453,52 @@ impl AuthSessionManager {
     /// Refreshes `/auth/me`, retrying exactly once after a 401 with a
     /// single-flight refresh-token rotation.
     pub async fn refresh_profile(self: &Arc<Self>) -> Result<AuthSnapshot, AuthError> {
-        let first = self.access_for_request().await?;
-        let (profile, used_token) = match self.api.get_profile(&first).await {
-            Ok(profile) => (profile, first),
-            Err(error) if error.is_unauthorized() => {
-                let second = self.refresh_access(Some(&first), true).await?;
-                (self.api.get_profile(&second).await?, second)
+        let mut token = self.access_for_request().await?;
+        let mut retried = false;
+        loop {
+            match self.refresh_profile_under_lifecycle(&token).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(SessionBoundRequestError::Api(error))
+                    if error.is_unauthorized() && !retried =>
+                {
+                    retried = true;
+                    token = self.refresh_access(Some(&token), true).await?;
+                }
+                Err(SessionBoundRequestError::Auth(
+                    AuthError::SessionChanged | AuthError::CredentialChanged,
+                )) if !retried => {
+                    retried = true;
+                    token = self.refresh_access(Some(&token), true).await?;
+                }
+                Err(SessionBoundRequestError::Api(error)) => return Err(error.into()),
+                Err(SessionBoundRequestError::Auth(error)) => return Err(error),
             }
-            Err(error) => return Err(error.into()),
-        };
-        self.snapshot_after_profile_response(&used_token, profile)
+        }
+    }
+
+    async fn refresh_profile_under_lifecycle(
+        self: &Arc<Self>,
+        token: &Arc<Secret>,
+    ) -> Result<AuthSnapshot, SessionBoundRequestError> {
+        let _local_lifecycle = Arc::clone(&self.refresh_gate).lock_owned().await;
+        let _process_lifecycle = self
+            .process_lock
+            .acquire()
             .await
+            .map_err(AuthError::from)
+            .map_err(SessionBoundRequestError::Auth)?;
+        let identity = self
+            .recheck_locked_session(token)
+            .await
+            .map_err(SessionBoundRequestError::Auth)?;
+        let profile = self
+            .api
+            .get_profile(token)
+            .await
+            .map_err(SessionBoundRequestError::Api)?;
+        self.commit_profile_response(token, identity.user_id, profile)
+            .await
+            .map_err(SessionBoundRequestError::Auth)
     }
 
     /// Updates the launcher nickname through a native authenticated PATCH,
@@ -416,72 +508,275 @@ impl AuthSessionManager {
         nickname: Option<&str>,
     ) -> Result<AuthSnapshot, AuthError> {
         let nickname = normalize_nickname(nickname)?;
-        let first = self.access_for_request().await?;
-        let (profile, used_token) =
-            match self.api.update_nickname(&first, nickname.as_deref()).await {
-                Ok(profile) => (profile, first),
-                Err(error) if error.is_unauthorized() => {
-                    let second = self.refresh_access(Some(&first), true).await?;
-                    (
-                        self.api
-                            .update_nickname(&second, nickname.as_deref())
-                            .await?,
-                        second,
-                    )
+        let mut token = self.access_for_request().await?;
+        let mut retried = false;
+        loop {
+            match self
+                .update_nickname_under_lifecycle(&token, nickname.as_deref())
+                .await
+            {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(SessionBoundRequestError::Api(error))
+                    if error.is_unauthorized() && !retried =>
+                {
+                    retried = true;
+                    token = self.refresh_access(Some(&token), true).await?;
                 }
-                Err(error) => return Err(error.into()),
-            };
-        self.snapshot_after_profile_response(&used_token, profile)
-            .await
+                Err(SessionBoundRequestError::Auth(
+                    AuthError::SessionChanged | AuthError::CredentialChanged,
+                )) if !retried => {
+                    retried = true;
+                    token = self.refresh_access(Some(&token), true).await?;
+                }
+                Err(SessionBoundRequestError::Api(error)) => return Err(error.into()),
+                Err(SessionBoundRequestError::Auth(error)) => return Err(error),
+            }
+        }
     }
 
-    /// Performs the authoritative FragmentApi admission check for a future
-    /// launch. The access token never leaves native memory. A real spawn command
-    /// must call this again immediately before creating the Java process.
-    pub async fn admission(
+    async fn update_nickname_under_lifecycle(
         self: &Arc<Self>,
-        channel: AdmissionChannel,
-    ) -> Result<LauncherAdmissionSnapshot, AuthError> {
-        let first = self.access_for_request().await?;
-        let (response, used_token) = match self.api.launcher_admission(&first, channel).await {
-            Ok(response) => (response, first),
-            Err(error) if error.is_unauthorized() => {
-                let second = match self.refresh_access(Some(&first), true).await {
-                    Ok(token) => token,
-                    Err(AuthError::SignedOut) => {
-                        return Ok(LauncherAdmissionSnapshot::denied(
-                            channel,
-                            super::types::LauncherAdmissionReason::InvalidSession,
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                };
-                match self.api.launcher_admission(&second, channel).await {
-                    Ok(response) => (response, second),
-                    Err(error) => return admission_failure(channel, error),
-                }
-            }
-            Err(error) => return admission_failure(channel, error),
-        };
+        token: &Arc<Secret>,
+        nickname: Option<&str>,
+    ) -> Result<AuthSnapshot, SessionBoundRequestError> {
+        let _local_lifecycle = Arc::clone(&self.refresh_gate).lock_owned().await;
+        let _process_lifecycle = self
+            .process_lock
+            .acquire()
+            .await
+            .map_err(AuthError::from)
+            .map_err(SessionBoundRequestError::Auth)?;
+        let identity = self
+            .recheck_locked_session(token)
+            .await
+            .map_err(SessionBoundRequestError::Auth)?;
+        let profile = self
+            .api
+            .update_nickname(token, nickname)
+            .await
+            .map_err(SessionBoundRequestError::Api)?;
 
         let mut state = self.state.lock().await;
         if !state
             .access
             .as_ref()
-            .is_some_and(|access| Arc::ptr_eq(&used_token, &access.token))
+            .is_some_and(|access| Arc::ptr_eq(token, &access.token))
+        {
+            return Err(SessionBoundRequestError::Auth(AuthError::SessionChanged));
+        }
+        profile
+            .validate()
+            .map_err(AuthError::from)
+            .map_err(SessionBoundRequestError::Auth)?;
+        let response_user_id = Uuid::parse_str(&profile.user_id)
+            .map_err(|_| AuthError::from(ContractError::InvalidField("userId")))
+            .map_err(SessionBoundRequestError::Auth)?;
+        if response_user_id != identity.user_id {
+            return Err(SessionBoundRequestError::Auth(AuthError::from(
+                ContractError::InvalidField("userId"),
+            )));
+        }
+        if profile.launcher_nick.as_deref() != nickname {
+            return Err(SessionBoundRequestError::Auth(AuthError::from(
+                ContractError::InvalidField("launcherNick"),
+            )));
+        }
+        state.profile = Some(profile);
+        Ok(state
+            .profile
+            .clone()
+            .map(AuthSnapshot::authenticated)
+            .unwrap_or_else(AuthSnapshot::signed_out))
+    }
+
+    /// Performs a UI-facing admission preview. The final Java spawn path must use
+    /// `launch_admission`, which requests a non-cacheable live decision.
+    pub async fn admission(
+        self: &Arc<Self>,
+        channel: AdmissionChannel,
+    ) -> Result<LauncherAdmissionSnapshot, AuthError> {
+        let (response, used_token) = match self.request_launcher_admission(channel).await {
+            Ok(result) => result,
+            Err(AdmissionRequestError::Auth(AuthError::SignedOut)) => {
+                return Ok(LauncherAdmissionSnapshot::denied(
+                    channel,
+                    super::types::LauncherAdmissionReason::InvalidSession,
+                ));
+            }
+            Err(AdmissionRequestError::Auth(error)) => return Err(error),
+            Err(AdmissionRequestError::Api(error)) => return admission_failure(channel, error),
+        };
+
+        let profile = self
+            .derive_admission_profile(&used_token, &response)
+            .await?;
+        Ok(LauncherAdmissionSnapshot::allowed(channel, profile))
+    }
+
+    /// Returns a non-cloneable admission lease for exactly one immediate process creation. The
+    /// final versioned FragmentApi request runs while both lifecycle locks are held, and the locks
+    /// remain owned by the returned value through CreateProcess.
+    pub(crate) async fn launch_admission(
+        self: &Arc<Self>,
+        channel: AdmissionChannel,
+    ) -> Result<LaunchAdmissionLease, LaunchAdmissionError> {
+        let mut token = self
+            .access_for_request()
+            .await
+            .map_err(launch_auth_failure)?;
+        let mut retried = false;
+        loop {
+            match self.launch_admission_under_lifecycle(&token, channel).await {
+                Ok(lease) => return Ok(lease),
+                Err(SessionBoundRequestError::Api(error))
+                    if error.is_unauthorized() && !retried =>
+                {
+                    retried = true;
+                    token = self
+                        .refresh_access(Some(&token), true)
+                        .await
+                        .map_err(launch_auth_failure)?;
+                }
+                Err(SessionBoundRequestError::Auth(
+                    AuthError::SessionChanged | AuthError::CredentialChanged,
+                )) if !retried => {
+                    retried = true;
+                    token = self
+                        .refresh_access(Some(&token), true)
+                        .await
+                        .map_err(launch_auth_failure)?;
+                }
+                Err(SessionBoundRequestError::Api(error)) => {
+                    return Err(launch_admission_failure(error));
+                }
+                Err(SessionBoundRequestError::Auth(error)) => {
+                    return Err(launch_auth_failure(error));
+                }
+            }
+        }
+    }
+
+    async fn launch_admission_under_lifecycle(
+        self: &Arc<Self>,
+        token: &Arc<Secret>,
+        channel: AdmissionChannel,
+    ) -> Result<LaunchAdmissionLease, SessionBoundRequestError> {
+        let local_lifecycle = Arc::clone(&self.refresh_gate).lock_owned().await;
+        let process_lifecycle = self
+            .process_lock
+            .acquire()
+            .await
+            .map_err(AuthError::from)
+            .map_err(SessionBoundRequestError::Auth)?;
+        let identity = self
+            .recheck_locked_session(token)
+            .await
+            .map_err(SessionBoundRequestError::Auth)?;
+
+        let response = self
+            .api
+            .launcher_spawn_admission_v1(token, channel)
+            .await
+            .map_err(SessionBoundRequestError::Api)?;
+
+        // From the successful response to returning the lease there is deliberately no await:
+        // the checked token/user/nickname generation and both lifecycle guards remain exact.
+        let admission = VerifiedLaunchAdmission::from_response(response, channel, Timestamp::now())
+            .map_err(AuthError::from)
+            .map_err(SessionBoundRequestError::Auth)?;
+        if admission.user_id() != identity.user_id
+            || identity.launcher_nick.as_deref() != Some(admission.launcher_nick())
+        {
+            return Err(SessionBoundRequestError::Auth(AuthError::SessionChanged));
+        }
+        Ok(LaunchAdmissionLease {
+            admission,
+            _local_lifecycle: local_lifecycle,
+            _process_lifecycle: process_lifecycle,
+        })
+    }
+
+    async fn request_launcher_admission(
+        self: &Arc<Self>,
+        channel: AdmissionChannel,
+    ) -> Result<(LauncherAdmissionResponse, Arc<Secret>), AdmissionRequestError> {
+        let first = self
+            .access_for_request()
+            .await
+            .map_err(AdmissionRequestError::Auth)?;
+        match self.api.launcher_admission(&first, channel).await {
+            Ok(response) => Ok((response, first)),
+            Err(error) if error.is_unauthorized() => {
+                let second = self
+                    .refresh_access(Some(&first), true)
+                    .await
+                    .map_err(AdmissionRequestError::Auth)?;
+                self.api
+                    .launcher_admission(&second, channel)
+                    .await
+                    .map(|response| (response, second))
+                    .map_err(AdmissionRequestError::Api)
+            }
+            Err(error) => Err(AdmissionRequestError::Api(error)),
+        }
+    }
+
+    async fn derive_admission_profile(
+        &self,
+        used_token: &Arc<Secret>,
+        response: &LauncherAdmissionResponse,
+    ) -> Result<LauncherProfile, AuthError> {
+        let state = self.state.lock().await;
+        if !state
+            .access
+            .as_ref()
+            .is_some_and(|access| Arc::ptr_eq(used_token, &access.token))
         {
             return Err(AuthError::SessionChanged);
         }
-        let profile = state.profile.as_mut().ok_or(AuthError::SessionChanged)?;
+        let mut profile = state.profile.clone().ok_or(AuthError::SessionChanged)?;
         if profile.user_id != response.user_id {
             return Err(ContractError::InvalidField("userId").into());
         }
-        profile.launcher_nick = Some(response.launcher_nick);
+        profile.launcher_nick = Some(response.launcher_nick.clone());
         profile.launcher_role = response.launcher_role;
-        profile.launcher_permissions = response.launcher_permissions;
+        profile.launcher_permissions = response.launcher_permissions.clone();
         profile.subscription_level = response.entitlement.level;
-        profile.entitlement = response.entitlement;
-        Ok(LauncherAdmissionSnapshot::allowed(channel, profile.clone()))
+        profile.entitlement = response.entitlement.clone();
+        Ok(profile)
+    }
+
+    /// Must only be called while the caller owns both `refresh_gate` and `process_lock`.
+    /// The persisted credential fingerprint binds the RAM access token/profile to the exact
+    /// cross-process session generation which won the most recent refresh-token rotation.
+    async fn recheck_locked_session(
+        &self,
+        token: &Arc<Secret>,
+    ) -> Result<LockedSessionIdentity, AuthError> {
+        let persisted = self
+            .credentials
+            .load()
+            .await?
+            .ok_or(AuthError::CredentialChanged)?;
+        validate_refresh_token(&persisted).map_err(|_| AuthError::CredentialChanged)?;
+        let persisted_fingerprint = refresh_fingerprint(&persisted);
+
+        let state = self.state.lock().await;
+        let access = state.access.as_ref().ok_or(AuthError::SessionChanged)?;
+        if !Arc::ptr_eq(token, &access.token) {
+            return Err(AuthError::SessionChanged);
+        }
+        if access.refresh_fingerprint != persisted_fingerprint {
+            return Err(AuthError::CredentialChanged);
+        }
+        let profile = state.profile.as_ref().ok_or(AuthError::SessionChanged)?;
+        profile.validate().map_err(AuthError::from)?;
+        let user_id = Uuid::parse_str(&profile.user_id)
+            .map_err(|_| AuthError::from(ContractError::InvalidField("userId")))?;
+        Ok(LockedSessionIdentity {
+            user_id,
+            launcher_nick: profile.launcher_nick.clone(),
+        })
     }
 
     /// Revokes the server session when possible, then removes local credentials
@@ -582,6 +877,7 @@ impl AuthSessionManager {
         expected_refresh: Option<&Secret>,
         _process_lease: RefreshProcessLease,
     ) -> Result<Arc<Secret>, AuthError> {
+        let refresh_fingerprint = refresh_fingerprint(&response.refresh_token);
         match self
             .credentials
             .replace_if_current(expected_refresh, &response.refresh_token)
@@ -615,15 +911,23 @@ impl AuthSessionManager {
         state.access = Some(AccessSession {
             token: Arc::clone(&token),
             refresh_at: Instant::now() + Duration::from_secs(refresh_after),
+            refresh_fingerprint,
         });
         Ok(token)
     }
 
-    async fn snapshot_after_profile_response(
+    async fn commit_profile_response(
         &self,
         token: &Arc<Secret>,
+        expected_user_id: Uuid,
         profile: LauncherProfile,
     ) -> Result<AuthSnapshot, AuthError> {
+        profile.validate().map_err(AuthError::from)?;
+        let response_user_id = Uuid::parse_str(&profile.user_id)
+            .map_err(|_| AuthError::from(ContractError::InvalidField("userId")))?;
+        if response_user_id != expected_user_id {
+            return Err(AuthError::from(ContractError::InvalidField("userId")));
+        }
         let mut state = self.state.lock().await;
         if !state
             .access
@@ -670,6 +974,29 @@ fn admission_failure(
     }
 }
 
+fn launch_admission_failure(error: ApiError) -> LaunchAdmissionError {
+    if error.is_unauthorized() {
+        LaunchAdmissionError::Denied(LauncherAdmissionReason::InvalidSession)
+    } else if let Some(reason) = error.admission_reason() {
+        LaunchAdmissionError::Denied(reason)
+    } else {
+        LaunchAdmissionError::Auth(error.into())
+    }
+}
+
+fn launch_auth_failure(error: AuthError) -> LaunchAdmissionError {
+    match error {
+        AuthError::SignedOut => {
+            LaunchAdmissionError::Denied(LauncherAdmissionReason::InvalidSession)
+        }
+        other => LaunchAdmissionError::Auth(other),
+    }
+}
+
+fn refresh_fingerprint(refresh: &Secret) -> [u8; 32] {
+    Sha256::digest(refresh.expose().as_bytes()).into()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -678,10 +1005,12 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use jiff::SignedDuration;
 
     use super::*;
     use crate::auth::credential_store::MemoryCredentialStore;
     use crate::auth::process_lock::{MemoryRefreshProcessLock, ProcessLockError};
+    use crate::auth::types::LauncherSpawnAdmissionResponse;
     use crate::auth::types::{
         EntitlementSnapshot, LauncherAdmissionReason, LauncherAdmissionResponse, LauncherRole,
         PollStatus, SubscriptionLevel, TelegramChallengeResponse, TokenType,
@@ -692,14 +1021,36 @@ mod tests {
         active_refreshes: AtomicUsize,
         max_active_refreshes: AtomicUsize,
         profile_gets: AtomicUsize,
+        nickname_calls: AtomicUsize,
         admission_calls: AtomicUsize,
+        spawn_admission_calls: AtomicUsize,
         logouts: AtomicUsize,
         confirm_next_poll: AtomicBool,
         reject_next_get: AtomicBool,
+        reject_all_get: AtomicBool,
         reject_next_refresh: AtomicBool,
+        reject_next_nickname: AtomicBool,
+        reject_all_nickname: AtomicBool,
         reject_next_admission: AtomicBool,
+        reject_all_admissions: AtomicBool,
         fail_logout: AtomicBool,
         admission_error: std::sync::Mutex<Option<&'static str>>,
+        admission_timestamp: std::sync::Mutex<Option<String>>,
+        gate_next_admission: AtomicBool,
+        admission_started: tokio::sync::Notify,
+        allow_admission: tokio::sync::Notify,
+        gate_next_nickname: AtomicBool,
+        nickname_started: tokio::sync::Notify,
+        allow_nickname: tokio::sync::Notify,
+        gate_next_profile_get: AtomicBool,
+        profile_get_started: tokio::sync::Notify,
+        allow_profile_get: tokio::sync::Notify,
+        current_nickname: std::sync::Mutex<Option<String>>,
+        scripted_patch_response_nicknames: std::sync::Mutex<VecDeque<Option<String>>>,
+        spawn_access_generations: std::sync::Mutex<Vec<usize>>,
+        spawn_purpose: std::sync::Mutex<String>,
+        spawn_contract_version: std::sync::Mutex<u32>,
+        scripted_spawn_nicknames: std::sync::Mutex<VecDeque<String>>,
         scripted_expires_in: std::sync::Mutex<VecDeque<u64>>,
     }
 
@@ -791,20 +1142,179 @@ mod tests {
                 active_refreshes: AtomicUsize::new(0),
                 max_active_refreshes: AtomicUsize::new(0),
                 profile_gets: AtomicUsize::new(0),
+                nickname_calls: AtomicUsize::new(0),
                 admission_calls: AtomicUsize::new(0),
+                spawn_admission_calls: AtomicUsize::new(0),
                 logouts: AtomicUsize::new(0),
                 confirm_next_poll: AtomicBool::new(false),
                 reject_next_get: AtomicBool::new(false),
+                reject_all_get: AtomicBool::new(false),
                 reject_next_refresh: AtomicBool::new(false),
+                reject_next_nickname: AtomicBool::new(false),
+                reject_all_nickname: AtomicBool::new(false),
                 reject_next_admission: AtomicBool::new(false),
+                reject_all_admissions: AtomicBool::new(false),
                 fail_logout: AtomicBool::new(false),
                 admission_error: std::sync::Mutex::new(None),
+                admission_timestamp: std::sync::Mutex::new(None),
+                gate_next_admission: AtomicBool::new(false),
+                admission_started: tokio::sync::Notify::new(),
+                allow_admission: tokio::sync::Notify::new(),
+                gate_next_nickname: AtomicBool::new(false),
+                nickname_started: tokio::sync::Notify::new(),
+                allow_nickname: tokio::sync::Notify::new(),
+                gate_next_profile_get: AtomicBool::new(false),
+                profile_get_started: tokio::sync::Notify::new(),
+                allow_profile_get: tokio::sync::Notify::new(),
+                current_nickname: std::sync::Mutex::new(Some("Player_1".into())),
+                scripted_patch_response_nicknames: std::sync::Mutex::new(VecDeque::new()),
+                spawn_access_generations: std::sync::Mutex::new(Vec::new()),
+                spawn_purpose: std::sync::Mutex::new(
+                    super::super::types::LAUNCH_SPAWN_PURPOSE.into(),
+                ),
+                spawn_contract_version: std::sync::Mutex::new(
+                    super::super::types::LAUNCH_SPAWN_CONTRACT_VERSION,
+                ),
+                scripted_spawn_nicknames: std::sync::Mutex::new(VecDeque::new()),
                 scripted_expires_in: std::sync::Mutex::new(VecDeque::new()),
             }
         }
 
         fn script_expires_in(&self, values: impl IntoIterator<Item = u64>) {
             self.scripted_expires_in.lock().unwrap().extend(values);
+        }
+
+        fn set_admission_timestamp(&self, value: impl Into<String>) {
+            *self.admission_timestamp.lock().unwrap() = Some(value.into());
+        }
+
+        fn arm_next_admission(&self) {
+            assert!(!self.gate_next_admission.swap(true, Ordering::AcqRel));
+        }
+
+        async fn wait_until_admission_started(&self) {
+            if !self.gate_next_admission.load(Ordering::Acquire) {
+                return;
+            }
+            loop {
+                let notified = self.admission_started.notified();
+                if !self.gate_next_admission.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_admission(&self) {
+            self.allow_admission.notify_one();
+        }
+
+        fn arm_next_nickname(&self) {
+            assert!(!self.gate_next_nickname.swap(true, Ordering::AcqRel));
+        }
+
+        async fn wait_until_nickname_started(&self) {
+            if !self.gate_next_nickname.load(Ordering::Acquire) {
+                return;
+            }
+            loop {
+                let notified = self.nickname_started.notified();
+                if !self.gate_next_nickname.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_nickname(&self) {
+            self.allow_nickname.notify_one();
+        }
+
+        fn arm_next_profile_get(&self) {
+            assert!(!self.gate_next_profile_get.swap(true, Ordering::AcqRel));
+        }
+
+        async fn wait_until_profile_get_started(&self) {
+            if !self.gate_next_profile_get.load(Ordering::Acquire) {
+                return;
+            }
+            loop {
+                let notified = self.profile_get_started.notified();
+                if !self.gate_next_profile_get.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_profile_get(&self) {
+            self.allow_profile_get.notify_one();
+        }
+
+        fn script_patch_response_nicknames(
+            &self,
+            values: impl IntoIterator<Item = Option<&'static str>>,
+        ) {
+            self.scripted_patch_response_nicknames
+                .lock()
+                .unwrap()
+                .extend(values.into_iter().map(|value| value.map(str::to_owned)));
+        }
+
+        fn current_profile(&self) -> LauncherProfile {
+            let mut profile = profile();
+            profile.launcher_nick = self.current_nickname.lock().unwrap().clone();
+            profile
+        }
+
+        fn set_spawn_proof(&self, purpose: &str, contract_version: u32) {
+            *self.spawn_purpose.lock().unwrap() = purpose.to_owned();
+            *self.spawn_contract_version.lock().unwrap() = contract_version;
+        }
+
+        fn script_spawn_nicknames(&self, values: impl IntoIterator<Item = &'static str>) {
+            self.scripted_spawn_nicknames
+                .lock()
+                .unwrap()
+                .extend(values.into_iter().map(str::to_owned));
+        }
+
+        async fn before_admission(
+            &self,
+            access_token: &Secret,
+            spawn: bool,
+        ) -> Result<(), ApiError> {
+            self.admission_calls.fetch_add(1, Ordering::SeqCst);
+            if spawn {
+                self.spawn_admission_calls.fetch_add(1, Ordering::SeqCst);
+                let generation = access_token
+                    .expose()
+                    .split('-')
+                    .nth(1)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(usize::MAX);
+                self.spawn_access_generations
+                    .lock()
+                    .unwrap()
+                    .push(generation);
+            }
+            if self.gate_next_admission.swap(false, Ordering::AcqRel) {
+                self.admission_started.notify_one();
+                self.allow_admission.notified().await;
+            }
+            if self.reject_all_admissions.load(Ordering::SeqCst)
+                || self.reject_next_admission.swap(false, Ordering::SeqCst)
+            {
+                return Err(ApiError::Unauthorized);
+            }
+            if let Some(code) = *self.admission_error.lock().unwrap() {
+                return Err(ApiError::Http {
+                    status: 403,
+                    code: Some(code.into()),
+                    message: String::new(),
+                });
+            }
+            Ok(())
         }
 
         fn session(&self) -> SessionResponse {
@@ -821,7 +1331,7 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .unwrap_or(900),
-                profile: profile(),
+                profile: self.current_profile(),
             }
         }
     }
@@ -883,42 +1393,94 @@ mod tests {
 
         async fn get_profile(&self, _access_token: &Secret) -> Result<LauncherProfile, ApiError> {
             self.profile_gets.fetch_add(1, Ordering::SeqCst);
-            if self.reject_next_get.swap(false, Ordering::SeqCst) {
+            let response = self.current_profile();
+            if self.gate_next_profile_get.swap(false, Ordering::AcqRel) {
+                self.profile_get_started.notify_one();
+                self.allow_profile_get.notified().await;
+            }
+            if self.reject_all_get.load(Ordering::SeqCst)
+                || self.reject_next_get.swap(false, Ordering::SeqCst)
+            {
                 Err(ApiError::Unauthorized)
             } else {
-                Ok(profile())
+                Ok(response)
             }
         }
 
         async fn update_nickname(
             &self,
             _access_token: &Secret,
-            _nickname: Option<&str>,
+            nickname: Option<&str>,
         ) -> Result<LauncherProfile, ApiError> {
-            Ok(profile())
+            self.nickname_calls.fetch_add(1, Ordering::SeqCst);
+            if self.gate_next_nickname.swap(false, Ordering::AcqRel) {
+                self.nickname_started.notify_one();
+                self.allow_nickname.notified().await;
+            }
+            if self.reject_all_nickname.load(Ordering::SeqCst)
+                || self.reject_next_nickname.swap(false, Ordering::SeqCst)
+            {
+                return Err(ApiError::Unauthorized);
+            }
+            *self.current_nickname.lock().unwrap() = nickname.map(str::to_owned);
+            let mut response = self.current_profile();
+            if let Some(scripted) = self
+                .scripted_patch_response_nicknames
+                .lock()
+                .unwrap()
+                .pop_front()
+            {
+                response.launcher_nick = scripted;
+            }
+            Ok(response)
         }
 
         async fn launcher_admission(
             &self,
-            _access_token: &Secret,
+            access_token: &Secret,
             channel: AdmissionChannel,
         ) -> Result<LauncherAdmissionResponse, ApiError> {
-            self.admission_calls.fetch_add(1, Ordering::SeqCst);
-            if self.reject_next_admission.swap(false, Ordering::SeqCst) {
-                return Err(ApiError::Unauthorized);
-            }
-            if let Some(code) = *self.admission_error.lock().unwrap() {
-                return Err(ApiError::Http {
-                    status: 403,
-                    code: Some(code.into()),
-                    message: String::new(),
-                });
-            }
-            let profile = profile();
+            self.before_admission(access_token, false).await?;
+            let profile = self.current_profile();
             Ok(LauncherAdmissionResponse {
                 allowed: true,
                 channel,
-                admitted_at: "2026-07-11T12:00:00Z".into(),
+                admitted_at: self
+                    .admission_timestamp
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| Timestamp::now().to_string()),
+                session_id: "660e8400-e29b-41d4-a716-446655440000".into(),
+                user_id: profile.user_id,
+                launcher_nick: profile.launcher_nick.unwrap(),
+                launcher_role: profile.launcher_role,
+                launcher_permissions: profile.launcher_permissions,
+                entitlement: profile.entitlement,
+            })
+        }
+
+        async fn launcher_spawn_admission_v1(
+            &self,
+            access_token: &Secret,
+            channel: AdmissionChannel,
+        ) -> Result<LauncherSpawnAdmissionResponse, ApiError> {
+            self.before_admission(access_token, true).await?;
+            let mut profile = self.current_profile();
+            if let Some(scripted) = self.scripted_spawn_nicknames.lock().unwrap().pop_front() {
+                profile.launcher_nick = Some(scripted);
+            }
+            Ok(LauncherSpawnAdmissionResponse {
+                purpose: self.spawn_purpose.lock().unwrap().clone(),
+                contract_version: *self.spawn_contract_version.lock().unwrap(),
+                allowed: true,
+                channel,
+                admitted_at: self
+                    .admission_timestamp
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| Timestamp::now().to_string()),
                 session_id: "660e8400-e29b-41d4-a716-446655440000".into(),
                 user_id: profile.user_id,
                 launcher_nick: profile.launcher_nick.unwrap(),
@@ -1144,6 +1706,107 @@ mod tests {
         assert!(manager.refresh_profile().await.unwrap().authenticated);
         assert_eq!(api.profile_gets.load(Ordering::SeqCst), 2);
         assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_makes_no_third_request_after_second_401() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.reject_all_get.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            manager.refresh_profile().await,
+            Err(AuthError::Api(message)) if message.contains("unauthorized")
+        ));
+        assert_eq!(api.profile_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_get_first_then_nickname_patch_cannot_restore_the_old_profile() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.arm_next_profile_get();
+        let refresh = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.refresh_profile().await }
+        });
+        api.wait_until_profile_get_started().await;
+        let patch = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.update_nickname(Some("Newest_Nick")).await }
+        });
+
+        api.release_profile_get();
+        assert_eq!(
+            refresh
+                .await
+                .unwrap()
+                .unwrap()
+                .profile
+                .unwrap()
+                .launcher_nick
+                .as_deref(),
+            Some("Player_1")
+        );
+        assert_eq!(
+            patch
+                .await
+                .unwrap()
+                .unwrap()
+                .profile
+                .unwrap()
+                .launcher_nick
+                .as_deref(),
+            Some("Newest_Nick")
+        );
+        assert_eq!(
+            manager
+                .snapshot()
+                .await
+                .profile
+                .unwrap()
+                .launcher_nick
+                .as_deref(),
+            Some("Newest_Nick")
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_lease_blocks_profile_publication_until_linearization_drop() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        let lease = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _ = started_tx.send(());
+                manager.refresh_profile().await
+            }
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(api.profile_gets.load(Ordering::SeqCst), 0);
+
+        drop(lease);
+        assert!(refresh.await.unwrap().unwrap().authenticated);
+        assert_eq!(api.profile_gets.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1397,6 +2060,7 @@ mod tests {
         assert!(admission.allowed);
         assert_eq!(admission.role, Some(LauncherRole::Player));
         assert_eq!(api.admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 0);
         assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
         let json = serde_json::to_string(&admission).unwrap();
         assert!(!json.contains("sessionId"));
@@ -1422,5 +2086,546 @@ mod tests {
         );
         assert!(admission.profile.is_none());
         assert!(admission.role.is_none());
+    }
+
+    #[tokio::test]
+    async fn ui_admission_preview_never_overwrites_the_canonical_profile() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        *api.current_nickname.lock().unwrap() = Some("Preview_Only".into());
+
+        let preview = manager.admission(AdmissionChannel::Stable).await.unwrap();
+        assert_eq!(
+            preview.profile.unwrap().launcher_nick.as_deref(),
+            Some("Preview_Only")
+        );
+        assert_eq!(
+            manager
+                .snapshot()
+                .await
+                .profile
+                .unwrap()
+                .launcher_nick
+                .as_deref(),
+            Some("Player_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_admission_is_sealed_fresh_and_preserves_exact_uuid_and_nickname() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+
+        let admission = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+
+        assert_eq!(admission.channel(), AdmissionChannel::Stable);
+        assert_eq!(
+            admission.admission.user_id(),
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+        );
+        assert_eq!(
+            admission.minecraft_uuid(),
+            "550e8400e29b41d4a716446655440000"
+        );
+        assert_eq!(admission.launcher_nick(), "Player_1");
+        assert_eq!(
+            admission.admission.session_id(),
+            Uuid::parse_str("660e8400-e29b-41d4-a716-446655440000").unwrap()
+        );
+        assert!(
+            Timestamp::now().duration_since(admission.admission.admitted_at())
+                < SignedDuration::from_secs(5)
+        );
+        admission.revalidate_fresh(Timestamp::now()).unwrap();
+        for invalid_now in [
+            admission
+                .admission
+                .admitted_at()
+                .checked_add(SignedDuration::from_secs(31))
+                .unwrap(),
+            admission
+                .admission
+                .admitted_at()
+                .checked_sub(SignedDuration::from_secs(6))
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                admission.revalidate_fresh(invalid_now),
+                Err(AuthError::Contract(message)) if message.contains("admittedAt")
+            ));
+        }
+        assert_eq!(api.admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn launch_admission_revalidation_observes_entitlement_expiry() {
+        let admitted_at = Timestamp::now();
+        let expires_at = admitted_at
+            .checked_add(SignedDuration::from_secs(2))
+            .unwrap();
+        let admission = VerifiedLaunchAdmission::from_response(
+            LauncherSpawnAdmissionResponse {
+                purpose: super::super::types::LAUNCH_SPAWN_PURPOSE.into(),
+                contract_version: super::super::types::LAUNCH_SPAWN_CONTRACT_VERSION,
+                allowed: true,
+                channel: AdmissionChannel::Stable,
+                admitted_at: admitted_at.to_string(),
+                session_id: "660e8400-e29b-41d4-a716-446655440000".into(),
+                user_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                launcher_nick: "Player_1".into(),
+                launcher_role: LauncherRole::Player,
+                launcher_permissions: Vec::new(),
+                entitlement: EntitlementSnapshot {
+                    active: true,
+                    level: SubscriptionLevel::Novice,
+                    expires_at: Some(expires_at.to_string()),
+                    recalculated_at: Some(admitted_at.to_string()),
+                },
+            },
+            AdmissionChannel::Stable,
+            admitted_at,
+        )
+        .unwrap();
+
+        let after_expiry = expires_at
+            .checked_add(SignedDuration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            admission.revalidate_fresh(after_expiry),
+            Err(AuthError::Contract(message)) if message.contains("entitlement.expiresAt")
+        ));
+    }
+
+    #[tokio::test]
+    async fn launch_admission_retries_exactly_one_401_with_versioned_spawn_post() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.reject_next_admission.store(true, Ordering::SeqCst);
+
+        let lease = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+
+        assert_eq!(api.admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(*api.spawn_access_generations.lock().unwrap(), [1, 2]);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn launch_admission_makes_no_third_request_after_a_second_401() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.reject_all_admissions.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            manager.launch_admission(AdmissionChannel::Stable).await,
+            Err(LaunchAdmissionError::Denied(
+                LauncherAdmissionReason::InvalidSession
+            ))
+        ));
+        assert_eq!(api.admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(*api.spawn_access_generations.lock().unwrap(), [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn stale_spawn_nickname_is_rejected_refreshed_and_retried_once() {
+        let api = Arc::new(FakeApi::new());
+        api.script_spawn_nicknames(["Stale_Name"]);
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+
+        let lease = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        assert_eq!(lease.launcher_nick(), "Player_1");
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(*api.spawn_access_generations.lock().unwrap(), [1, 2]);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn repeated_stale_spawn_nickname_is_terminal_without_a_third_post() {
+        let api = Arc::new(FakeApi::new());
+        api.script_spawn_nicknames(["Stale_One", "Stale_Two"]);
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+
+        assert!(matches!(
+            manager.launch_admission(AdmissionChannel::Stable).await,
+            Err(LaunchAdmissionError::Auth(AuthError::SessionChanged))
+        ));
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn launch_admission_rejects_stale_and_future_server_timestamps() {
+        for timestamp in ["2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z"] {
+            let api = Arc::new(FakeApi::new());
+            api.set_admission_timestamp(timestamp);
+            let store = Arc::new(MemoryCredentialStore::with(
+                Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+            ));
+            let manager = Arc::new(AuthSessionManager::new(api, store));
+            manager.restore().await.unwrap();
+
+            let error = match manager.launch_admission(AdmissionChannel::Stable).await {
+                Ok(_) => panic!("stale or future admission unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                LaunchAdmissionError::Auth(AuthError::Contract(message))
+                    if message.contains("admittedAt")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_admission_holds_local_lifecycle_through_linearization_and_drop() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.arm_next_admission();
+
+        let launch = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.launch_admission(AdmissionChannel::Stable).await }
+        });
+        api.wait_until_admission_started().await;
+        assert!(manager.refresh_gate.try_lock().is_err());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let logout = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _ = started_tx.send(());
+                manager.logout().await
+            }
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(api.logouts.load(Ordering::SeqCst), 0);
+        api.release_admission();
+        let lease = launch.await.unwrap().unwrap();
+        assert!(manager.refresh_gate.try_lock().is_err());
+        assert_eq!(api.logouts.load(Ordering::SeqCst), 0);
+        drop(lease);
+        assert!(!logout.await.unwrap().unwrap().authenticated);
+        assert_eq!(api.logouts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn launch_admission_holds_cross_process_session_generation_until_drop() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_secs(1)));
+        let first = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock.clone(),
+        ));
+        let second = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock,
+        ));
+        first.restore().await.unwrap();
+        let lease = first
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        let writes_at_admission = store.writes();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let replacement = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            second.restore().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(store.writes(), writes_at_admission);
+
+        drop(lease);
+        assert!(replacement.await.unwrap().unwrap().authenticated);
+        assert_eq!(store.writes(), writes_at_admission + 1);
+    }
+
+    #[tokio::test]
+    async fn cross_process_replacement_before_admission_reloads_exact_session_before_post() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_secs(1)));
+        let first = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock.clone(),
+        ));
+        let second = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store,
+            process_lock,
+        ));
+        first.restore().await.unwrap();
+        second.restore().await.unwrap();
+
+        let lease = first
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 3);
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*api.spawn_access_generations.lock().unwrap(), [3]);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn cross_process_logout_before_admission_never_posts_with_the_old_session() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_secs(1)));
+        let first = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock.clone(),
+        ));
+        let second = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store,
+            process_lock,
+        ));
+        first.restore().await.unwrap();
+        assert!(!second.logout().await.unwrap().authenticated);
+
+        assert!(matches!(
+            first.launch_admission(AdmissionChannel::Stable).await,
+            Err(LaunchAdmissionError::Denied(
+                LauncherAdmissionReason::InvalidSession
+            ))
+        ));
+        assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn nickname_patch_drops_lifecycle_guards_and_retries_exactly_one_401() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.reject_next_nickname.store(true, Ordering::SeqCst);
+
+        let snapshot = manager.update_nickname(Some("Retry_Nick")).await.unwrap();
+        assert_eq!(
+            snapshot.profile.unwrap().launcher_nick.as_deref(),
+            Some("Retry_Nick")
+        );
+        assert_eq!(api.nickname_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn nickname_patch_never_makes_a_third_request_after_second_401() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.reject_all_nickname.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            manager.update_nickname(Some("Never_Set")).await,
+            Err(AuthError::Api(message)) if message.contains("unauthorized")
+        ));
+        assert_eq!(api.nickname_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            api.current_profile().launcher_nick.as_deref(),
+            Some("Player_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn nickname_patch_rejects_mismatched_server_nick_without_publishing_it() {
+        for scripted in [Some("Wrong_Nick"), None] {
+            let api = Arc::new(FakeApi::new());
+            api.script_patch_response_nicknames([scripted]);
+            let store = Arc::new(MemoryCredentialStore::with(
+                Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+            ));
+            let manager = Arc::new(AuthSessionManager::new(api, store));
+            manager.restore().await.unwrap();
+
+            assert!(matches!(
+                manager.update_nickname(Some("Expected_Nick")).await,
+                Err(AuthError::Contract(message)) if message.contains("launcherNick")
+            ));
+            assert_eq!(
+                manager
+                    .snapshot()
+                    .await
+                    .profile
+                    .unwrap()
+                    .launcher_nick
+                    .as_deref(),
+                Some("Player_1")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nickname_patch_first_commits_before_final_admission_and_new_nick_is_sealed() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        api.arm_next_nickname();
+        let patch = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.update_nickname(Some("New_Player")).await }
+        });
+        api.wait_until_nickname_started().await;
+        let launch = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.launch_admission(AdmissionChannel::Stable).await }
+        });
+        assert!(manager.refresh_gate.try_lock().is_err());
+        api.release_nickname();
+        assert_eq!(
+            patch
+                .await
+                .unwrap()
+                .unwrap()
+                .profile
+                .unwrap()
+                .launcher_nick
+                .as_deref(),
+            Some("New_Player")
+        );
+        let lease = launch.await.unwrap().unwrap();
+        assert_eq!(lease.launcher_nick(), "New_Player");
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn spawn_lease_first_blocks_nickname_patch_until_spawn_linearization_drop() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        let lease = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        assert!(manager.refresh_gate.try_lock().is_err());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let patch = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _ = started_tx.send(());
+                manager.update_nickname(Some("After_Spawn")).await
+            }
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(api.nickname_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lease.launcher_nick(), "Player_1");
+
+        drop(lease);
+        let snapshot = patch.await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.profile.unwrap().launcher_nick.as_deref(),
+            Some("After_Spawn")
+        );
+        assert_eq!(api.nickname_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_spawn_proof_is_terminal_and_never_refreshes_or_retries() {
+        for (purpose, version, expected_field) in [
+            ("status_preview", 1, "purpose"),
+            ("minecraft_spawn", 2, "contractVersion"),
+        ] {
+            let api = Arc::new(FakeApi::new());
+            api.set_spawn_proof(purpose, version);
+            let store = Arc::new(MemoryCredentialStore::with(
+                Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+            ));
+            let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+            manager.restore().await.unwrap();
+
+            assert!(matches!(
+                manager.launch_admission(AdmissionChannel::Stable).await,
+                Err(LaunchAdmissionError::Auth(AuthError::Contract(message)))
+                    if message.contains(expected_field)
+            ));
+            assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(api.refreshes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_admission_preserves_a_typed_server_denial() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        *api.admission_error.lock().unwrap() = Some("subscription_required");
+
+        assert!(matches!(
+            manager.launch_admission(AdmissionChannel::Stable).await,
+            Err(LaunchAdmissionError::Denied(
+                LauncherAdmissionReason::SubscriptionRequired
+            ))
+        ));
     }
 }

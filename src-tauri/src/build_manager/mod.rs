@@ -10,6 +10,10 @@ mod coordinator;
 #[allow(dead_code)]
 mod game_generation;
 #[allow(dead_code)]
+mod game_launch;
+#[allow(dead_code)]
+mod game_natives;
+#[allow(dead_code)]
 mod game_runtime;
 #[allow(dead_code)]
 mod game_runtime_executor;
@@ -52,16 +56,24 @@ mod tuf;
 mod tuf_transport;
 mod types;
 
-use crate::auth::AuthSessionManager;
+use crate::auth::{
+    AdmissionChannel, AuthSessionManager, LaunchAdmissionError, LauncherAdmissionReason,
+};
 use coordinator::{
     BuildCoordinator, CoordinatorCancellation, CoordinatorConfig, CoordinatorError,
-    CoordinatorProgress, CoordinatorSnapshot, ProgressObserver, TufRootAnchors,
+    CoordinatorProgress, CoordinatorSnapshot, PrepareGameLaunchOutcome, PrepareGameLaunchRequest,
+    ProgressObserver, TufRootAnchors,
 };
+use game_launch::prepare_game_invocation;
+use game_natives::prepare_native_workspace;
+use planner::PlannedBuildState;
+pub(crate) use process_supervisor::spawn_command_with_inheritance_lock;
+use process_supervisor::spawn_with_before_resume as spawn_contained_process_with_gate;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
@@ -78,6 +90,7 @@ pub use types::{BuildChannel, BuildStatus, PresetId};
 
 const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const COMPLETED_OPERATION_RETENTION: usize = 32;
+const POST_GAME_VERIFY_MESSAGE: &str = "Minecraft завершён. Повторно проверяем сборку…";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BuildKey {
@@ -103,6 +116,12 @@ struct ActiveBuildOperation {
     cancellation: CoordinatorCancellation,
 }
 
+struct ActiveGameLaunch {
+    key: BuildKey,
+    operation_id: Uuid,
+    stop_requested: Arc<AtomicBool>,
+}
+
 #[derive(Clone)]
 struct CompletedBuildOperation {
     key: BuildKey,
@@ -125,6 +144,7 @@ struct ActiveBuildInspection {
 #[derive(Default)]
 struct BuildRuntimeState {
     active: Option<ActiveBuildOperation>,
+    game: Option<ActiveGameLaunch>,
     inspection: Option<ActiveBuildInspection>,
     cached: HashMap<BuildKey, CachedBuildStatus>,
     completed_operations: VecDeque<CompletedBuildOperation>,
@@ -212,6 +232,12 @@ impl BuildManager {
 
         let inspection = {
             let mut runtime = self.lock_runtime()?;
+            if let Some(game) = runtime.game.as_ref() {
+                let install = install_hint.ok_or_else(|| {
+                    "Активный процесс Minecraft потерял привязку к папке установки".to_string()
+                })?;
+                return Ok(self.game_status_for(&runtime, game, key, install));
+            }
             if let Some(active) = runtime.active.as_ref() {
                 let install = install_hint.ok_or_else(|| {
                     "РђРєС‚РёРІРЅР°СЏ РѕРїРµСЂР°С†РёСЏ Spark2 РїРѕС‚РµСЂСЏР»Р° РїСЂРёРІСЏР·РєСѓ Рє РїР°РїРєРµ СѓСЃС‚Р°РЅРѕРІРєРё".to_string()
@@ -311,6 +337,9 @@ impl BuildManager {
         let operation_id = Uuid::new_v4();
         let cancellation = CoordinatorCancellation::default();
         let mut runtime = self.lock_runtime()?;
+        if let Some(game) = runtime.game.as_ref() {
+            return Ok(self.game_status_for(&runtime, game, key, &install_directory));
+        }
         if let Some(active) = runtime.active.as_ref() {
             return Ok(self.active_status_for(&runtime, active, key, &install_directory));
         }
@@ -465,23 +494,176 @@ impl BuildManager {
         Ok(initial)
     }
 
+    pub fn start_game(
+        self: &Arc<Self>,
+        auth: Arc<AuthSessionManager>,
+        channel: BuildChannel,
+        preset: PresetId,
+    ) -> Result<BuildStatus, String> {
+        let install_transition = self.lock_install_transition()?;
+        let key = BuildKey::new(channel, preset);
+        let startup_warning = self.startup_warning()?;
+        let (install_directory, install_id) = self
+            .configured_installation()?
+            .ok_or_else(|| "Сначала выберите безопасную папку установки Fragment".to_string())?;
+        validate_owned_install_directory(&install_directory, install_id)?;
+
+        let operation_id = Uuid::new_v4();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let mut runtime = self.lock_runtime()?;
+        if let Some(game) = runtime.game.as_ref() {
+            return Ok(self.game_status_for(&runtime, game, key, &install_directory));
+        }
+        if let Some(active) = runtime.active.as_ref() {
+            return Ok(self.active_status_for(&runtime, active, key, &install_directory));
+        }
+        if runtime.inspection.is_some() {
+            return Err("Дождитесь завершения текущей проверки сборки".into());
+        }
+        if let Some(message) = startup_warning {
+            let status = BuildStatus::error(channel, preset, None, message);
+            return Ok(self.publish_non_operation_status_locked(&mut runtime, status));
+        }
+        let cached = runtime
+            .cached
+            .get(&key)
+            .ok_or_else(|| "Перед запуском дождитесь завершения проверки сборки".to_string())?;
+        if cached.status.primary_action != PrimaryAction::Play
+            || cached.status.phase != BuildPhase::Ready
+            || cached.status.operation_active
+        {
+            return Ok(cached.status.clone());
+        }
+
+        let initial = self.with_next_revision(BuildStatus {
+            operation_id: Some(operation_id),
+            revision: 0,
+            channel,
+            preset,
+            phase: BuildPhase::Authorizing,
+            primary_action: PrimaryAction::Busy,
+            install_directory: Some(install_directory.to_string_lossy().into_owned()),
+            installed_release_id: cached.status.installed_release_id.clone(),
+            available_release_id: cached.status.available_release_id.clone(),
+            message: "Проверяем подписанную сборку перед запуском…".into(),
+            operation_active: true,
+            progress: TransferProgress::default(),
+        });
+        runtime.cached.insert(
+            key,
+            CachedBuildStatus {
+                status: initial.clone(),
+                observed_at: Instant::now(),
+            },
+        );
+        runtime.game = Some(ActiveGameLaunch {
+            key,
+            operation_id,
+            stop_requested: Arc::clone(&stop_requested),
+        });
+        drop(runtime);
+        drop(install_transition);
+
+        let manager = Arc::clone(self);
+        let coordinator_config = self.coordinator_config.clone();
+        let install_for_worker = install_directory.clone();
+        let worker = std::thread::Builder::new()
+            .name(format!("fragment-game-{operation_id}"))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| {
+                            CoordinatorError::Failed(format!(
+                                "Не удалось запустить runtime игры: {error}"
+                            ))
+                        })?;
+                    let coordinator = BuildCoordinator::new(coordinator_config);
+                    let run = runtime.block_on(run_game_launch(
+                        Arc::clone(&manager),
+                        coordinator.clone(),
+                        install_for_worker.clone(),
+                        install_id,
+                        operation_id,
+                        key,
+                        Arc::clone(&auth),
+                        stop_requested,
+                    ));
+                    if matches!(&run, Err(CoordinatorError::Cancelled)) {
+                        let observer: ProgressObserver = Arc::new(|_| {});
+                        runtime.block_on(coordinator.inspect(
+                            &install_for_worker,
+                            install_id,
+                            channel,
+                            preset,
+                            &auth,
+                            &observer,
+                        ))
+                    } else {
+                        run
+                    }
+                }))
+                .unwrap_or_else(|_| {
+                    Err(CoordinatorError::Failed(
+                        "Worker запуска Minecraft аварийно завершился".into(),
+                    ))
+                });
+                manager.finish_game_launch(key, operation_id, &install_for_worker, result);
+            });
+        if let Err(error) = worker {
+            let mut runtime = self.lock_runtime()?;
+            if runtime
+                .game
+                .as_ref()
+                .is_some_and(|game| game.operation_id == operation_id)
+            {
+                runtime.game = None;
+            }
+            let mut status = self.error_status(
+                key,
+                Some(&install_directory),
+                CoordinatorError::Failed(format!(
+                    "Не удалось создать поток запуска Minecraft: {error}"
+                )),
+            );
+            status.operation_id = Some(operation_id);
+            let status = self.with_next_revision(status);
+            runtime.cached.insert(
+                key,
+                CachedBuildStatus {
+                    status: status.clone(),
+                    observed_at: Instant::now(),
+                },
+            );
+            return Ok(status);
+        }
+        Ok(initial)
+    }
+
     pub fn cancel_operation(&self, operation_id: Uuid) -> Result<BuildStatus, String> {
         let mut runtime = self.lock_runtime()?;
-        let active = runtime
-            .active
-            .as_ref()
-            .ok_or_else(|| "Активной операции Spark2 нет".to_string())?;
-        if active.operation_id != operation_id {
-            return Err("Идентификатор операции устарел".into());
-        }
-        active.cancellation.cancel();
-        let key = active.key;
+        let (key, message) = if let Some(active) = runtime.active.as_ref() {
+            if active.operation_id != operation_id {
+                return Err("Идентификатор операции устарел".into());
+            }
+            active.cancellation.cancel();
+            (active.key, "Безопасно останавливаем операцию…")
+        } else if let Some(game) = runtime.game.as_ref() {
+            if game.operation_id != operation_id {
+                return Err("Идентификатор запуска устарел".into());
+            }
+            game.stop_requested.store(true, Ordering::Release);
+            (game.key, "Завершаем Minecraft и все дочерние процессы…")
+        } else {
+            return Err("Активной операции Spark2 или игры нет".into());
+        };
         let cached = runtime
             .cached
             .get(&key)
             .ok_or_else(|| "Статус активной операции отсутствует".to_string())?;
         let mut status = cached.status.clone();
-        status.message = "Безопасно останавливаем операцию…".into();
+        status.message = message.into();
         status.revision = self.next_revision();
         runtime.cached.insert(
             key,
@@ -501,6 +683,35 @@ impl BuildManager {
     ) -> Result<BuildStatus, String> {
         let key = BuildKey::new(channel, preset);
         let runtime = self.lock_runtime()?;
+        if let Some(game) = runtime
+            .game
+            .as_ref()
+            .filter(|game| game.operation_id == operation_id)
+        {
+            if game.key != key {
+                return Err("Идентификатор запуска не соответствует ветке и пресету".into());
+            }
+            if !runtime.cached.get(&key).is_some_and(|cached| {
+                cached.status.operation_id == Some(operation_id)
+                    && cached.status.operation_active
+                    && cached.status.channel == channel
+                    && cached.status.preset == preset
+                    && matches!(
+                        cached.status.phase,
+                        BuildPhase::Authorizing
+                            | BuildPhase::Launching
+                            | BuildPhase::Running
+                            | BuildPhase::Verifying
+                    )
+            }) {
+                return Err("Active game status failed exact identity validation".into());
+            }
+            return runtime
+                .cached
+                .get(&key)
+                .map(|cached| cached.status.clone())
+                .ok_or_else(|| "Статус активной игры отсутствует".into());
+        }
         if let Some(active) = runtime
             .active
             .as_ref()
@@ -563,13 +774,13 @@ impl BuildManager {
         self.pause_install_transition_for_test();
         {
             let runtime = self.lock_runtime()?;
-            if runtime.active.is_some() || runtime.inspection.is_some() {
+            if runtime.active.is_some() || runtime.game.is_some() || runtime.inspection.is_some() {
                 return Err("Нельзя менять папку во время операции или проверки Spark2".into());
             }
         }
         let validated = select_install_directory(&path)?;
         let mut runtime = self.lock_runtime()?;
-        if runtime.active.is_some() || runtime.inspection.is_some() {
+        if runtime.active.is_some() || runtime.game.is_some() || runtime.inspection.is_some() {
             return Err("Build ownership changed during install-directory selection".into());
         }
         let mut config = self
@@ -661,8 +872,10 @@ impl BuildManager {
             return Err("A stale install-directory status cannot be published".into());
         }
         let mut runtime = self.lock_runtime()?;
-        if runtime.active.is_some() || runtime.inspection.is_some() {
-            return Err("A non-operation status cannot replace an active build owner".into());
+        if runtime.active.is_some() || runtime.game.is_some() || runtime.inspection.is_some() {
+            return Err(
+                "A non-operation status cannot replace an active build or game owner".into(),
+            );
         }
         Ok(self.publish_non_operation_status_locked(&mut runtime, status))
     }
@@ -793,6 +1006,47 @@ impl BuildManager {
             installed_release_id: None,
             available_release_id: None,
             message: "Другая сборка сейчас использует общий диск Fragment".into(),
+            operation_active: false,
+            progress: TransferProgress::default(),
+        })
+    }
+
+    fn game_status_for(
+        &self,
+        runtime: &BuildRuntimeState,
+        game: &ActiveGameLaunch,
+        requested: BuildKey,
+        install: &Path,
+    ) -> BuildStatus {
+        if game.key == requested {
+            if let Some(cached) = runtime.cached.get(&requested) {
+                if cached.status.operation_id == Some(game.operation_id)
+                    && cached.status.operation_active
+                    && cached.status.channel == requested.channel
+                    && cached.status.preset == requested.preset
+                    && matches!(
+                        cached.status.phase,
+                        BuildPhase::Authorizing
+                            | BuildPhase::Launching
+                            | BuildPhase::Running
+                            | BuildPhase::Verifying
+                    )
+                {
+                    return cached.status.clone();
+                }
+            }
+        }
+        self.with_next_revision(BuildStatus {
+            operation_id: None,
+            revision: 0,
+            channel: requested.channel,
+            preset: requested.preset,
+            phase: BuildPhase::Running,
+            primary_action: PrimaryAction::Busy,
+            install_directory: Some(install.to_string_lossy().into_owned()),
+            installed_release_id: None,
+            available_release_id: None,
+            message: "Другая сборка Fragment сейчас запущена".into(),
             operation_active: false,
             progress: TransferProgress::default(),
         })
@@ -947,6 +1201,99 @@ impl BuildManager {
         );
     }
 
+    fn update_game_progress(
+        &self,
+        key: BuildKey,
+        operation_id: Uuid,
+        phase: BuildPhase,
+        message: impl Into<String>,
+    ) {
+        let Ok(mut runtime) = self.runtime.lock() else {
+            return;
+        };
+        if !runtime
+            .game
+            .as_ref()
+            .is_some_and(|game| game.operation_id == operation_id && game.key == key)
+        {
+            return;
+        }
+        let previous = runtime.cached.get(&key).map(|cached| cached.status.clone());
+        let status = BuildStatus {
+            operation_id: Some(operation_id),
+            revision: self.next_revision(),
+            channel: key.channel,
+            preset: key.preset,
+            phase,
+            primary_action: PrimaryAction::Busy,
+            install_directory: previous
+                .as_ref()
+                .and_then(|status| status.install_directory.clone()),
+            installed_release_id: previous
+                .as_ref()
+                .and_then(|status| status.installed_release_id.clone()),
+            available_release_id: previous
+                .as_ref()
+                .and_then(|status| status.available_release_id.clone()),
+            message: message.into(),
+            operation_active: true,
+            progress: TransferProgress::default(),
+        };
+        runtime.cached.insert(
+            key,
+            CachedBuildStatus {
+                status,
+                observed_at: Instant::now(),
+            },
+        );
+    }
+
+    fn finish_game_launch(
+        &self,
+        key: BuildKey,
+        operation_id: Uuid,
+        install: &Path,
+        result: Result<CoordinatorSnapshot, CoordinatorError>,
+    ) {
+        let Ok(mut runtime) = self.runtime.lock() else {
+            return;
+        };
+        if !runtime
+            .game
+            .as_ref()
+            .is_some_and(|game| game.operation_id == operation_id && game.key == key)
+        {
+            return;
+        }
+        runtime.game = None;
+        let mut status = match result {
+            Ok(snapshot) => self.snapshot_status(key, install, snapshot, false, Some(operation_id)),
+            Err(error) => self.error_status(key, Some(install), error),
+        };
+        status.operation_id = Some(operation_id);
+        let status = self.with_next_revision(status);
+        runtime.cached.insert(
+            key,
+            CachedBuildStatus {
+                status: status.clone(),
+                observed_at: Instant::now(),
+            },
+        );
+        runtime
+            .completed_operations
+            .retain(|completed| completed.operation_id != operation_id);
+        runtime
+            .completed_operations
+            .push_back(CompletedBuildOperation {
+                key,
+                operation_id,
+                status,
+            });
+        while runtime.completed_operations.len() > COMPLETED_OPERATION_RETENTION {
+            runtime.completed_operations.pop_front();
+        }
+    }
+
     fn finish_operation(
         &self,
         key: BuildKey,
@@ -996,6 +1343,294 @@ impl BuildManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_game_launch(
+    manager: Arc<BuildManager>,
+    coordinator: BuildCoordinator,
+    install_directory: PathBuf,
+    install_id: Uuid,
+    operation_id: Uuid,
+    key: BuildKey,
+    auth: Arc<AuthSessionManager>,
+    stop_requested: Arc<AtomicBool>,
+) -> Result<CoordinatorSnapshot, CoordinatorError> {
+    let prepare_manager = Arc::clone(&manager);
+    let prepare_observer: ProgressObserver = Arc::new(move |progress| {
+        prepare_manager.update_game_progress(
+            key,
+            operation_id,
+            BuildPhase::Authorizing,
+            progress.message,
+        );
+    });
+    let outcome = coordinator
+        .prepare_game_launch(PrepareGameLaunchRequest {
+            install_directory: &install_directory,
+            install_id,
+            launch_id: operation_id,
+            channel: key.channel,
+            preset: key.preset,
+            auth: &auth,
+            observer: &prepare_observer,
+        })
+        .await?;
+    let mut prepared = match outcome {
+        PrepareGameLaunchOutcome::Ready(prepared) => prepared,
+        PrepareGameLaunchOutcome::NotReady(snapshot) => return Ok(snapshot),
+    };
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Cancelled);
+    }
+
+    manager.update_game_progress(
+        key,
+        operation_id,
+        BuildPhase::Authorizing,
+        "Подготавливаем изолированные native-библиотеки…",
+    );
+    let mut natives =
+        prepare_native_workspace(prepared.game(), prepared.trusted().game_runtime_lock())
+            .map_err(CoordinatorError::Failed)?;
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Cancelled);
+    }
+
+    manager.update_game_progress(
+        key,
+        operation_id,
+        BuildPhase::Authorizing,
+        "Проверяем подписку и право на запуск через FragmentApi…",
+    );
+    let admission_channel = match key.channel {
+        BuildChannel::Stable => AdmissionChannel::Stable,
+        BuildChannel::Dev => AdmissionChannel::Dev,
+    };
+    // Every content-dependent hash and mutable-policy validation must finish before the
+    // short-lived admission is requested. Native DLLs are likewise fully hashed here. The code
+    // after the await is restricted to bounded namespace/identity checks and process creation.
+    prepared.revalidate_before_admission()?;
+    natives.revalidate().map_err(CoordinatorError::Failed)?;
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Cancelled);
+    }
+    // This is deliberately the final network await before CreateProcessW. The endpoint bypasses
+    // the ordinary decision cache and re-evaluates entitlement/session/channel permissions live.
+    let admission = auth
+        .launch_admission(admission_channel)
+        .await
+        .map_err(map_launch_admission_error)?;
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Cancelled);
+    }
+
+    manager.update_game_progress(
+        key,
+        operation_id,
+        BuildPhase::Launching,
+        "Финально проверяем файлы и запускаем Java 25…",
+    );
+    let invocation = prepare_game_invocation(&prepared, &natives, &admission)
+        .map_err(CoordinatorError::Failed)?;
+    prepared.revalidate_for_spawn()?;
+    natives
+        .revalidate_fast()
+        .map_err(CoordinatorError::Failed)?;
+    admission
+        .revalidate_fresh(jiff::Timestamp::now())
+        .map_err(|error| CoordinatorError::Auth(error.to_string()))?;
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Cancelled);
+    }
+
+    let spawn_result = spawn_and_release_lifecycle(admission, |admission| {
+        spawn_contained_process_with_gate(invocation.process_spec(), || {
+            // CreateProcessW has succeeded, Job containment has been proven, and Java is still
+            // suspended here. Repeat the bounded authority gate at the final possible instant;
+            // SpawnGuard kills the child without running payload code on any rejection.
+            prepared
+                .revalidate_for_spawn()
+                .map_err(|error| error.to_string())?;
+            natives.revalidate_fast()?;
+            admission
+                .revalidate_fresh(jiff::Timestamp::now())
+                .map_err(|error| error.to_string())?;
+            if stop_requested.load(Ordering::Acquire) {
+                return Err("Game launch was cancelled before Java resumed".into());
+            }
+            // This must remain the last operation before returning to the supervisor's immediate
+            // ResumeThread call. It is the only point where Minecraft's signed mutable files
+            // become writable; exact content remains sealed for the whole Job lifetime.
+            prepared
+                .release_mutable_seals_for_resume()
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    });
+    let (mut child, pipes) = spawn_result.map_err(CoordinatorError::Failed)?;
+    let pid = child.pid();
+    let drain = match pipes.drain_bounded(64 * 1024) {
+        Ok(drain) => drain,
+        Err(error) => {
+            if let Err(cleanup) = child.terminate_and_reap(Duration::from_secs(5)) {
+                return Err(CoordinatorError::Failed(format!(
+                    "{error}; process cleanup failed: {cleanup}"
+                )));
+            }
+            // ResumeThread has already run. Once the Job is proven empty this is a real game exit,
+            // even if the bounded output drain could not finish its local startup handshake. Keep
+            // the same network-free settlement contract as every later stop/crash path so allowed
+            // controls and graphics changes cannot be lost and disallowed changes become Repair.
+            drop(child);
+            let native_cleanup = natives.cleanup();
+            drop(invocation);
+            manager.update_game_progress(
+                key,
+                operation_id,
+                BuildPhase::Verifying,
+                POST_GAME_VERIFY_MESSAGE,
+            );
+            let snapshot = prepared.settle_after_game()?;
+            drop(prepared);
+            let mut errors = vec![error];
+            if let Err(cleanup) = native_cleanup {
+                errors.push(format!("Native workspace cleanup failed: {cleanup}"));
+            }
+            return resolve_settled_launch(snapshot, errors);
+        }
+    };
+    manager.update_game_progress(
+        key,
+        operation_id,
+        BuildPhase::Running,
+        format!("Minecraft запущен (PID {pid})"),
+    );
+
+    let mut stopped = false;
+    let exit_code = loop {
+        if let Some(code) = child.try_wait().map_err(CoordinatorError::Failed)? {
+            break code;
+        }
+        if stop_requested.load(Ordering::Acquire) {
+            stopped = true;
+            child
+                .terminate_and_reap(Duration::from_secs(10))
+                .map_err(CoordinatorError::Failed)?;
+            break child
+                .try_wait()
+                .map_err(CoordinatorError::Failed)?
+                .unwrap_or(1);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // The Java root may have spawned descendants which inherited stdout/stderr. Drain only after
+    // the Job is proven empty, otherwise a surviving helper could keep a pipe writer open forever.
+    if !stopped {
+        child
+            .terminate_and_reap(Duration::from_secs(10))
+            .map_err(CoordinatorError::Failed)?;
+    }
+    let capture = drain.finish();
+    drop(child);
+    let native_cleanup = natives.cleanup();
+    drop(invocation);
+
+    let process_error = if exit_code != 0 && !stopped {
+        Some(format!(
+            "Minecraft завершился с кодом {exit_code} (stdout: {} байт, stderr: {} байт)",
+            capture
+                .as_ref()
+                .map(|value| value.stdout().total_bytes())
+                .unwrap_or(0),
+            capture
+                .as_ref()
+                .map(|value| value.stderr().total_bytes())
+                .unwrap_or(0)
+        ))
+    } else {
+        None
+    };
+
+    manager.update_game_progress(
+        key,
+        operation_id,
+        BuildPhase::Verifying,
+        POST_GAME_VERIFY_MESSAGE,
+    );
+    // No network call is allowed after the Job exits. `prepared` retains the exact signed TUF
+    // release, inventory, mutable defaults and locks used for this launch.
+    let snapshot = prepared.settle_after_game()?;
+    drop(prepared);
+    let mut errors = Vec::new();
+    if let Some(error) = process_error {
+        errors.push(error);
+    }
+    if let Err(error) = capture {
+        errors.push(error);
+    }
+    if let Err(error) = native_cleanup {
+        errors.push(format!("Native workspace cleanup failed: {error}"));
+    }
+    resolve_settled_launch(snapshot, errors)
+}
+
+/// Settlement is authoritative over diagnostics from a process which is already proven gone. A
+/// disallowed mutation is represented by Repair/Update/Download and must reach the UI even when
+/// the child also crashed or its local output/native cleanup failed. Diagnostics are terminal only
+/// when the signed local state remains Ready.
+fn resolve_settled_launch(
+    snapshot: CoordinatorSnapshot,
+    errors: Vec<String>,
+) -> Result<CoordinatorSnapshot, CoordinatorError> {
+    if snapshot.state != PlannedBuildState::Ready || errors.is_empty() {
+        Ok(snapshot)
+    } else {
+        Err(CoordinatorError::Failed(errors.join("; ")))
+    }
+}
+
+/// Runs the synchronous CreateProcess boundary while the supplied lifecycle capability is alive,
+/// then releases it before the caller can drain pipes, wait for the child, or do more work.
+fn spawn_and_release_lifecycle<L, T, E>(
+    lifecycle: L,
+    spawn: impl FnOnce(&L) -> Result<T, E>,
+) -> Result<T, E> {
+    let result = spawn(&lifecycle);
+    drop(lifecycle);
+    result
+}
+
+fn map_launch_admission_error(error: LaunchAdmissionError) -> CoordinatorError {
+    match error {
+        LaunchAdmissionError::Denied(LauncherAdmissionReason::SubscriptionRequired) => {
+            CoordinatorError::SubscriptionRequired(
+                "Для запуска нужна активная подписка либо подаренный доступ".into(),
+            )
+        }
+        LaunchAdmissionError::Denied(LauncherAdmissionReason::DevAccessRequired) => {
+            CoordinatorError::DevForbidden(
+                "Dev-сборку могут запускать только тестеры и разработчики".into(),
+            )
+        }
+        LaunchAdmissionError::Denied(LauncherAdmissionReason::LauncherNicknameRequired) => {
+            CoordinatorError::Auth("Перед запуском выберите ник в профиле лаунчера".into())
+        }
+        LaunchAdmissionError::Denied(LauncherAdmissionReason::AccountBanned) => {
+            CoordinatorError::Auth("Аккаунт заблокирован для запуска Fragment".into())
+        }
+        LaunchAdmissionError::Denied(LauncherAdmissionReason::InvalidSession) => {
+            CoordinatorError::Auth("Сессия Fragment недействительна; войдите снова".into())
+        }
+        LaunchAdmissionError::Denied(
+            LauncherAdmissionReason::EntitlementVerificationUnavailable
+            | LauncherAdmissionReason::LauncherAdmissionUnavailable
+            | LauncherAdmissionReason::LauncherAdmissionBusy,
+        ) => CoordinatorError::Auth(
+            "FragmentApi сейчас не смог безопасно подтвердить право на запуск".into(),
+        ),
+        LaunchAdmissionError::Auth(error) => CoordinatorError::Auth(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1649,58 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let manager = Arc::new(BuildManager::new(root.join("manager.json")));
         (manager, root)
+    }
+
+    #[test]
+    fn launch_lifecycle_is_alive_during_spawn_and_released_before_return() {
+        struct LifecycleProbe(Arc<AtomicBool>);
+
+        impl Drop for LifecycleProbe {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let result = spawn_and_release_lifecycle(LifecycleProbe(Arc::clone(&alive)), |lifecycle| {
+            assert!(lifecycle.0.load(Ordering::Acquire));
+            assert!(alive.load(Ordering::Acquire));
+            Ok::<_, ()>(7_u32)
+        });
+
+        assert_eq!(result, Ok(7));
+        assert!(!alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn post_game_non_ready_settlement_outranks_process_diagnostics() {
+        let mut repair = ready_snapshot();
+        repair.state = PlannedBuildState::Repair;
+        repair.message = "repair required".into();
+        let settled = resolve_settled_launch(
+            repair.clone(),
+            vec![
+                "drain startup failed".into(),
+                "native cleanup failed".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(settled, repair);
+
+        let error = resolve_settled_launch(
+            ready_snapshot(),
+            vec![
+                "drain startup failed".into(),
+                "native cleanup failed".into(),
+            ],
+        )
+        .unwrap_err();
+        match error {
+            CoordinatorError::Failed(message) => {
+                assert_eq!(message, "drain startup failed; native cleanup failed")
+            }
+            other => panic!("unexpected settled launch error: {other}"),
+        }
     }
 
     fn seed_active(manager: &BuildManager, key: BuildKey, operation_id: Uuid, install: &Path) {
@@ -1046,6 +1733,43 @@ mod tests {
         });
     }
 
+    fn seed_game(
+        manager: &BuildManager,
+        key: BuildKey,
+        operation_id: Uuid,
+        install: &Path,
+    ) -> Arc<AtomicBool> {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let status = BuildStatus {
+            operation_id: Some(operation_id),
+            revision: manager.next_revision(),
+            channel: key.channel,
+            preset: key.preset,
+            phase: BuildPhase::Running,
+            primary_action: PrimaryAction::Busy,
+            install_directory: Some(install.to_string_lossy().into_owned()),
+            installed_release_id: Some("release-1".into()),
+            available_release_id: Some("release-1".into()),
+            message: "running".into(),
+            operation_active: true,
+            progress: TransferProgress::default(),
+        };
+        let mut runtime = manager.runtime.lock().unwrap();
+        runtime.cached.insert(
+            key,
+            CachedBuildStatus {
+                status,
+                observed_at: Instant::now(),
+            },
+        );
+        runtime.game = Some(ActiveGameLaunch {
+            key,
+            operation_id,
+            stop_requested: Arc::clone(&stop_requested),
+        });
+        stop_requested
+    }
+
     fn seed_inspection(manager: &BuildManager, key: BuildKey) -> ActiveBuildInspection {
         let inspection = ActiveBuildInspection {
             key,
@@ -1064,6 +1788,50 @@ mod tests {
             disk_required_bytes: 0,
             message: "ready".into(),
         }
+    }
+
+    #[test]
+    fn game_process_is_exactly_correlated_and_cancel_sets_only_its_stop_capability() {
+        let (manager, root) = test_manager("game-correlation");
+        let key = BuildKey::new(BuildChannel::Dev, PresetId::High);
+        let operation_id = Uuid::new_v4();
+        let stop = seed_game(&manager, key, operation_id, &root);
+
+        let status = manager
+            .operation_status(operation_id, key.channel, key.preset)
+            .unwrap();
+        assert_eq!(status.phase, BuildPhase::Running);
+        assert!(status.operation_active);
+        assert!(!stop.load(Ordering::Acquire));
+
+        let stopping = manager.cancel_operation(operation_id).unwrap();
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(stopping.operation_id, Some(operation_id));
+        assert!(stopping.message.contains("Minecraft"));
+        assert!(manager
+            .operation_status(operation_id, BuildChannel::Stable, key.preset)
+            .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_directory_change_is_rejected_while_game_is_owned() {
+        let (manager, root) = test_manager("game-install-transition");
+        let install = root.join("old");
+        fs::create_dir_all(&install).unwrap();
+        seed_game(
+            &manager,
+            BuildKey::new(BuildChannel::Stable, PresetId::Low),
+            Uuid::new_v4(),
+            &install,
+        );
+        let candidate = root.join("new");
+        let error = manager
+            .set_install_directory(candidate.clone(), BuildChannel::Stable, PresetId::Low)
+            .unwrap_err();
+        assert!(error.contains("Нельзя менять папку"));
+        assert!(!candidate.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1660,6 +2428,35 @@ mod tests {
         assert_eq!(after.operation_id, before.operation_id);
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.message, before.message);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_operation_publication_cannot_overwrite_an_active_game() {
+        let (manager, root) = test_manager("non-operation-active-game-owner");
+        let key = BuildKey::new(BuildChannel::Dev, PresetId::High);
+        let operation_id = Uuid::new_v4();
+        seed_game(&manager, key, operation_id, &root);
+        let before = manager.runtime.lock().unwrap().cached[&key].status.clone();
+
+        let result = manager.publish_non_operation_status(BuildStatus::not_installed(
+            key.channel,
+            key.preset,
+            Some(root.to_string_lossy().into_owned()),
+            42,
+        ));
+
+        assert!(result.is_err());
+        let runtime = manager.runtime.lock().unwrap();
+        let after = &runtime.cached[&key].status;
+        assert_eq!(after.operation_id, before.operation_id);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.message, before.message);
+        assert!(runtime
+            .game
+            .as_ref()
+            .is_some_and(|game| { game.operation_id == operation_id && game.key == key }));
+        drop(runtime);
         fs::remove_dir_all(root).unwrap();
     }
 

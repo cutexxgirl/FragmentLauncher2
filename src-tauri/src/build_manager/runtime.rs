@@ -7,7 +7,7 @@ use super::{
         quarantine_node_if_identity, remove_bounded_managed_directory_tree,
         ConditionalManagedDirectoryMoveOutcome, ExclusiveManagedFile, FileIdentity,
         GuardedDirectoryChain, ImmutableManagedFile, ManagedDirectoryRemovalLimits, ManagedFsError,
-        ManagedLockFile, ManagedNodeKind, RelativeManagedPath,
+        ManagedLockFile, ManagedNodeKind, RecursiveChangeSentinel, RelativeManagedPath,
     },
     storage::OwnedCasRoot,
 };
@@ -74,6 +74,7 @@ struct RuntimeInstallationLease {
     _directories: Vec<GuardedDirectoryChain>,
     _marker: ImmutableManagedFile,
     _files: Vec<ImmutableManagedFile>,
+    _change_sentinel: RecursiveChangeSentinel,
 }
 
 impl fmt::Debug for RuntimeInstallation {
@@ -811,6 +812,42 @@ pub(super) fn revalidate_runtime_installation_for_root(
     Ok(verified)
 }
 
+/// O(1) launch-window validation for an already fully authenticated Java generation. The sticky
+/// recursive sentinel was armed before the full audit and every exact file handle remains
+/// immutable; no lock traversal, directory enumeration, reopen, or content read occurs here.
+pub(super) fn revalidate_runtime_installation_fast_for_root(
+    installed: &RuntimeInstallation,
+    _lock: &RuntimeLock,
+    owned_root: &OwnedCasRoot,
+) -> Result<(), String> {
+    validate_sha256(&installed.runtime_lock_sha256)?;
+    let binding = installed
+        .binding
+        .as_ref()
+        .ok_or_else(|| "Synthetic Java runtime is not root-bound launch authority".to_string())?;
+    binding.validate_owned(owned_root)?;
+    let lease = installed
+        ._lease
+        .as_ref()
+        .ok_or_else(|| "Java runtime capability has no retained filesystem lease".to_string())?;
+    let generation = relative("runtime/java/generations")
+        .and_then(|value| value.join_component(&installed.runtime_lock_sha256))
+        .map_err(|error| error.to_string())?;
+    let image = generation
+        .join_component("image")
+        .map_err(|error| error.to_string())?;
+    if generation.join_to(&binding.install_root) != installed.generation
+        || image.join_to(&binding.install_root) != installed.image
+    {
+        return Err("Java runtime capability paths differ from its signed generation".into());
+    }
+    lease
+        ._change_sentinel
+        .revalidate_clean()
+        .map_err(|error| format!("Java generation changed after full audit: {error}"))?;
+    binding.validate_owned(owned_root)
+}
+
 /// Audits the one canonical Java generation beneath an already validated Fragment install.
 /// Missing state is not an error, but an existing malformed/mismatched generation fails closed.
 /// This is deliberately the only path used by the artifact availability scanner to claim that
@@ -859,6 +896,8 @@ fn audit_generation(
     let image_relative = generation_relative
         .join_component("image")
         .map_err(|error| error.to_string())?;
+    let change_sentinel = RecursiveChangeSentinel::arm(&generation_relative.join_to(root))
+        .map_err(|error| format!("Cannot arm Java generation change sentinel: {error}"))?;
 
     let mut expected_by_directory = expected_directory_entries(&image_relative, lock)?;
     expected_by_directory.insert(
@@ -952,6 +991,9 @@ fn audit_generation(
         return Err("Java install root identity differs from its owned CAS binding".into());
     }
     binding.validate_current()?;
+    change_sentinel
+        .revalidate_clean()
+        .map_err(|error| format!("Java generation changed during full audit: {error}"))?;
 
     let generation = generation_relative.join_to(root);
     let image = image_relative.join_to(root);
@@ -973,6 +1015,7 @@ fn audit_generation(
             _directories: directory_leases,
             _marker: marker,
             _files: files,
+            _change_sentinel: change_sentinel,
         }),
     })
 }
@@ -1054,9 +1097,9 @@ fn audit_exact_directory_entries(
 ) -> Result<(), String> {
     let mut actual = HashSet::new();
     let mut collision_keys = HashSet::new();
-    for entry in fs::read_dir(guard.leaf().path())
-        .map_err(|error| format!("Cannot enumerate Java runtime directory: {error}"))?
-    {
+    let mut entries = fs::read_dir(guard.leaf().path())
+        .map_err(|error| format!("Cannot enumerate Java runtime directory: {error}"))?;
+    for entry in entries.by_ref().take(expected.len()) {
         let entry = entry.map_err(|error| format!("Cannot inspect Java runtime entry: {error}"))?;
         let name = entry
             .file_name()
@@ -1068,6 +1111,14 @@ fn audit_exact_directory_entries(
         if !collision_keys.insert(parsed.collision_key().to_owned()) || !actual.insert(name) {
             return Err("Java runtime directory contains a casing/collision duplicate".into());
         }
+    }
+    // Consume at most one extra item. Any yielded item, including a per-entry I/O error, proves
+    // that the namespace exceeds the signed bound; no counter can overflow at usize::MAX.
+    if entries.next().is_some() {
+        return Err(format!(
+            "Java runtime directory exceeds its signed entry bound at {}",
+            guard.leaf().path().display()
+        ));
     }
     if &actual != expected {
         return Err(format!(
@@ -2356,11 +2407,30 @@ mod tests {
             revalidate_runtime_installation_for_root(&installed, &lock, &owned_root).unwrap(),
             installed
         );
+        revalidate_runtime_installation_fast_for_root(&installed, &lock, &owned_root).unwrap();
+
+        let late_unknown = installed.image.join("late-unknown.bin");
+        fs::write(&late_unknown, b"unknown").unwrap();
+        assert!(
+            revalidate_runtime_installation_fast_for_root(&installed, &lock, &owned_root).is_err()
+        );
+        fs::remove_file(&late_unknown).unwrap();
+        assert!(
+            revalidate_runtime_installation_fast_for_root(&installed, &lock, &owned_root).is_err(),
+            "a one-shot notification must remain sticky after the mutation is reverted"
+        );
+        let refreshed =
+            revalidate_runtime_installation_for_root(&installed, &lock, &owned_root).unwrap();
+        revalidate_runtime_installation_fast_for_root(&refreshed, &lock, &owned_root).unwrap();
 
         let foreign = select_install_directory(&fixture_root.join("foreign-install"))
             .unwrap()
             .into_owned_cas_root();
-        assert!(revalidate_runtime_installation_for_root(&installed, &lock, &foreign).is_err());
+        assert!(revalidate_runtime_installation_for_root(&refreshed, &lock, &foreign).is_err());
+        assert!(
+            revalidate_runtime_installation_fast_for_root(&refreshed, &lock, &foreign).is_err()
+        );
+        drop(refreshed);
         drop(installed);
         drop(foreign);
         drop(owned_root);

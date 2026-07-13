@@ -5,7 +5,9 @@ use auth::{
     AdmissionChannel, AuthError, AuthSessionManager, AuthSnapshot, LauncherAdmissionSnapshot,
     TelegramLoginSnapshot, TelegramPollSnapshot,
 };
-use build_manager::{BuildChannel, BuildManager, BuildStatus, PresetId};
+use build_manager::{
+    spawn_command_with_inheritance_lock, BuildChannel, BuildManager, BuildStatus, PresetId,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -265,9 +267,9 @@ fn start_tg_ws_proxy_process(proxy_path: &Path) -> Result<(), String> {
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    Command::new(proxy_path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
+    let mut command = Command::new(proxy_path);
+    command.creation_flags(CREATE_NO_WINDOW);
+    spawn_command_with_inheritance_lock(&mut command)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
@@ -286,6 +288,7 @@ fn powershell_string(value: &Path) -> String {
 #[cfg(target_os = "windows")]
 fn create_tg_ws_proxy_shortcut(proxy_path: &Path) -> Result<Option<PathBuf>, String> {
     use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -308,7 +311,8 @@ fn create_tg_ws_proxy_shortcut(proxy_path: &Path) -> Result<Option<PathBuf>, Str
         powershell_string(proxy_path),
     );
 
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -317,7 +321,11 @@ fn create_tg_ws_proxy_shortcut(proxy_path: &Path) -> Result<Option<PathBuf>, Str
             &script,
         ])
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_command_with_inheritance_lock(&mut command)
+        .and_then(|child| child.wait_with_output())
         .map_err(|error| error.to_string())?;
 
     if !output.status.success() {
@@ -445,6 +453,16 @@ fn start_build_operation(
     preset: PresetId,
 ) -> Result<BuildStatus, String> {
     Arc::clone(manager.inner()).start_operation(Arc::clone(auth.inner()), channel, preset)
+}
+
+#[tauri::command]
+fn start_game(
+    manager: tauri::State<'_, Arc<BuildManager>>,
+    auth: tauri::State<'_, Arc<AuthSessionManager>>,
+    channel: BuildChannel,
+    preset: PresetId,
+) -> Result<BuildStatus, String> {
+    Arc::clone(manager.inner()).start_game(Arc::clone(auth.inner()), channel, preset)
 }
 
 #[tauri::command]
@@ -596,6 +614,7 @@ pub fn run() {
             build_status,
             set_build_install_directory,
             start_build_operation,
+            start_game,
             cancel_build_operation,
             auth_restore,
             auth_begin_login,

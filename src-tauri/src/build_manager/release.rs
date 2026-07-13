@@ -899,18 +899,122 @@ fn is_within_any(path: &str, roots: &[String]) -> bool {
 }
 
 fn forbidden_jvm_argument(argument: &str) -> bool {
-    let normalized = argument.trim().to_lowercase();
-    normalized.starts_with('@')
-        || normalized.starts_with("-javaagent")
-        || normalized.starts_with("-agentlib")
-        || normalized.starts_with("-agentpath")
-        || normalized.starts_with("-xbootclasspath")
-        || normalized == "-cp"
-        || normalized == "-classpath"
-        || normalized.starts_with("--class-path")
-        || normalized.starts_with("-djava.system.class.loader")
-        || normalized.starts_with("-djdk.attach.allowattachself")
-        || normalized.starts_with("-dloader.path")
+    if !argument.starts_with('-') || argument == "--" {
+        return true;
+    }
+    if argument
+        .bytes()
+        .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    {
+        return true;
+    }
+    let normalized = argument.to_ascii_lowercase();
+    if let Some(property) = parse_jvm_system_property(argument) {
+        return !allowed_jvm_preset_system_property(&property);
+    }
+    if matches!(
+        normalized.as_str(),
+        "--enable-preview" | "--illegal-native-access=deny" | "-xverify:all"
+    ) {
+        return false;
+    }
+    if normalized.starts_with("-xlog:") {
+        return !allowed_jvm_preset_logging_argument(&normalized);
+    }
+    if normalized.starts_with("-xx:") {
+        return !allowed_jvm_preset_xx_argument(&normalized);
+    }
+    true
+}
+
+fn parse_jvm_system_property(argument: &str) -> Option<String> {
+    let bytes = argument.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'-' || bytes[1] != b'D' {
+        return None;
+    }
+    let suffix = &argument[2..];
+    let key = suffix.split_once('=').map_or(suffix, |(key, _)| key);
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Some(String::new());
+    }
+    Some(key.to_ascii_lowercase())
+}
+
+fn allowed_jvm_preset_system_property(key: &str) -> bool {
+    matches!(
+        key,
+        "file.encoding"
+            | "user.country"
+            | "user.language"
+            | "user.script"
+            | "user.timezone"
+            | "user.variant"
+    )
+}
+
+fn allowed_jvm_preset_logging_argument(normalized: &str) -> bool {
+    let Some(selection) = normalized.strip_prefix("-xlog:") else {
+        return false;
+    };
+    !selection.is_empty()
+        && selection != "help"
+        && selection.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'+' | b'*' | b'.' | b',' | b'=' | b'_' | b'-')
+        })
+}
+
+fn allowed_jvm_preset_xx_argument(normalized: &str) -> bool {
+    if matches!(
+        normalized,
+        "-xx:+alwayspretouch"
+            | "-xx:+disableattachmechanism"
+            | "-xx:-enabledynamicagentloading"
+            | "-xx:+exitonoutofmemoryerror"
+            | "-xx:-omitstacktraceinfastthrow"
+            | "-xx:+parallelrefprocenabled"
+            | "-xx:-startattachlistener"
+            | "-xx:+useg1gc"
+            | "-xx:+useparallelgc"
+            | "-xx:+useserialgc"
+            | "-xx:+usestringdeduplication"
+            | "-xx:+usezgc"
+    ) {
+        return true;
+    }
+    let Some((name, value)) = normalized
+        .strip_prefix("-xx:")
+        .and_then(|body| body.split_once('='))
+    else {
+        return false;
+    };
+    let numeric = value.strip_suffix(['k', 'm', 'g', 't']).unwrap_or(value);
+    if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        name,
+        "activeprocessorcount"
+            | "concgcthreads"
+            | "g1heapregionsize"
+            | "g1heapwastepercent"
+            | "g1maxnewsizepercent"
+            | "g1mixedgccounttarget"
+            | "g1mixedgclivethresholdpercent"
+            | "g1newsizepercent"
+            | "g1reservepercent"
+            | "g1rsetupdatingpausetimepercent"
+            | "initiatingheapoccupancypercent"
+            | "maxgcpausemillis"
+            | "parallelgcthreads"
+            | "softreflrupolicymspermb"
+            | "zcollectioninterval"
+            | "zuncommitdelay"
+    )
 }
 
 fn is_https_url(value: &str) -> bool {
@@ -1019,6 +1123,145 @@ pub(crate) mod tests {
             release.selected_preset(PresetId::High).unwrap().id,
             PresetId::High
         );
+    }
+
+    #[test]
+    fn preset_jvm_arguments_allow_tuning_but_not_launch_authority_overrides() {
+        let parse = |arguments: &[&str]| {
+            let mut value = manifest();
+            for preset in value["presets"].as_array_mut().unwrap() {
+                preset["jvm"]["extraArguments"] = serde_json::json!(arguments);
+            }
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&value).unwrap()).is_ok()
+        };
+
+        assert!(parse(&[
+            "-XX:+UseZGC",
+            "-XX:MaxGCPauseMillis=75",
+            "-XX:G1HeapRegionSize=16m",
+            "-XX:+ExitOnOutOfMemoryError",
+            "-Xlog:gc*=info",
+            "-Xverify:all",
+            "--enable-preview",
+            "--illegal-native-access=deny",
+            "-XX:-EnableDynamicAgentLoading",
+            "-XX:+DisableAttachMechanism",
+            "-Dfile.encoding=UTF-8",
+            "-Duser.language=ru",
+            "-Duser.country=RU",
+            "-Duser.timezone=Europe/Moscow",
+        ]));
+
+        for argument in [
+            "-Xms2G",
+            "-ms2G",
+            "-xMX4g",
+            "-mx4g",
+            "-XX:InitialHeapSize=1g",
+            "-XX:MaxHeapSize=8g",
+            "-XX:MaxRAMPercentage=99",
+            " -Xmx4G",
+            "\u{feff}-Xmx4G",
+            "\u{a0}-Xmx4G",
+            "evil.Main",
+            "evil.jar",
+            "--",
+            "-D",
+            "-d",
+            "-cp",
+            "-classpath=evil.jar",
+            "--class-path",
+            "-p=evil",
+            "--module-path=evil",
+            "--patch-module=java.base=evil.jar",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
+            "--enable-native-access=ALL-UNNAMED",
+            "-Djava.class.path=evil.jar",
+            "-Djava.library.path=evil",
+            "-Djava.home=evil",
+            "-Djava.io.tmpdir=evil",
+            "-Duser.home=evil",
+            "-Duser.dir=evil",
+            "-Duser.name=Impostor",
+            "-Dfragment.identity=Impostor",
+            "-Dminecraft.launcher.brand=Impostor",
+            "-DlibraryDirectory=evil",
+            "-Dlog4j.configurationFile=evil.xml",
+            "-Djna.tmpdir=evil",
+            "-Dorg.lwjgl.system.SharedLibraryExtractPath=evil",
+            "-Dio.netty.native.workdir=evil",
+            "-Djava.system.class.loader=evil.Loader",
+            "-Djdk.module.path=evil",
+            "-Dsun.boot.library.path=C:/evil",
+            "-Djava.nio.file.spi.DefaultFileSystemProvider=evil.Provider",
+            "-Djava.util.logging.config.class=evil.Hook",
+            "-Djava.util.logging.config.file=C:/evil.properties",
+            "-Djava.security.auth.login.config=C:/evil.conf",
+            "-Djavax.net.ssl.keyStore=C:/evil.p12",
+            "-Dorg.lwjgl.libname=C:/evil.dll",
+            "-Dorg.lwjgl.opencl.libname=C:/evil.dll",
+            "-Dorg.lwjgl.opengl.libname=C:/evil.dll",
+            "-Dorg.lwjgl.system.bundledLibrary.pathMapper=evil.Mapper",
+            "-Djava.homebrew=not-allowlisted",
+            "-Dloader.pathname=not-allowlisted",
+            "-javaagent:evil.jar",
+            "-agentlib:jdwp=transport=dt_socket,server=y",
+            "-Xrunjdwp:transport=dt_socket,server=y",
+            "-XX:+EnableDynamicAgentLoading",
+            "-XX:+StartAttachListener",
+            "-XX:-DisableAttachMechanism",
+            "@evil.args",
+            "-jar=evil.jar",
+            "--module=evil/main",
+            "--source=25",
+            "-XX:OnError=evil.exe",
+            "-XX:VMOptionsFile=evil.options",
+            "-XX:SharedArchiveFile=evil.jsa",
+            "-XX:InitialRAMFraction=1",
+            "-XX:MaxRAMFraction=1",
+            "-XX:MinRAMFraction=1",
+            "-XX:LogFile=C:/evil.log",
+            "-XX:ReplayDataFile=C:/evil.log",
+            "-XX:PerfDataSaveFile=C:/evil.log",
+            "-XX:JVMCILibPath=C:/evil",
+            "-XX:+UseJVMCINativeLibrary",
+            "-XX:JVMCINativeLibraryErrorFile=C:/evil.log",
+            "-XX:AllocateHeapAt=C:/outside",
+            "-XX:+ManagementServer",
+            "-XX:+PrintFlagsInitial",
+            "-XX:+UnlockDiagnosticVMOptions",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+IgnoreUnrecognizedVMOptions",
+            "-XX:",
+            "-XX:+",
+            "-XX:-EnableDynamicAgentLoading=1",
+            "-XX:+DisableAttachMechanism=0",
+            "--help-extra",
+            "-Xinternalversion",
+            "-fullversion",
+            "--full-version",
+            "-Xlog:gc:file=C:/evil.log",
+            "-Xloggc:C:/evil.log",
+            "-Xlog:gc:C:/evil.log",
+            "-Xlog:help",
+            "-noverify",
+            "-Xverify:none",
+            "-Xverify:remote",
+            "-XX:-BytecodeVerificationLocal",
+            "-XX:-BytecodeVerificationRemote",
+            "-XX:+UseG1GC -javaagent:evil.jar",
+        ] {
+            assert!(
+                !parse(&[argument]),
+                "forbidden JVM argument passed: {argument}"
+            );
+        }
+        assert!(!parse(&[
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+EnableJVMCI",
+            "-XX:JVMCILibPath=C:/evil",
+            "-XX:+UseJVMCINativeLibrary",
+        ]));
     }
 
     #[test]

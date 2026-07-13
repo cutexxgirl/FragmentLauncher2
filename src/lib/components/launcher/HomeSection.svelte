@@ -66,6 +66,16 @@
 			buildStatus.primaryAction === 'retry' ||
 			buildStatus.primaryAction === 'busy',
 	);
+	let gameLifecycleActive = $derived(
+		buildStatus.phase === 'authorizing' ||
+			buildStatus.phase === 'launching' ||
+			buildStatus.phase === 'running',
+	);
+	let transferActive = $derived(
+		buildStatus.phase === 'downloading' ||
+			buildStatus.phase === 'updating' ||
+			buildStatus.phase === 'repairing',
+	);
 
 	onMount(() => {
 		const timer = window.setInterval(() => {
@@ -120,6 +130,10 @@
 			case 'retry':
 				return 'Повторить проверку';
 			case 'busy':
+				if (buildStatus.phase === 'running') return 'Игра запущена';
+				if (buildStatus.phase === 'launching' || buildStatus.phase === 'authorizing') {
+					return 'Запускаем…';
+				}
 				return 'Подождите';
 			default:
 				return 'Недоступно';
@@ -206,11 +220,11 @@
 				>
 					<div class="operation-status-head">
 						<strong>{buildStatus.message}</strong>
-						{#if buildStatus.operationActive}
+						{#if buildStatus.operationActive && transferActive}
 							<span>{formatBytes(buildStatus.progress.speedBytesPerSecond)}/с</span>
 						{/if}
 					</div>
-					{#if buildStatus.operationActive}
+					{#if buildStatus.operationActive && transferActive}
 						<div
 							class="operation-progress-track"
 							role="progressbar"
@@ -255,9 +269,64 @@
 								{:else}
 									<X size={14} />
 								{/if}
-								<span>{operationCancelPending ? 'Отменяем…' : 'Отменить'}</span>
+								<span
+									>{operationCancelPending
+										? gameLifecycleActive
+											? 'Завершаем…'
+											: 'Отменяем…'
+										: buildStatus.phase === 'running'
+											? 'Завершить игру'
+											: gameLifecycleActive
+												? 'Отменить запуск'
+												: 'Отменить'}</span
+								>
 							</button>
 						{/if}
+					{:else if buildStatus.operationActive && gameLifecycleActive}
+						<p class="operation-current-file">
+							{buildStatus.phase === 'running'
+								? 'Лаунчер контролирует процесс и завершит всё дерево дочерних процессов.'
+								: 'UUID, ник и право доступа проверяются только в нативной части лаунчера.'}
+						</p>
+						{#if buildStatus.operationId}
+							<button
+								type="button"
+								class="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-semibold text-white/75 transition hover:border-white/20 hover:bg-white/[0.08] hover:text-white disabled:cursor-wait disabled:opacity-50"
+								disabled={operationCancelPending}
+								onclick={cancelAction}
+							>
+								{#if operationCancelPending}
+									<LoaderCircle size={14} class="spin-icon" />
+								{:else}
+									<X size={14} />
+								{/if}
+								<span
+									>{operationCancelPending
+										? 'Завершаем…'
+										: buildStatus.phase === 'running'
+											? 'Завершить игру'
+											: 'Отменить запуск'}</span
+								>
+							</button>
+						{/if}
+					{:else if buildStatus.operationActive && buildStatus.operationId}
+						<p class="operation-current-file">
+							Лаунчер завершит уже начатый безопасный шаг и остановит операцию в ближайшей
+							разрешённой точке.
+						</p>
+						<button
+							type="button"
+							class="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-semibold text-white/75 transition hover:border-white/20 hover:bg-white/[0.08] hover:text-white disabled:cursor-wait disabled:opacity-50"
+							disabled={operationCancelPending}
+							onclick={cancelAction}
+						>
+							{#if operationCancelPending}
+								<LoaderCircle size={14} class="spin-icon" />
+							{:else}
+								<X size={14} />
+							{/if}
+							<span>{operationCancelPending ? 'Отменяем…' : 'Отменить операцию'}</span>
+						</button>
 					{:else if buildStatus.phase === 'diskInsufficient'}
 						<div class="operation-status-grid">
 							<span><HardDrive size={13} /> Резерв операции</span>

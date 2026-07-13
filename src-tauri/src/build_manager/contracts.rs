@@ -166,15 +166,15 @@ const NEOFORGE_MODULE_PATHS: [&str; 8] = [
     "libraries/org/ow2/asm/asm/9.8/asm-9.8.jar",
     "libraries/net/neoforged/JarJarFileSystems/0.4.1/JarJarFileSystems-0.4.1.jar",
 ];
-const MINECRAFT_NEOFORGE_WINDOWS_LIBRARY_COUNT: usize = 106;
+const MINECRAFT_NEOFORGE_WINDOWS_LIBRARY_COUNT: usize = 90;
 const MINECRAFT_NEOFORGE_RUNTIME_LIBRARY_COUNT: usize = 82;
-const MINECRAFT_NEOFORGE_NATIVE_LIBRARY_COUNT: usize = 24;
+const MINECRAFT_NEOFORGE_NATIVE_LIBRARY_COUNT: usize = 8;
 const NEOFORGE_INSTALLER_ONLY_LIBRARY_COUNT: usize = 21;
-const MINECRAFT_NEOFORGE_OFFICIAL_FILE_COUNT: usize = 4_022;
-const MINECRAFT_NEOFORGE_OFFICIAL_BYTES: u64 = 951_471_493;
+const MINECRAFT_NEOFORGE_OFFICIAL_FILE_COUNT: usize = 4_006;
+const MINECRAFT_NEOFORGE_OFFICIAL_BYTES: u64 = 946_722_278;
 const NEOFORGE_DERIVED_OUTPUT_BYTES: u64 = 62_474_478;
-const MINECRAFT_NEOFORGE_GAME_RUNTIME_FILE_COUNT: usize = 4_028;
-const MINECRAFT_NEOFORGE_GAME_RUNTIME_BYTES: u64 = 1_013_945_971;
+const MINECRAFT_NEOFORGE_GAME_RUNTIME_FILE_COUNT: usize = 4_012;
+const MINECRAFT_NEOFORGE_GAME_RUNTIME_BYTES: u64 = 1_009_196_756;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -740,6 +740,7 @@ pub enum GameLaunchPlaceholder {
     VersionName,
     LibrariesDirectory,
     NativesDirectory,
+    ScratchTempDirectory,
     LoggingConfigPath,
     Classpath,
     ModulePath,
@@ -1533,9 +1534,21 @@ impl GameRuntimeLock {
             validate_required_template_argument(
                 &launch.jvm_arguments,
                 prefix,
-                GameLaunchPlaceholder::NativesDirectory,
+                GameLaunchPlaceholder::ScratchTempDirectory,
             )?;
         }
+        validate_required_wrapped_template_argument(
+            &launch.jvm_arguments,
+            "-XX:HeapDumpPath=",
+            GameLaunchPlaceholder::ScratchTempDirectory,
+            "/MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump",
+        )?;
+        validate_required_wrapped_template_argument(
+            &launch.jvm_arguments,
+            "-XX:ErrorFile=",
+            GameLaunchPlaceholder::ScratchTempDirectory,
+            "/hs_err_pid%p.log",
+        )?;
         validate_required_template_argument(
             &launch.jvm_arguments,
             "-Dlog4j.configurationFile=",
@@ -1669,6 +1682,7 @@ impl GameRuntimeLock {
             GameLaunchPlaceholder::Classpath,
             GameLaunchPlaceholder::ModulePath,
             GameLaunchPlaceholder::NativesDirectory,
+            GameLaunchPlaceholder::ScratchTempDirectory,
             GameLaunchPlaceholder::LoggingConfigPath,
             GameLaunchPlaceholder::LibrariesDirectory,
             GameLaunchPlaceholder::LauncherName,
@@ -1710,7 +1724,13 @@ impl GameRuntimeLock {
         require_placeholder_count(
             &launch.jvm_arguments,
             GameLaunchPlaceholder::NativesDirectory,
-            4,
+            1,
+            "JVM arguments",
+        )?;
+        require_placeholder_count(
+            &launch.jvm_arguments,
+            GameLaunchPlaceholder::ScratchTempDirectory,
+            5,
             "JVM arguments",
         )?;
         require_placeholder_count(
@@ -2460,9 +2480,7 @@ fn validate_launch_paths(
         }
         if !matches!(
             files[&key].role,
-            GameRuntimeRole::MinecraftClient
-                | GameRuntimeRole::Library
-                | GameRuntimeRole::NativeLibrary
+            GameRuntimeRole::MinecraftClient | GameRuntimeRole::Library
         ) {
             return Err(format!(
                 "Game runtime {label} contains a non-loadable role: {path}"
@@ -2542,26 +2560,45 @@ fn validate_game_file_destination(file: &GameRuntimeFile) -> Result<(), String> 
             file.path
         ));
     }
-    let is_windows_native = [
-        "-natives-windows.jar",
-        "-natives-windows-arm64.jar",
-        "-natives-windows-x86.jar",
-    ]
-    .iter()
-    .any(|suffix| file.path.ends_with(suffix));
+    let classifier = game_runtime_maven_classifier(&file.path);
+    let is_native_classifier = classifier.is_some_and(|classifier| {
+        classifier.eq_ignore_ascii_case("natives")
+            || classifier.to_ascii_lowercase().starts_with("natives-")
+    });
+    let is_windows_native = classifier == Some("natives-windows");
+    if is_native_classifier && !is_windows_native {
+        return Err(format!(
+            "Foreign native classifier is forbidden in the Windows x64 graph: {}",
+            file.path
+        ));
+    }
     if file.role == GameRuntimeRole::NativeLibrary && !is_windows_native {
         return Err(format!(
             "Native game runtime role has a non-native path: {}",
             file.path
         ));
     }
-    if file.role == GameRuntimeRole::Library && is_windows_native {
+    if file.role != GameRuntimeRole::NativeLibrary && is_native_classifier {
         return Err(format!(
             "Game runtime library hides a native path: {}",
             file.path
         ));
     }
     Ok(())
+}
+
+fn game_runtime_maven_classifier(path: &str) -> Option<&str> {
+    let mut segments = path.rsplit('/');
+    let file_name = segments.next()?;
+    let version = segments.next()?;
+    let artifact = segments.next()?;
+    let stem = file_name.strip_suffix(".jar")?;
+    let classifier = stem
+        .strip_prefix(artifact)?
+        .strip_prefix('-')?
+        .strip_prefix(version)?
+        .strip_prefix('-')?;
+    (!classifier.is_empty()).then_some(classifier)
 }
 
 fn validate_critical_classpath_roles(
@@ -2572,11 +2609,7 @@ fn validate_critical_classpath_roles(
         .iter()
         .filter_map(|path| files.get(&path.to_lowercase()).map(|file| file.role))
         .collect();
-    for role in [
-        GameRuntimeRole::MinecraftClient,
-        GameRuntimeRole::Library,
-        GameRuntimeRole::NativeLibrary,
-    ] {
+    for role in [GameRuntimeRole::MinecraftClient, GameRuntimeRole::Library] {
         if !roles.contains(&role) {
             return Err(format!(
                 "Game runtime classpath is missing critical role {}",
@@ -2588,9 +2621,7 @@ fn validate_critical_classpath_roles(
     for file in files.values() {
         if matches!(
             file.role,
-            GameRuntimeRole::MinecraftClient
-                | GameRuntimeRole::Library
-                | GameRuntimeRole::NativeLibrary
+            GameRuntimeRole::MinecraftClient | GameRuntimeRole::Library
         ) && !classpath.contains(&file.path.to_lowercase())
         {
             return Err(format!(
@@ -2837,9 +2868,18 @@ fn validate_exact_jvm_arguments(arguments: &[GameLaunchArgument]) -> Result<(), 
         JvmArgumentExpectation::Literal("java.base/sun.security.util=cpw.mods.securejarhandler"),
         JvmArgumentExpectation::Literal("--add-exports"),
         JvmArgumentExpectation::Literal("jdk.naming.dns/com.sun.jndi.dns=java.naming"),
-        JvmArgumentExpectation::Literal(
-            "-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump",
-        ),
+        JvmArgumentExpectation::Template {
+            prefix: "-XX:HeapDumpPath=",
+            placeholder: GameLaunchPlaceholder::ScratchTempDirectory,
+            suffix: Some(
+                "/MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump",
+            ),
+        },
+        JvmArgumentExpectation::Template {
+            prefix: "-XX:ErrorFile=",
+            placeholder: GameLaunchPlaceholder::ScratchTempDirectory,
+            suffix: Some("/hs_err_pid%p.log"),
+        },
         JvmArgumentExpectation::Template {
             prefix: "-Djava.library.path=",
             placeholder: GameLaunchPlaceholder::NativesDirectory,
@@ -2847,17 +2887,17 @@ fn validate_exact_jvm_arguments(arguments: &[GameLaunchArgument]) -> Result<(), 
         },
         JvmArgumentExpectation::Template {
             prefix: "-Djna.tmpdir=",
-            placeholder: GameLaunchPlaceholder::NativesDirectory,
+            placeholder: GameLaunchPlaceholder::ScratchTempDirectory,
             suffix: None,
         },
         JvmArgumentExpectation::Template {
             prefix: "-Dorg.lwjgl.system.SharedLibraryExtractPath=",
-            placeholder: GameLaunchPlaceholder::NativesDirectory,
+            placeholder: GameLaunchPlaceholder::ScratchTempDirectory,
             suffix: None,
         },
         JvmArgumentExpectation::Template {
             prefix: "-Dio.netty.native.workdir=",
-            placeholder: GameLaunchPlaceholder::NativesDirectory,
+            placeholder: GameLaunchPlaceholder::ScratchTempDirectory,
             suffix: None,
         },
         JvmArgumentExpectation::Template {
@@ -2966,6 +3006,8 @@ fn validate_protected_jvm_argument_counts(arguments: &[GameLaunchArgument]) -> R
         "-Djna.tmpdir=",
         "-Dorg.lwjgl.system.SharedLibraryExtractPath=",
         "-Dio.netty.native.workdir=",
+        "-XX:HeapDumpPath=",
+        "-XX:ErrorFile=",
         "-Dlog4j.configurationFile=",
         "-Dminecraft.launcher.brand=",
         "-Dminecraft.launcher.version=",
@@ -3114,6 +3156,7 @@ fn placeholder_name(placeholder: GameLaunchPlaceholder) -> &'static str {
         GameLaunchPlaceholder::VersionName => "versionName",
         GameLaunchPlaceholder::LibrariesDirectory => "librariesDirectory",
         GameLaunchPlaceholder::NativesDirectory => "nativesDirectory",
+        GameLaunchPlaceholder::ScratchTempDirectory => "scratchTempDirectory",
         GameLaunchPlaceholder::LoggingConfigPath => "loggingConfigPath",
         GameLaunchPlaceholder::Classpath => "classpath",
         GameLaunchPlaceholder::ModulePath => "modulePath",
@@ -3907,7 +3950,7 @@ pub(crate) mod tests {
                 )
             }));
         }
-        for index in 0..23 {
+        for index in 0..7 {
             let path =
                 format!("libraries/com/example/native/{index}/native-{index}-natives-windows.jar");
             file_list.push(serde_json::json!({
@@ -3996,12 +4039,7 @@ pub(crate) mod tests {
         });
         let classpath: Vec<_> = file_list
             .iter()
-            .filter(|file| {
-                matches!(
-                    file["role"].as_str(),
-                    Some("minecraft-client" | "library" | "native-library")
-                )
-            })
+            .filter(|file| matches!(file["role"].as_str(), Some("minecraft-client" | "library")))
             .map(|file| file["path"].as_str().unwrap().to_owned())
             .collect();
         let literal = |value: &str| serde_json::json!({ "kind": "literal", "value": value });
@@ -4040,9 +4078,22 @@ pub(crate) mod tests {
             literal("java.base/sun.security.util=cpw.mods.securejarhandler"),
             literal("--add-exports"),
             literal("jdk.naming.dns/com.sun.jndi.dns=java.naming"),
-            literal(
-                "-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump",
-            ),
+            serde_json::json!({
+                "kind": "template",
+                "fragments": [
+                    { "kind": "literal", "value": "-XX:HeapDumpPath=" },
+                    { "kind": "placeholder", "name": "scratchTempDirectory" },
+                    { "kind": "literal", "value": "/MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump" }
+                ]
+            }),
+            serde_json::json!({
+                "kind": "template",
+                "fragments": [
+                    { "kind": "literal", "value": "-XX:ErrorFile=" },
+                    { "kind": "placeholder", "name": "scratchTempDirectory" },
+                    { "kind": "literal", "value": "/hs_err_pid%p.log" }
+                ]
+            }),
             serde_json::json!({
                 "kind": "template",
                 "fragments": [
@@ -4054,21 +4105,21 @@ pub(crate) mod tests {
                 "kind": "template",
                 "fragments": [
                     { "kind": "literal", "value": "-Djna.tmpdir=" },
-                    { "kind": "placeholder", "name": "nativesDirectory" }
+                    { "kind": "placeholder", "name": "scratchTempDirectory" }
                 ]
             }),
             serde_json::json!({
                 "kind": "template",
                 "fragments": [
                     { "kind": "literal", "value": "-Dorg.lwjgl.system.SharedLibraryExtractPath=" },
-                    { "kind": "placeholder", "name": "nativesDirectory" }
+                    { "kind": "placeholder", "name": "scratchTempDirectory" }
                 ]
             }),
             serde_json::json!({
                 "kind": "template",
                 "fragments": [
                     { "kind": "literal", "value": "-Dio.netty.native.workdir=" },
-                    { "kind": "placeholder", "name": "nativesDirectory" }
+                    { "kind": "placeholder", "name": "scratchTempDirectory" }
                 ]
             }),
             serde_json::json!({
@@ -5132,13 +5183,211 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn launch_scratch_is_distinct_from_the_sealed_native_directory() {
+        let valid = game_runtime_lock();
+        let launch: GameRuntimeLaunch = serde_json::from_value(valid["launch"].clone()).unwrap();
+        assert_eq!(
+            count_placeholder(
+                &launch.jvm_arguments,
+                GameLaunchPlaceholder::NativesDirectory
+            ),
+            1
+        );
+        assert_eq!(
+            count_placeholder(
+                &launch.jvm_arguments,
+                GameLaunchPlaceholder::ScratchTempDirectory
+            ),
+            5
+        );
+        validate_exact_jvm_arguments(&launch.jvm_arguments).unwrap();
+
+        for (prefix, forbidden_placeholder) in [
+            ("-Djava.library.path=", "scratchTempDirectory"),
+            ("-Djna.tmpdir=", "nativesDirectory"),
+            ("-XX:HeapDumpPath=", "nativesDirectory"),
+        ] {
+            let mut invalid = valid.clone();
+            let argument = invalid["launch"]["jvmArguments"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|argument| {
+                    argument["kind"] == "template" && argument["fragments"][0]["value"] == prefix
+                })
+                .unwrap();
+            let placeholder = argument["fragments"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|fragment| fragment["kind"] == "placeholder")
+                .unwrap();
+            placeholder["name"] = serde_json::json!(forbidden_placeholder);
+            let launch: GameRuntimeLaunch =
+                serde_json::from_value(invalid["launch"].clone()).unwrap();
+            assert!(validate_exact_jvm_arguments(&launch.jvm_arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn x64_game_runtime_keeps_native_classifiers_out_of_the_launch_classpath() {
+        let valid = game_runtime_lock();
+        let rebind_fingerprints = |lock: &mut serde_json::Value| {
+            let parsed: GameRuntimeLock = serde_json::from_value(lock.clone())
+                .expect("mutated fixture schema must deserialize");
+            let fingerprints = parsed
+                .compute_graph_fingerprints()
+                .expect("mutated fixture fingerprints must compute");
+            let resolver = lock["provenance"]["resolver"]
+                .as_object_mut()
+                .expect("fixture resolver must be an object");
+            for (field, value) in [
+                ("inputsSha256", fingerprints.inputs_sha256),
+                ("graphSha256", fingerprints.graph_sha256),
+                ("assetGraphSha256", fingerprints.asset_graph_sha256),
+                (
+                    "runtimeLibraryGraphSha256",
+                    fingerprints.runtime_library_graph_sha256,
+                ),
+                (
+                    "installerInputGraphSha256",
+                    fingerprints.installer_input_graph_sha256,
+                ),
+                ("downloadGraphSha256", fingerprints.download_graph_sha256),
+                ("launchSha256", fingerprints.launch_sha256),
+                ("upstreamPlanSha256", fingerprints.upstream_plan_sha256),
+                ("translationSha256", fingerprints.translation_sha256),
+                ("executablePlanSha256", fingerprints.executable_plan_sha256),
+                (
+                    "materializationGraphSha256",
+                    fingerprints.materialization_graph_sha256,
+                ),
+                (
+                    "metadataDeclarationSha256",
+                    fingerprints.metadata_declaration_sha256,
+                ),
+            ] {
+                resolver.insert(field.to_owned(), serde_json::json!(value));
+            }
+        };
+        let parsed = GameRuntimeLock::parse_and_validate(&serde_json::to_vec(&valid).unwrap())
+            .expect("x64 fixture must validate");
+        let native_paths = parsed
+            .files
+            .iter()
+            .filter(|file| file.role == GameRuntimeRole::NativeLibrary)
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(native_paths.len(), MINECRAFT_NEOFORGE_NATIVE_LIBRARY_COUNT);
+        assert!(native_paths
+            .iter()
+            .all(|path| path.ends_with("-natives-windows.jar")));
+        assert!(native_paths.iter().all(|path| !parsed
+            .launch
+            .classpath
+            .iter()
+            .any(|entry| entry == path)));
+        assert_eq!(
+            parsed.launch.classpath.len(),
+            MINECRAFT_NEOFORGE_RUNTIME_LIBRARY_COUNT + 1
+        );
+
+        let mut classpath_native = valid.clone();
+        let native_path = classpath_native["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["role"] == "native-library")
+            .unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        classpath_native["launch"]["classpath"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(native_path));
+        rebind_fingerprints(&mut classpath_native);
+        assert!(GameRuntimeLock::parse_and_validate(
+            &serde_json::to_vec(&classpath_native).unwrap()
+        )
+        .is_err());
+
+        for architecture in ["arm64", "x86"] {
+            let mut foreign = valid.clone();
+            let native = foreign["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["role"] == "native-library")
+                .unwrap();
+            for field in ["path", "source.url"] {
+                let target = if field == "path" {
+                    &mut native["path"]
+                } else {
+                    &mut native["source"]["url"]
+                };
+                *target = serde_json::json!(target.as_str().unwrap().replace(
+                    "-natives-windows.jar",
+                    &format!("-natives-windows-{architecture}.jar"),
+                ));
+            }
+            rebind_fingerprints(&mut foreign);
+            assert!(
+                GameRuntimeLock::parse_and_validate(&serde_json::to_vec(&foreign).unwrap())
+                    .is_err(),
+                "foreign {architecture} native was accepted in the x64 graph"
+            );
+        }
+
+        for classifier in [
+            "natives-linux",
+            "natives-macos",
+            "natives-windows-aarch64",
+            "NATIVES-WINDOWS",
+        ] {
+            let mut disguised = valid.clone();
+            let (old_path, new_path) = {
+                let library = disguised["files"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|file| file["role"] == "library")
+                    .unwrap();
+                let old_path = library["path"].as_str().unwrap().to_owned();
+                let new_path = format!(
+                    "{}-{classifier}.jar",
+                    old_path.strip_suffix(".jar").unwrap()
+                );
+                library["path"] = serde_json::json!(new_path);
+                let old_url = library["source"]["url"].as_str().unwrap();
+                library["source"]["url"] = serde_json::json!(format!(
+                    "{}-{classifier}.jar",
+                    old_url.strip_suffix(".jar").unwrap()
+                ));
+                (old_path, new_path)
+            };
+            for entry in disguised["launch"]["classpath"].as_array_mut().unwrap() {
+                if entry.as_str() == Some(old_path.as_str()) {
+                    *entry = serde_json::json!(new_path);
+                }
+            }
+            rebind_fingerprints(&mut disguised);
+            assert!(
+                GameRuntimeLock::parse_and_validate(&serde_json::to_vec(&disguised).unwrap())
+                    .is_err(),
+                "foreign classifier {classifier} was accepted as an ordinary library"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_spark2_release_canonical_verified_lock_fixture() {
         let bytes = include_bytes!(
             "../../tests/fixtures/game-runtime-lock-v2-release-canonical-verified.json"
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "9cdc76c6d62c4acfc50df8118a06c5556db3d0d420f2b14f2cdff565cf5b790d"
+            "c0ada0cc63faa954da18ccf17eb51eaddb71bcaeb38801dba92c99a5de1458de"
         );
         let lock = GameRuntimeLock::parse_and_validate(bytes)
             .expect("release canonical verified lock must validate");
@@ -5157,7 +5406,7 @@ pub(crate) mod tests {
             ),
             (
                 resolver.graph_sha256.as_str(),
-                "345fa45f03dac17514fb1b5f0478ce7cff8707e9a12d02e326779f80d0af2115",
+                "6765acd70b779f9d4220deb727e351414c1d45594970d24be16eb514ec177fe9",
             ),
             (
                 resolver.asset_graph_sha256.as_str(),
@@ -5165,7 +5414,7 @@ pub(crate) mod tests {
             ),
             (
                 resolver.runtime_library_graph_sha256.as_str(),
-                "5702d4d81d7ef00f36b2eceb74f1bd8cd2fd139c3e0ff2801c3919f608bff5db",
+                "28f714825ea3625faf2631d64646a4bedb4e4dedd29e1f58b42337069a626069",
             ),
             (
                 resolver.installer_input_graph_sha256.as_str(),
@@ -5173,11 +5422,11 @@ pub(crate) mod tests {
             ),
             (
                 resolver.download_graph_sha256.as_str(),
-                "cbbb955688af601baede28dd9bbfd5ff1b7729787378e704017602fd73aa5b10",
+                "6e630979318edece2e7f5ce5a9a5f635d3249b885bcd34d2c8231c27d20f4535",
             ),
             (
                 resolver.launch_sha256.as_str(),
-                "7ef64dc9a925e9edf372a9abd642a8d1719418768c4ab54ab8e35d47b90ded93",
+                "430bd337ec551988d45b15d9ad06e93ebed05e33ae4e78fd17fdef6d1f9e11fd",
             ),
             (
                 resolver.upstream_plan_sha256.as_str(),
@@ -5197,14 +5446,14 @@ pub(crate) mod tests {
             ),
             (
                 resolver.metadata_declaration_sha256.as_str(),
-                "d3935681db8b15f7a18e1976bfa15f9e9fa4eed4c671de90faf644ea7a415e97",
+                "d68b4ef99130c30df6b49e6b7d48a0de5dc740604d74ce6e31ab6c13004fd94b",
             ),
         ] {
             assert_eq!(actual, expected);
         }
         assert_eq!(
             resolver.resolver_artifact_sha256,
-            "2be70ba8be14eded04da701a47456b28c2705de6504bccdf6adafc232b8da1cf"
+            "0ef54d8dfb21b483ee512d1c83014603a94e1798d9ae41c19c74974ae40c9cb3"
         );
         lock.verification
             .offline_processors
@@ -5225,15 +5474,15 @@ pub(crate) mod tests {
             } => {
                 assert_eq!(
                     resolver_artifact_sha256,
-                    "2be70ba8be14eded04da701a47456b28c2705de6504bccdf6adafc232b8da1cf"
+                    "0ef54d8dfb21b483ee512d1c83014603a94e1798d9ae41c19c74974ae40c9cb3"
                 );
                 assert_eq!(
                     executor_artifact_sha256,
-                    "f5b57369631410ebac019a7d8e51988f46e95e339e308fe70c0f60e5edbc64fe"
+                    "832098de1538b314f08584712c63f5d9df6c59b561774f7a80848022b07aff20"
                 );
                 assert_eq!(
                     receipt_sha256,
-                    "091dbca682c3303ea2f1d69d0021be1323b49fad2e41d28d7a7f9e9019f49f68"
+                    "25a9962b3a04302c89b64f5f947212adb16efe6673cd4e82c42cf9e7b6319e9e"
                 );
                 let expected_transient_artifacts = expected_transient_artifact_states();
                 for run in runs.iter() {

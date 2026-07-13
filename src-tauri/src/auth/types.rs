@@ -1,6 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
+use std::time::{Duration as StdDuration, Instant};
 
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -306,6 +308,256 @@ impl LauncherAdmissionResponse {
         validate_optional_nickname(&Some(self.launcher_nick.clone()))?;
         validate_launcher_permissions(&self.launcher_permissions)?;
         self.entitlement.validate()
+    }
+}
+
+pub(crate) const LAUNCH_SPAWN_PURPOSE: &str = "minecraft_spawn";
+pub(crate) const LAUNCH_SPAWN_CONTRACT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LauncherSpawnAdmissionRequest {
+    pub(crate) channel: AdmissionChannel,
+}
+
+/// Response contract for the final, non-cacheable admission decision immediately before spawn.
+/// It is intentionally distinct from the UI preview response: an old endpoint or intermediary
+/// cannot accidentally deserialize into a native spawn capability.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LauncherSpawnAdmissionResponse {
+    pub(crate) purpose: String,
+    pub(crate) contract_version: u32,
+    pub(crate) allowed: bool,
+    pub(crate) channel: AdmissionChannel,
+    pub(crate) admitted_at: String,
+    pub(crate) session_id: String,
+    pub(crate) user_id: String,
+    pub(crate) launcher_nick: String,
+    pub(crate) launcher_role: LauncherRole,
+    pub(crate) launcher_permissions: Vec<String>,
+    pub(crate) entitlement: EntitlementSnapshot,
+}
+
+impl LauncherSpawnAdmissionResponse {
+    pub(crate) fn validate(&self) -> Result<(), ContractError> {
+        if self.purpose != LAUNCH_SPAWN_PURPOSE {
+            return Err(ContractError::InvalidField("purpose"));
+        }
+        if self.contract_version != LAUNCH_SPAWN_CONTRACT_VERSION {
+            return Err(ContractError::InvalidField("contractVersion"));
+        }
+        if !self.allowed {
+            return Err(ContractError::InvalidField("allowed"));
+        }
+        validate_timestamp(&self.admitted_at, "admittedAt")?;
+        validate_uuid(&self.session_id, "sessionId")?;
+        validate_uuid(&self.user_id, "userId")?;
+        validate_optional_nickname(&Some(self.launcher_nick.clone()))?;
+        validate_launcher_permissions(&self.launcher_permissions)?;
+        self.entitlement.validate()
+    }
+}
+
+const MAX_LAUNCH_ADMISSION_AGE: SignedDuration = SignedDuration::from_secs(30);
+const MAX_LAUNCH_ADMISSION_FUTURE_SKEW: SignedDuration = SignedDuration::from_secs(5);
+const MAX_LAUNCH_ADMISSION_MONOTONIC_LIFETIME: StdDuration = StdDuration::from_secs(30);
+const DEV_CHANNEL_PERMISSION: &str = "launcher.channel.dev";
+
+fn monotonic_deadline(
+    reference: Timestamp,
+    lifetime: SignedDuration,
+    wall_now: Timestamp,
+    monotonic_now: Instant,
+    cap: StdDuration,
+    field: &'static str,
+) -> Result<Instant, ContractError> {
+    let wall_deadline = reference
+        .checked_add(lifetime)
+        .map_err(|_| ContractError::InvalidField(field))?;
+    let remaining = wall_deadline.duration_since(wall_now);
+    if remaining <= SignedDuration::ZERO {
+        return Err(ContractError::InvalidField(field));
+    }
+    monotonic_now
+        .checked_add(remaining.unsigned_abs().min(cap))
+        .ok_or(ContractError::InvalidField(field))
+}
+
+/// Native-only proof that FragmentApi authorized this exact launch identity immediately before
+/// process creation. It is deliberately neither serializable nor cloneable, so it cannot cross
+/// the Tauri IPC boundary or be casually reused as a UI admission result.
+#[allow(dead_code)]
+pub(crate) struct VerifiedLaunchAdmission {
+    channel: AdmissionChannel,
+    session_id: Uuid,
+    admitted_at: Timestamp,
+    user_id: Uuid,
+    launcher_nick: String,
+    launcher_role: LauncherRole,
+    launcher_permissions: Vec<String>,
+    entitlement: EntitlementSnapshot,
+    monotonic_admission_deadline: Instant,
+    monotonic_entitlement_deadline: Option<Instant>,
+}
+
+#[allow(dead_code)]
+impl VerifiedLaunchAdmission {
+    pub(crate) fn from_response(
+        response: LauncherSpawnAdmissionResponse,
+        expected_channel: AdmissionChannel,
+        now: Timestamp,
+    ) -> Result<Self, ContractError> {
+        Self::from_response_at(response, expected_channel, now, Instant::now())
+    }
+
+    fn from_response_at(
+        response: LauncherSpawnAdmissionResponse,
+        expected_channel: AdmissionChannel,
+        now: Timestamp,
+        monotonic_now: Instant,
+    ) -> Result<Self, ContractError> {
+        response.validate()?;
+        if response.channel != expected_channel {
+            return Err(ContractError::InvalidField("channel"));
+        }
+
+        let admitted_at = Timestamp::from_str(&response.admitted_at)
+            .map_err(|_| ContractError::InvalidField("admittedAt"))?;
+        if expected_channel == AdmissionChannel::Dev
+            && !response
+                .launcher_permissions
+                .iter()
+                .any(|permission| permission == DEV_CHANNEL_PERMISSION)
+        {
+            return Err(ContractError::InvalidField("launcherPermissions"));
+        }
+
+        let session_id = Uuid::parse_str(&response.session_id)
+            .map_err(|_| ContractError::InvalidField("sessionId"))?;
+        let user_id = Uuid::parse_str(&response.user_id)
+            .map_err(|_| ContractError::InvalidField("userId"))?;
+        let monotonic_admission_deadline = monotonic_deadline(
+            admitted_at,
+            MAX_LAUNCH_ADMISSION_AGE,
+            now,
+            monotonic_now,
+            MAX_LAUNCH_ADMISSION_MONOTONIC_LIFETIME,
+            "admittedAt",
+        )?;
+        let monotonic_entitlement_deadline = response
+            .entitlement
+            .expires_at
+            .as_deref()
+            .map(|expires_at| {
+                let expires_at = Timestamp::from_str(expires_at)
+                    .map_err(|_| ContractError::InvalidField("entitlement.expiresAt"))?;
+                monotonic_deadline(
+                    now,
+                    expires_at.duration_since(now),
+                    now,
+                    monotonic_now,
+                    MAX_LAUNCH_ADMISSION_MONOTONIC_LIFETIME,
+                    "entitlement.expiresAt",
+                )
+            })
+            .transpose()?;
+        let admission = Self {
+            channel: response.channel,
+            session_id,
+            admitted_at,
+            user_id,
+            launcher_nick: response.launcher_nick,
+            launcher_role: response.launcher_role,
+            launcher_permissions: response.launcher_permissions,
+            entitlement: response.entitlement,
+            monotonic_admission_deadline,
+            monotonic_entitlement_deadline,
+        };
+        admission.validate_fresh_contract(now, monotonic_now)?;
+        Ok(admission)
+    }
+
+    /// Rechecks the short-lived server decision after the caller's final local revalidation and
+    /// immediately before process creation. This never refreshes or extends the admission window.
+    pub(crate) fn revalidate_fresh(&self, now: Timestamp) -> Result<(), super::session::AuthError> {
+        self.revalidate_fresh_at(now, Instant::now())
+            .map_err(super::session::AuthError::from)
+    }
+
+    fn revalidate_fresh_at(
+        &self,
+        now: Timestamp,
+        monotonic_now: Instant,
+    ) -> Result<(), ContractError> {
+        self.validate_fresh_contract(now, monotonic_now)
+    }
+
+    fn validate_fresh_contract(
+        &self,
+        now: Timestamp,
+        monotonic_now: Instant,
+    ) -> Result<(), ContractError> {
+        let age = now.duration_since(self.admitted_at);
+        if age > MAX_LAUNCH_ADMISSION_AGE || age < -MAX_LAUNCH_ADMISSION_FUTURE_SKEW {
+            return Err(ContractError::InvalidField("admittedAt"));
+        }
+        if monotonic_now >= self.monotonic_admission_deadline {
+            return Err(ContractError::InvalidField("admittedAt"));
+        }
+        if !self.entitlement.active || self.entitlement.level == SubscriptionLevel::None {
+            return Err(ContractError::InvalidField("entitlement.active"));
+        }
+        if let Some(expires_at) = self.entitlement.expires_at.as_deref() {
+            let expires_at = Timestamp::from_str(expires_at)
+                .map_err(|_| ContractError::InvalidField("entitlement.expiresAt"))?;
+            if expires_at <= now {
+                return Err(ContractError::InvalidField("entitlement.expiresAt"));
+            }
+        }
+        if self
+            .monotonic_entitlement_deadline
+            .is_some_and(|deadline| monotonic_now >= deadline)
+        {
+            return Err(ContractError::InvalidField("entitlement.expiresAt"));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn channel(&self) -> AdmissionChannel {
+        self.channel
+    }
+
+    pub(crate) const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub(crate) const fn admitted_at(&self) -> Timestamp {
+        self.admitted_at
+    }
+
+    pub(crate) const fn user_id(&self) -> Uuid {
+        self.user_id
+    }
+
+    pub(crate) fn minecraft_uuid(&self) -> String {
+        self.user_id.simple().to_string()
+    }
+
+    pub(crate) fn launcher_nick(&self) -> &str {
+        &self.launcher_nick
+    }
+
+    pub(crate) const fn launcher_role(&self) -> LauncherRole {
+        self.launcher_role
+    }
+
+    pub(crate) fn launcher_permissions(&self) -> &[String] {
+        &self.launcher_permissions
+    }
+
+    pub(crate) fn entitlement(&self) -> &EntitlementSnapshot {
+        &self.entitlement
     }
 }
 
@@ -745,6 +997,30 @@ fn bounded_error_code(value: String) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn spawn_response(
+        admitted_at: Timestamp,
+        entitlement_expires_at: Option<Timestamp>,
+    ) -> LauncherSpawnAdmissionResponse {
+        LauncherSpawnAdmissionResponse {
+            purpose: LAUNCH_SPAWN_PURPOSE.into(),
+            contract_version: LAUNCH_SPAWN_CONTRACT_VERSION,
+            allowed: true,
+            channel: AdmissionChannel::Stable,
+            admitted_at: admitted_at.to_string(),
+            session_id: "660e8400-e29b-41d4-a716-446655440000".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            launcher_nick: "Player_1".into(),
+            launcher_role: LauncherRole::Player,
+            launcher_permissions: Vec::new(),
+            entitlement: EntitlementSnapshot {
+                active: true,
+                level: SubscriptionLevel::Novice,
+                expires_at: entitlement_expires_at.map(|value| value.to_string()),
+                recalculated_at: Some(admitted_at.to_string()),
+            },
+        }
+    }
+
     #[test]
     fn secret_is_redacted_and_not_serializable() {
         let secret = Secret::new("a".repeat(32)).expect("valid secret");
@@ -806,5 +1082,97 @@ mod tests {
         ] {
             assert!(validate_telegram_link(&invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn spawn_admission_requires_exact_purpose_and_contract_version() {
+        let base = serde_json::json!({
+            "purpose": "minecraft_spawn",
+            "contractVersion": 1,
+            "allowed": true,
+            "channel": "stable",
+            "admittedAt": Timestamp::now().to_string(),
+            "sessionId": "660e8400-e29b-41d4-a716-446655440000",
+            "userId": "550e8400-e29b-41d4-a716-446655440000",
+            "launcherNick": "Player_1",
+            "launcherRole": "player",
+            "launcherPermissions": [],
+            "entitlement": {
+                "active": true,
+                "level": "novice",
+                "expiresAt": null,
+                "recalculatedAt": null
+            }
+        });
+        let valid: LauncherSpawnAdmissionResponse =
+            serde_json::from_value(base.clone()).expect("exact spawn response");
+        assert!(valid.validate().is_ok());
+
+        for field in ["purpose", "contractVersion"] {
+            let mut missing = base.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<LauncherSpawnAdmissionResponse>(missing).is_err());
+        }
+
+        let mut wrong_purpose = base.clone();
+        wrong_purpose["purpose"] = serde_json::json!("status_preview");
+        assert!(
+            serde_json::from_value::<LauncherSpawnAdmissionResponse>(wrong_purpose)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        let mut wrong_version = base;
+        wrong_version["contractVersion"] = serde_json::json!(2);
+        assert!(
+            serde_json::from_value::<LauncherSpawnAdmissionResponse>(wrong_version)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn monotonic_deadline_rejects_wall_clock_rollback_after_admission() {
+        let wall_now = Timestamp::now();
+        let monotonic_now = Instant::now();
+        let admission = VerifiedLaunchAdmission::from_response_at(
+            spawn_response(wall_now, None),
+            AdmissionChannel::Stable,
+            wall_now,
+            monotonic_now,
+        )
+        .unwrap();
+        let after_deadline = monotonic_now
+            .checked_add(StdDuration::from_secs(31))
+            .unwrap();
+
+        assert_eq!(
+            admission.revalidate_fresh_at(wall_now, after_deadline),
+            Err(ContractError::InvalidField("admittedAt"))
+        );
+    }
+
+    #[test]
+    fn monotonic_entitlement_deadline_survives_wall_clock_rollback() {
+        let wall_now = Timestamp::now();
+        let entitlement_expiry = wall_now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let monotonic_now = Instant::now();
+        let admission = VerifiedLaunchAdmission::from_response_at(
+            spawn_response(wall_now, Some(entitlement_expiry)),
+            AdmissionChannel::Stable,
+            wall_now,
+            monotonic_now,
+        )
+        .unwrap();
+        let after_expiry = monotonic_now
+            .checked_add(StdDuration::from_secs(3))
+            .unwrap();
+
+        assert_eq!(
+            admission.revalidate_fresh_at(wall_now, after_expiry),
+            Err(ContractError::InvalidField("entitlement.expiresAt"))
+        );
     }
 }

@@ -660,9 +660,19 @@
 		transform 140ms ease;
 }
 
+.operation-status-popover::after {
+	position: absolute;
+	top: 100%;
+	right: 0;
+	left: 0;
+	height: 12px;
+	content: '';
+}
+
 .primary-action-wrap:hover .operation-status-popover,
 .primary-action-wrap:focus-within .operation-status-popover {
 	opacity: 1;
+	pointer-events: auto;
 	transform: translateY(0);
 }
 

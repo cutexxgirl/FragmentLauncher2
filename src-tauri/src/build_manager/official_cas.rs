@@ -758,7 +758,7 @@ impl OperationRetryGovernor {
 
     /// Reserves every network attempt after an object's first one, including transport/status
     /// retries, a range reset and a clean integrity retry. One outage therefore cannot multiply
-    /// independently across all 4,022 official objects.
+    /// independently across all 4,006 official objects.
     fn prepare_attempt(&self, is_retry: bool) -> OfficialResult<()> {
         let mut state = self
             .state
