@@ -26,6 +26,12 @@ mod instance_state;
 #[allow(dead_code)]
 mod journal;
 #[allow(dead_code)]
+mod launch_guard_ipc;
+#[allow(dead_code)]
+mod launch_ticket_client;
+#[allow(dead_code)]
+mod launch_ticket_service;
+#[allow(dead_code)]
 mod managed_fs;
 #[allow(dead_code)]
 mod mutable;
@@ -66,9 +72,14 @@ use coordinator::{
 };
 use game_launch::prepare_game_invocation;
 use game_natives::prepare_native_workspace;
+use launch_guard_ipc::{
+    ArmedLaunchGuardBroker, LaunchGuardBrokerOutcome, LaunchGuardIssueFailure,
+    PendingLaunchGuardBroker,
+};
+use launch_ticket_service::LaunchTicketIssuer;
 use planner::PlannedBuildState;
 pub(crate) use process_supervisor::spawn_command_with_inheritance_lock;
-use process_supervisor::spawn_with_before_resume as spawn_contained_process_with_gate;
+use process_supervisor::spawn_with_before_resume_identity as spawn_contained_process_with_gate;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -82,7 +93,7 @@ use storage::{
     load_config, save_config, select_install_directory, validate_owned_install_directory,
     BuildManagerConfig,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use types::{BuildPhase, PrimaryAction, TransferProgress};
 use uuid::Uuid;
 
@@ -1343,6 +1354,97 @@ impl BuildManager {
     }
 }
 
+/// Owns the asynchronous pipe server for one Java process. Every ordinary path explicitly joins
+/// it; `Drop` is only a panic-safety backstop and aborts instead of silently detaching a credential
+/// task into the per-operation runtime.
+struct ActiveLaunchGuardTask {
+    shutdown: watch::Sender<bool>,
+    worker: Option<tokio::task::JoinHandle<Result<LaunchGuardBrokerOutcome, String>>>,
+}
+
+impl ActiveLaunchGuardTask {
+    fn start(broker: ArmedLaunchGuardBroker, issuer: LaunchTicketIssuer) -> Self {
+        let (shutdown, receiver) = watch::channel(false);
+        let mut issuer = Some(issuer);
+        let worker = tokio::spawn(async move {
+            broker
+                .serve(receiver, move |binding| {
+                    let issuer = issuer.take();
+                    async move {
+                        match issuer {
+                            Some(issuer) => issuer.issue(binding).await,
+                            None => Err(LaunchGuardIssueFailure::Fatal),
+                        }
+                    }
+                })
+                .await
+        });
+        Self {
+            shutdown,
+            worker: Some(worker),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn join_finished(mut self) -> Result<LaunchGuardBrokerOutcome, String> {
+        self.join_worker().await
+    }
+
+    async fn shutdown_and_join(mut self) -> Result<LaunchGuardBrokerOutcome, String> {
+        let _ = self.shutdown.send(true);
+        self.join_worker().await
+    }
+
+    async fn join_worker(&mut self) -> Result<LaunchGuardBrokerOutcome, String> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| "Launch-guard broker was already joined".to_string())?;
+        worker
+            .await
+            .map_err(|_| "Launch-guard broker worker terminated unexpectedly".to_string())?
+    }
+}
+
+impl Drop for ActiveLaunchGuardTask {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+    }
+}
+
+fn launch_guard_outcome_error(
+    outcome: LaunchGuardBrokerOutcome,
+    process_still_running: bool,
+) -> Option<String> {
+    match outcome {
+        LaunchGuardBrokerOutcome::Delivered => None,
+        LaunchGuardBrokerOutcome::Cancelled if !process_still_running => None,
+        LaunchGuardBrokerOutcome::Cancelled => {
+            Some("Secure launch-ticket broker stopped while Minecraft was still running".into())
+        }
+        LaunchGuardBrokerOutcome::Rejected(LaunchGuardIssueFailure::AccessDenied) => {
+            Some("Fragment rejected launch-ticket authorization for this session".into())
+        }
+        LaunchGuardBrokerOutcome::Rejected(LaunchGuardIssueFailure::ChallengeRejected) => {
+            Some("The game server launch challenge is no longer valid".into())
+        }
+        LaunchGuardBrokerOutcome::Rejected(LaunchGuardIssueFailure::Retryable) => {
+            Some("Spark2 could not issue the launch ticket before its deadline".into())
+        }
+        LaunchGuardBrokerOutcome::Rejected(LaunchGuardIssueFailure::Fatal) => {
+            Some("Secure launch-ticket validation failed closed".into())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_game_launch(
     manager: Arc<BuildManager>,
@@ -1423,14 +1525,32 @@ async fn run_game_launch(
         return Err(CoordinatorError::Cancelled);
     }
 
+    let running_identity = admission.running_identity();
+    let (pending_broker, launch_guard_bootstrap) =
+        PendingLaunchGuardBroker::prepare().map_err(|_| {
+            CoordinatorError::Failed("Cannot create the secure launch-guard pipe".into())
+        })?;
+    let ticket_issuer = LaunchTicketIssuer::new(
+        Arc::clone(&auth),
+        running_identity,
+        key.channel,
+        key.preset,
+        prepared.release_id().to_owned(),
+        prepared.install_id(),
+    )
+    .map_err(|_| {
+        CoordinatorError::Failed("Cannot initialize secure launch-ticket authorization".into())
+    })?;
+
     manager.update_game_progress(
         key,
         operation_id,
         BuildPhase::Launching,
         "Финально проверяем файлы и запускаем Java 25…",
     );
-    let invocation = prepare_game_invocation(&prepared, &natives, &admission)
-        .map_err(CoordinatorError::Failed)?;
+    let invocation =
+        prepare_game_invocation(&prepared, &natives, &admission, &launch_guard_bootstrap)
+            .map_err(CoordinatorError::Failed)?;
     prepared.revalidate_for_spawn()?;
     natives
         .revalidate_fast()
@@ -1442,8 +1562,10 @@ async fn run_game_launch(
         return Err(CoordinatorError::Cancelled);
     }
 
+    let mut pending_broker = Some(pending_broker);
+    let mut armed_broker = None;
     let spawn_result = spawn_and_release_lifecycle(admission, |admission| {
-        spawn_contained_process_with_gate(invocation.process_spec(), || {
+        spawn_contained_process_with_gate(invocation.process_spec(), |process_binding| {
             // CreateProcessW has succeeded, Job containment has been proven, and Java is still
             // suspended here. Repeat the bounded authority gate at the final possible instant;
             // SpawnGuard kills the child without running payload code on any rejection.
@@ -1457,6 +1579,11 @@ async fn run_game_launch(
             if stop_requested.load(Ordering::Acquire) {
                 return Err("Game launch was cancelled before Java resumed".into());
             }
+            let broker = pending_broker
+                .take()
+                .ok_or_else(|| "Launch-guard broker was already armed".to_string())?
+                .arm(process_binding)?;
+            armed_broker = Some(broker);
             // This must remain the last operation before returning to the supervisor's immediate
             // ResumeThread call. It is the only point where Minecraft's signed mutable files
             // become writable; exact content remains sealed for the whole Job lifetime.
@@ -1467,14 +1594,35 @@ async fn run_game_launch(
         })
     });
     let (mut child, pipes) = spawn_result.map_err(CoordinatorError::Failed)?;
+    let armed_broker = armed_broker
+        .take()
+        .ok_or_else(|| CoordinatorError::Failed("Launch-guard broker was not armed".into()))?;
+    let mut launch_guard = Some(ActiveLaunchGuardTask::start(armed_broker, ticket_issuer));
     let pid = child.pid();
     let drain = match pipes.drain_bounded(64 * 1024) {
         Ok(drain) => drain,
         Err(error) => {
-            if let Err(cleanup) = child.terminate_and_reap(Duration::from_secs(5)) {
-                return Err(CoordinatorError::Failed(format!(
-                    "{error}; process cleanup failed: {cleanup}"
-                )));
+            let process_cleanup = child.terminate_and_reap(Duration::from_secs(5));
+            let broker_cleanup = launch_guard
+                .take()
+                .expect("an armed launch always owns its broker task")
+                .shutdown_and_join()
+                .await;
+            let mut errors = vec![error];
+            if let Err(cleanup) = process_cleanup {
+                errors.push(format!("Process cleanup failed: {cleanup}"));
+                if let Err(broker) = broker_cleanup {
+                    errors.push(broker);
+                }
+                return Err(CoordinatorError::Failed(errors.join("; ")));
+            }
+            match broker_cleanup {
+                Ok(outcome) => {
+                    if let Some(broker) = launch_guard_outcome_error(outcome, false) {
+                        errors.push(broker);
+                    }
+                }
+                Err(broker) => errors.push(broker),
             }
             // ResumeThread has already run. Once the Job is proven empty this is a real game exit,
             // even if the bounded output drain could not finish its local startup handshake. Keep
@@ -1491,7 +1639,6 @@ async fn run_game_launch(
             );
             let snapshot = prepared.settle_after_game()?;
             drop(prepared);
-            let mut errors = vec![error];
             if let Err(cleanup) = native_cleanup {
                 errors.push(format!("Native workspace cleanup failed: {cleanup}"));
             }
@@ -1506,28 +1653,89 @@ async fn run_game_launch(
     );
 
     let mut stopped = false;
+    let mut job_reaped = false;
+    let mut launch_diagnostics = Vec::new();
     let exit_code = loop {
-        if let Some(code) = child.try_wait().map_err(CoordinatorError::Failed)? {
-            break code;
+        match child.try_wait() {
+            Ok(Some(code)) => break code,
+            Ok(None) => {}
+            Err(error) => {
+                stopped = true;
+                launch_diagnostics.push(error);
+                if let Err(cleanup) = child.terminate_and_reap(Duration::from_secs(10)) {
+                    if let Some(broker) = launch_guard.take() {
+                        let _ = broker.shutdown_and_join().await;
+                    }
+                    launch_diagnostics.push(format!("Process cleanup failed: {cleanup}"));
+                    return Err(CoordinatorError::Failed(launch_diagnostics.join("; ")));
+                }
+                job_reaped = true;
+                break child.try_wait().ok().flatten().unwrap_or(1);
+            }
+        }
+        if launch_guard
+            .as_ref()
+            .is_some_and(ActiveLaunchGuardTask::is_finished)
+        {
+            let result = launch_guard
+                .take()
+                .expect("a finished launch-guard task is present")
+                .join_finished()
+                .await;
+            match result {
+                Ok(LaunchGuardBrokerOutcome::Delivered) => {}
+                Ok(outcome) => {
+                    if let Some(error) = launch_guard_outcome_error(outcome, true) {
+                        launch_diagnostics.push(error);
+                    }
+                    stopped = true;
+                }
+                Err(error) => {
+                    launch_diagnostics.push(error);
+                    stopped = true;
+                }
+            }
+            if stopped {
+                if let Err(cleanup) = child.terminate_and_reap(Duration::from_secs(10)) {
+                    launch_diagnostics.push(format!("Process cleanup failed: {cleanup}"));
+                    return Err(CoordinatorError::Failed(launch_diagnostics.join("; ")));
+                }
+                job_reaped = true;
+                break child.try_wait().ok().flatten().unwrap_or(1);
+            }
         }
         if stop_requested.load(Ordering::Acquire) {
             stopped = true;
-            child
-                .terminate_and_reap(Duration::from_secs(10))
-                .map_err(CoordinatorError::Failed)?;
-            break child
-                .try_wait()
-                .map_err(CoordinatorError::Failed)?
-                .unwrap_or(1);
+            if let Err(cleanup) = child.terminate_and_reap(Duration::from_secs(10)) {
+                if let Some(broker) = launch_guard.take() {
+                    let _ = broker.shutdown_and_join().await;
+                }
+                return Err(CoordinatorError::Failed(cleanup));
+            }
+            job_reaped = true;
+            break child.try_wait().ok().flatten().unwrap_or(1);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
     // The Java root may have spawned descendants which inherited stdout/stderr. Drain only after
     // the Job is proven empty, otherwise a surviving helper could keep a pipe writer open forever.
-    if !stopped {
-        child
-            .terminate_and_reap(Duration::from_secs(10))
-            .map_err(CoordinatorError::Failed)?;
+    if !job_reaped {
+        if let Err(cleanup) = child.terminate_and_reap(Duration::from_secs(10)) {
+            if let Some(broker) = launch_guard.take() {
+                let _ = broker.shutdown_and_join().await;
+            }
+            return Err(CoordinatorError::Failed(cleanup));
+        }
+    }
+    if let Some(broker) = launch_guard.take() {
+        match broker.shutdown_and_join().await {
+            Ok(outcome) => {
+                if let Some(error) = launch_guard_outcome_error(outcome, false) {
+                    launch_diagnostics.push(error);
+                }
+            }
+            Err(error) => launch_diagnostics.push(error),
+        }
     }
     let capture = drain.finish();
     drop(child);
@@ -1560,7 +1768,7 @@ async fn run_game_launch(
     // release, inventory, mutable defaults and locks used for this launch.
     let snapshot = prepared.settle_after_game()?;
     drop(prepared);
-    let mut errors = Vec::new();
+    let mut errors = launch_diagnostics;
     if let Some(error) = process_error {
         errors.push(error);
     }

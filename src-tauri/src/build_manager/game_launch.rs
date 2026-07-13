@@ -5,6 +5,7 @@ use super::{
     },
     coordinator::PreparedGameLaunch,
     game_natives::NativeWorkspace,
+    launch_guard_ipc::{LaunchGuardBootstrap, LAUNCH_GUARD_NONCE_ENV, LAUNCH_GUARD_PIPE_ENV},
     managed_fs::RelativeManagedPath,
     process_supervisor::ProcessSpec,
 };
@@ -102,6 +103,7 @@ pub(super) fn prepare_game_invocation(
     prepared: &PreparedGameLaunch,
     natives: &NativeWorkspace,
     admission: &LaunchAdmissionLease,
+    launch_guard: &LaunchGuardBootstrap,
 ) -> Result<PreparedGameInvocation, String> {
     let expected_admission_channel = match prepared.channel() {
         super::types::BuildChannel::Stable => AdmissionChannel::Stable,
@@ -207,6 +209,7 @@ pub(super) fn prepare_game_invocation(
     if let Some(system_root) = controlled_system_root()? {
         environment.push((OsString::from("SystemRoot"), system_root));
     }
+    environment.extend(launch_guard.environment());
 
     let invocation = PreparedGameInvocation {
         executable: prepared.runtime().java().to_path_buf(),
@@ -214,7 +217,7 @@ pub(super) fn prepare_game_invocation(
         cwd: prepared.instance_root().to_path_buf(),
         environment,
     };
-    validate_invocation(&invocation, lock)?;
+    validate_invocation(&invocation, lock, launch_guard)?;
     Ok(invocation)
 }
 
@@ -313,6 +316,7 @@ fn controlled_system_root() -> Result<Option<OsString>, String> {
 fn validate_invocation(
     invocation: &PreparedGameInvocation,
     lock: &GameRuntimeLock,
+    launch_guard: &LaunchGuardBootstrap,
 ) -> Result<(), String> {
     if !invocation.executable.is_absolute()
         || !invocation.cwd.is_absolute()
@@ -340,6 +344,22 @@ fn validate_invocation(
         {
             return Err("Prepared game environment contains an ambient Java hook".into());
         }
+    }
+    let expected_pipe = invocation.environment.iter().filter(|(key, value)| {
+        key.to_string_lossy()
+            .eq_ignore_ascii_case(LAUNCH_GUARD_PIPE_ENV)
+            && value == launch_guard.pipe_name()
+    });
+    if expected_pipe.count() != 1 {
+        return Err("Prepared game environment lost its launch-guard pipe binding".into());
+    }
+    let expected_nonce = invocation.environment.iter().filter(|(key, value)| {
+        key.to_string_lossy()
+            .eq_ignore_ascii_case(LAUNCH_GUARD_NONCE_ENV)
+            && value == launch_guard.nonce_text()
+    });
+    if expected_nonce.count() != 1 {
+        return Err("Prepared game environment lost its launch-guard bootstrap proof".into());
     }
     Ok(())
 }

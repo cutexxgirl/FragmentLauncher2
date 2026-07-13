@@ -5,7 +5,9 @@ mod session;
 mod types;
 
 pub use session::{AuthError, AuthSessionManager};
-pub(crate) use session::{LaunchAdmissionError, LaunchAdmissionLease};
+pub(crate) use session::{
+    LaunchAdmissionError, LaunchAdmissionLease, LaunchTicketAuthLease, RunningLaunchIdentity,
+};
 pub(crate) use session::{NativeAccessFailure, NativeAccessToken};
 pub use types::{
     AdmissionChannel, AuthSnapshot, EntitlementSnapshot, LauncherAdmissionReason,

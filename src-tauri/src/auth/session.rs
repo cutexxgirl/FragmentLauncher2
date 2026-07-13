@@ -19,8 +19,8 @@ use super::process_lock::{ProcessLockError, RefreshProcessLease, RefreshProcessL
 use super::types::{
     normalize_device_name, normalize_nickname, validate_refresh_token, AdmissionChannel,
     AuthSnapshot, ContractError, LauncherAdmissionReason, LauncherAdmissionResponse,
-    LauncherAdmissionSnapshot, LauncherProfile, Secret, SessionResponse, TelegramLoginSnapshot,
-    TelegramPollOutcome, TelegramPollSnapshot, VerifiedLaunchAdmission,
+    LauncherAdmissionSnapshot, LauncherProfile, LauncherRole, Secret, SessionResponse,
+    TelegramLoginSnapshot, TelegramPollOutcome, TelegramPollSnapshot, VerifiedLaunchAdmission,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -136,8 +136,152 @@ impl LaunchAdmissionLease {
         self.admission.launcher_nick()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn device_session_id(&self) -> Uuid {
+        self.admission.session_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn user_id(&self) -> Uuid {
+        self.admission.user_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn launcher_role(&self) -> LauncherRole {
+        self.admission.launcher_role()
+    }
+
+    /// Captures the exact non-secret identity which FragmentApi admitted for the process being
+    /// created. Unlike the admission itself this snapshot may outlive CreateProcess and be cloned
+    /// for the post-spawn launch-ticket exchange.
+    pub(crate) fn running_identity(&self) -> RunningLaunchIdentity {
+        RunningLaunchIdentity::from_admission(&self.admission)
+    }
+
     pub(crate) fn revalidate_fresh(&self, now: Timestamp) -> Result<(), AuthError> {
         self.admission.revalidate_fresh(now)
+    }
+}
+
+/// Immutable, native-only, non-secret identity of one already-admitted Minecraft process.
+///
+/// The device-session id and role intentionally remain server preconditions for Spark: neither is
+/// present in the persisted refresh credential, so the launcher must never try to reconstruct or
+/// overwrite them from a later local profile snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunningLaunchIdentity {
+    channel: AdmissionChannel,
+    device_session_id: Uuid,
+    user_id: Uuid,
+    launcher_nick: String,
+    launcher_role: LauncherRole,
+    minecraft_uuid: String,
+}
+
+impl RunningLaunchIdentity {
+    fn from_admission(admission: &VerifiedLaunchAdmission) -> Self {
+        let identity = Self {
+            channel: admission.channel(),
+            device_session_id: admission.session_id(),
+            user_id: admission.user_id(),
+            launcher_nick: admission.launcher_nick().to_owned(),
+            launcher_role: admission.launcher_role(),
+            minecraft_uuid: admission.minecraft_uuid(),
+        };
+        debug_assert!(identity.validate().is_ok());
+        identity
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), AuthError> {
+        let normalized = normalize_nickname(Some(&self.launcher_nick))?;
+        if normalized.as_deref() != Some(self.launcher_nick.as_str())
+            || self.minecraft_uuid != self.user_id.simple().to_string()
+        {
+            return Err(ContractError::InvalidField("runningLaunchIdentity").into());
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn channel(&self) -> AdmissionChannel {
+        self.channel
+    }
+
+    pub(crate) const fn device_session_id(&self) -> Uuid {
+        self.device_session_id
+    }
+
+    pub(crate) const fn user_id(&self) -> Uuid {
+        self.user_id
+    }
+
+    pub(crate) fn launcher_nick(&self) -> &str {
+        &self.launcher_nick
+    }
+
+    pub(crate) const fn launcher_role(&self) -> LauncherRole {
+        self.launcher_role
+    }
+
+    #[cfg(test)]
+    pub(crate) fn minecraft_uuid(&self) -> &str {
+        &self.minecraft_uuid
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchTicketAuthAttempt {
+    Initial,
+    RotatedAfterUnauthorized,
+}
+
+/// Native-only linearization lease for one bounded Spark ticket request and its local IPC ACK.
+/// It is deliberately non-cloneable and must not be retained for the lifetime of the game.
+#[must_use = "the ticket auth lease must cover the bounded HTTP request and IPC acknowledgement"]
+pub(crate) struct LaunchTicketAuthLease {
+    token: NativeAccessToken,
+    running_identity: RunningLaunchIdentity,
+    attempt: LaunchTicketAuthAttempt,
+    _local_lifecycle: OwnedMutexGuard<()>,
+    _process_lifecycle: RefreshProcessLease,
+}
+
+impl LaunchTicketAuthLease {
+    /// The bearer capability is borrow-only at this boundary. It must never cross Tauri IPC or be
+    /// rendered into an error, command line, environment variable, or diagnostic buffer.
+    pub(crate) const fn access_token(&self) -> &NativeAccessToken {
+        &self.token
+    }
+
+    pub(crate) const fn running_identity(&self) -> &RunningLaunchIdentity {
+        &self.running_identity
+    }
+
+    /// Consumes the lease and releases both lifecycle locks before returning an opaque proof of
+    /// the exact token rejected by a 401. A lease returned after that rotation cannot produce a
+    /// second proof, which makes the one-retry policy structural rather than caller convention.
+    pub(crate) fn into_rejected_token(self) -> Option<RejectedLaunchTicketToken> {
+        let Self {
+            token,
+            running_identity: _,
+            attempt,
+            _local_lifecycle,
+            _process_lifecycle,
+        } = self;
+        drop(_process_lifecycle);
+        drop(_local_lifecycle);
+        (attempt == LaunchTicketAuthAttempt::Initial).then_some(RejectedLaunchTicketToken { token })
+    }
+}
+
+/// Linear, opaque identity of one rejected bearer capability. It is neither cloneable nor
+/// externally constructible and is consumed by the completion-safe refresh path.
+pub(crate) struct RejectedLaunchTicketToken {
+    token: NativeAccessToken,
+}
+
+impl std::fmt::Debug for RejectedLaunchTicketToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RejectedLaunchTicketToken([REDACTED])")
     }
 }
 
@@ -327,6 +471,64 @@ impl AuthSessionManager {
         self.refresh_access(Some(&rejected.0), true)
             .await
             .map(NativeAccessToken)
+    }
+
+    /// Acquires the bearer first, then seals both the in-process and cross-process session
+    /// generations for one bounded post-spawn launch-ticket exchange.
+    pub(crate) async fn launch_ticket_auth_lease(
+        self: &Arc<Self>,
+        expected: &RunningLaunchIdentity,
+    ) -> Result<LaunchTicketAuthLease, AuthError> {
+        expected.validate()?;
+        let token = self.access_for_request().await?;
+        self.launch_ticket_auth_lease_for_token(token, expected, LaunchTicketAuthAttempt::Initial)
+            .await
+    }
+
+    /// Performs the only permitted ticket-request 401 rotation. Refresh persistence remains
+    /// completion-safe even if the outer broker future is cancelled while awaiting it. The
+    /// returned lease is marked terminal, so a second 401 cannot trigger a third request.
+    pub(crate) async fn launch_ticket_auth_lease_after_rejection_completion_safe(
+        self: &Arc<Self>,
+        rejected: RejectedLaunchTicketToken,
+        expected: &RunningLaunchIdentity,
+    ) -> Result<LaunchTicketAuthLease, AuthError> {
+        expected.validate()?;
+        let token = self.refresh_access(Some(&rejected.token.0), true).await?;
+        self.launch_ticket_auth_lease_for_token(
+            token,
+            expected,
+            LaunchTicketAuthAttempt::RotatedAfterUnauthorized,
+        )
+        .await
+    }
+
+    async fn launch_ticket_auth_lease_for_token(
+        self: &Arc<Self>,
+        token: Arc<Secret>,
+        expected: &RunningLaunchIdentity,
+        attempt: LaunchTicketAuthAttempt,
+    ) -> Result<LaunchTicketAuthLease, AuthError> {
+        let local_lifecycle = Arc::clone(&self.refresh_gate).lock_owned().await;
+        let process_lifecycle = self.process_lock.acquire().await?;
+        let current = self.recheck_locked_session(&token).await?;
+
+        // The refresh credential binds this access token to the exact local session generation,
+        // but does not contain DeviceSession id or launcher role. Spark validates those two
+        // fields as expected preconditions against a fresh FragmentApi spawn admission.
+        if current.user_id != expected.user_id
+            || current.launcher_nick.as_deref() != Some(expected.launcher_nick())
+        {
+            return Err(AuthError::SessionChanged);
+        }
+
+        Ok(LaunchTicketAuthLease {
+            token: NativeAccessToken(token),
+            running_identity: expected.clone(),
+            attempt,
+            _local_lifecycle: local_lifecycle,
+            _process_lifecycle: process_lifecycle,
+        })
     }
 
     /// Restores a session by rotating the persisted refresh token. An invalid
@@ -2167,6 +2369,163 @@ mod tests {
         }
         assert_eq!(api.admission_calls.load(Ordering::SeqCst), 1);
         assert_eq!(api.spawn_admission_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn running_launch_identity_matches_the_exact_spawn_admission() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api, store));
+        manager.restore().await.unwrap();
+
+        let admission = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        let identity = admission.running_identity();
+
+        assert_eq!(identity.channel(), admission.channel());
+        assert_eq!(identity.device_session_id(), admission.device_session_id());
+        assert_eq!(identity.user_id(), admission.user_id());
+        assert_eq!(identity.launcher_nick(), admission.launcher_nick());
+        assert_eq!(identity.launcher_role(), admission.launcher_role());
+        assert_eq!(identity.minecraft_uuid(), admission.minecraft_uuid());
+        assert!(identity.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ticket_auth_lease_blocks_logout_nickname_and_profile_refresh_until_drop() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        let admission = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        let identity = admission.running_identity();
+        drop(admission);
+
+        let lease = manager.launch_ticket_auth_lease(&identity).await.unwrap();
+        assert!(manager.refresh_gate.try_lock().is_err());
+
+        let (logout_started_tx, logout_started_rx) = tokio::sync::oneshot::channel();
+        let logout = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _ = logout_started_tx.send(());
+                manager.logout().await
+            }
+        });
+        let (nickname_started_tx, nickname_started_rx) = tokio::sync::oneshot::channel();
+        let nickname = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _ = nickname_started_tx.send(());
+                manager.update_nickname(Some("Blocked_Nick")).await
+            }
+        });
+        let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _ = refresh_started_tx.send(());
+                manager.refresh_profile().await
+            }
+        });
+        logout_started_rx.await.unwrap();
+        nickname_started_rx.await.unwrap();
+        refresh_started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        assert_eq!(api.logouts.load(Ordering::SeqCst), 0);
+        assert_eq!(api.nickname_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.profile_gets.load(Ordering::SeqCst), 0);
+
+        logout.abort();
+        nickname.abort();
+        refresh.abort();
+        assert!(logout.await.unwrap_err().is_cancelled());
+        assert!(nickname.await.unwrap_err().is_cancelled());
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn ticket_auth_rejects_a_local_account_or_nickname_switch_from_the_running_process() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api, store));
+        manager.restore().await.unwrap();
+        let admission = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        let identity = admission.running_identity();
+        drop(admission);
+
+        manager.state.lock().await.profile.as_mut().unwrap().user_id =
+            "750e8400-e29b-41d4-a716-446655440000".into();
+
+        assert!(matches!(
+            manager.launch_ticket_auth_lease(&identity).await,
+            Err(AuthError::SessionChanged)
+        ));
+
+        {
+            let mut state = manager.state.lock().await;
+            let profile = state.profile.as_mut().unwrap();
+            profile.user_id = identity.user_id().to_string();
+            profile.launcher_nick = Some("Other_Player".into());
+        }
+        assert!(matches!(
+            manager.launch_ticket_auth_lease(&identity).await,
+            Err(AuthError::SessionChanged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ticket_auth_token_is_redacted_and_allows_exactly_one_401_rotation() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        let admission = manager
+            .launch_admission(AdmissionChannel::Stable)
+            .await
+            .unwrap();
+        let identity = admission.running_identity();
+        drop(admission);
+
+        let initial = manager.launch_ticket_auth_lease(&identity).await.unwrap();
+        assert!(initial.access_token().expose().starts_with("access-1-"));
+        let rendered = format!("{:?}", initial.access_token());
+        assert_eq!(rendered, "NativeAccessToken([REDACTED])");
+        assert!(!rendered.contains("access-1-"));
+
+        let rejected = initial
+            .into_rejected_token()
+            .expect("the initial request may rotate once");
+        assert_eq!(
+            format!("{rejected:?}"),
+            "RejectedLaunchTicketToken([REDACTED])"
+        );
+        let rotated = manager
+            .launch_ticket_auth_lease_after_rejection_completion_safe(rejected, &identity)
+            .await
+            .unwrap();
+        assert!(rotated.access_token().expose().starts_with("access-2-"));
+        assert_eq!(rotated.running_identity(), &identity);
+        assert!(rotated.into_rejected_token().is_none());
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -719,12 +719,13 @@ mod platform {
                 Pipes::CreatePipe,
                 Threading::{
                     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-                    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
-                    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
-                    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-                    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+                    GetProcessId, InitializeProcThreadAttributeList, ResumeThread,
+                    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+                    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+                    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+                    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+                    STARTUPINFOW,
                 },
             },
         },
@@ -834,6 +835,67 @@ mod platform {
         process: OwnedHandle,
         pid: u32,
         exit_code: Option<i32>,
+    }
+
+    /// Non-cloneable proof of the exact suspended Java root and its mandatory Job. Both handles
+    /// are duplicated without inheritance before the primary thread is resumed, so a later local
+    /// IPC peer check cannot be defeated by PID reuse or by an unrelated process in the same user
+    /// session.
+    pub(crate) struct SuspendedProcessBinding {
+        process: OwnedHandle,
+        job: OwnedHandle,
+        pid: u32,
+    }
+
+    impl fmt::Debug for SuspendedProcessBinding {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SuspendedProcessBinding")
+                .field("pid", &self.pid)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl SuspendedProcessBinding {
+        pub(crate) const fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        /// Revalidates the exact retained process identity immediately before accepting or
+        /// delivering a launch ticket. `Ok(false)` is an ordinary foreign/dead peer rejection;
+        /// OS query failures remain fail-closed errors.
+        pub(crate) fn validate_exact_client_pid(&self, client_pid: u32) -> Result<bool, String> {
+            if client_pid != self.pid {
+                return Ok(false);
+            }
+            let retained_pid = unsafe { GetProcessId(raw_handle(&self.process)) };
+            if retained_pid == 0 {
+                return Err("Cannot revalidate the retained Java process identity".into());
+            }
+            if retained_pid != self.pid {
+                return Err("Retained Java process identity changed unexpectedly".into());
+            }
+            match unsafe { WaitForSingleObject(raw_handle(&self.process), 0) } {
+                WAIT_TIMEOUT => {}
+                WAIT_OBJECT_0 => return Ok(false),
+                other => {
+                    return Err(format!(
+                        "Cannot poll the retained Java process identity: wait result {}",
+                        other.0
+                    ));
+                }
+            }
+            let mut in_job = BOOL::from(false);
+            unsafe {
+                IsProcessInJob(
+                    raw_handle(&self.process),
+                    Some(raw_handle(&self.job)),
+                    &mut in_job,
+                )
+            }
+            .map_err(|_| "Cannot revalidate the retained Java Job identity".to_string())?;
+            Ok(in_job.as_bool())
+        }
     }
 
     struct SpawnGuard {
@@ -1015,6 +1077,16 @@ mod platform {
         spec: ProcessSpec<'_>,
         before_resume: impl FnOnce() -> Result<(), String>,
     ) -> Result<(ContainedProcess, ProcessPipes), String> {
+        spawn_with_before_resume_identity(spec, |_| before_resume())
+    }
+
+    /// Variant used by the launch-ticket broker. The callback receives an owned, non-inheritable
+    /// process/Job proof while Java is still suspended and may only move it into an already-created
+    /// local broker. It must remain O(1), synchronous and network-free.
+    pub(crate) fn spawn_with_before_resume_identity(
+        spec: ProcessSpec<'_>,
+        before_resume: impl FnOnce(SuspendedProcessBinding) -> Result<(), String>,
+    ) -> Result<(ContainedProcess, ProcessPipes), String> {
         let inheritance_guard = process_handle_inheritance_guard()
             .map_err(|_| "Process handle inheritance lock is unavailable".to_string())?;
         spawn_while_inheritance_locked(spec, &inheritance_guard, before_resume)
@@ -1023,7 +1095,7 @@ mod platform {
     fn spawn_while_inheritance_locked(
         spec: ProcessSpec<'_>,
         _inheritance_guard: &std::sync::MutexGuard<'static, ()>,
-        before_resume: impl FnOnce() -> Result<(), String>,
+        before_resume: impl FnOnce(SuspendedProcessBinding) -> Result<(), String>,
     ) -> Result<(ContainedProcess, ProcessPipes), String> {
         let application = nul_terminated(spec.executable.as_os_str(), "process executable")?;
         let cwd = nul_terminated(spec.cwd.as_os_str(), "process cwd")?;
@@ -1112,7 +1184,15 @@ mod platform {
             return Err("Contained process was created outside its mandatory job".into());
         }
         guard.contained = true;
-        before_resume()?;
+        let binding = SuspendedProcessBinding {
+            process: duplicate_owned_handle(guard.process_raw(), "Java process")?,
+            job: duplicate_owned_handle(
+                guard.job.as_ref().expect("spawn guard owns its job").raw(),
+                "Java Job",
+            )?,
+            pid: guard.pid,
+        };
+        before_resume(binding)?;
         let previous = unsafe { ResumeThread(guard.thread_raw()) };
         if previous != 1 {
             return Err(format!(
@@ -1128,6 +1208,29 @@ mod platform {
                 stderr: Box::new(File::from(stderr_read)),
             },
         ))
+    }
+
+    fn duplicate_owned_handle(source: HANDLE, label: &str) -> Result<OwnedHandle, String> {
+        let current = unsafe { GetCurrentProcess() };
+        let mut duplicate = HANDLE::default();
+        unsafe {
+            DuplicateHandle(
+                current,
+                source,
+                current,
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(|_| format!("Cannot duplicate the contained {label} identity handle"))?;
+        if duplicate.is_invalid() {
+            return Err(format!(
+                "Windows returned an invalid contained {label} identity handle"
+            ));
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(duplicate.0) })
     }
 
     #[derive(Clone, Copy)]
@@ -1454,7 +1557,7 @@ fn main() {
                     environment: &[],
                 },
                 &inheritance_guard,
-                || Ok(()),
+                |_| Ok(()),
             );
             drop(sentinel_scope);
             drop(sentinel_write);
@@ -1619,15 +1722,22 @@ fn main() {
 
             let gate_entered = std::sync::atomic::AtomicBool::new(false);
             let arguments = [marker.clone().into_os_string()];
-            let error = spawn_with_before_resume(
+            let error = spawn_with_before_resume_identity(
                 ProcessSpec {
                     executable: &executable,
                     arguments: &arguments,
                     cwd: &directory.0,
                     environment: &[],
                 },
-                || {
+                |binding| {
                     gate_entered.store(true, Ordering::Release);
+                    assert_ne!(binding.pid(), 0);
+                    assert!(binding
+                        .validate_exact_client_pid(binding.pid())
+                        .expect("the retained suspended identity must be queryable"));
+                    assert!(!binding
+                        .validate_exact_client_pid(std::process::id())
+                        .expect("a foreign PID must be an ordinary rejection"));
                     Err("synthetic final authority rejection".into())
                 },
             )
@@ -2072,6 +2182,20 @@ mod platform {
     use super::*;
     use std::process::{Child, Command, Stdio};
 
+    /// Compile-time placeholder only. Fragment's trusted launch-ticket IPC requires the Windows
+    /// suspended-process and Job boundary and therefore never fabricates this proof elsewhere.
+    pub(crate) struct SuspendedProcessBinding;
+
+    impl SuspendedProcessBinding {
+        pub(crate) const fn pid(&self) -> u32 {
+            0
+        }
+
+        pub(crate) fn validate_exact_client_pid(&self, _client_pid: u32) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
     pub(crate) struct ContainedProcess {
         child: Child,
         exit_code: Option<i32>,
@@ -2176,6 +2300,13 @@ mod platform {
             },
         ))
     }
+
+    pub(crate) fn spawn_with_before_resume_identity(
+        _spec: ProcessSpec<'_>,
+        _before_resume: impl FnOnce(SuspendedProcessBinding) -> Result<(), String>,
+    ) -> Result<(ContainedProcess, ProcessPipes), String> {
+        Err("Secure launch-ticket process binding requires Windows Job containment".into())
+    }
 }
 
-pub(super) use platform::{spawn, spawn_with_before_resume};
+pub(super) use platform::{spawn, spawn_with_before_resume_identity, SuspendedProcessBinding};

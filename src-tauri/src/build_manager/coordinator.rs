@@ -418,6 +418,17 @@ impl PreparedGameLaunch {
         self.preset
     }
 
+    /// Stable launcher installation identity bound by the owned root marker. This is the only
+    /// value permitted as Spark's `launcherInstanceId`; per-operation UUIDs are not identities.
+    pub(super) const fn install_id(&self) -> Uuid {
+        self.authority.install_id
+    }
+
+    /// Exact active release proven by the retained TUF transaction and instance state.
+    pub(super) fn release_id(&self) -> &str {
+        &self.active.release_id
+    }
+
     fn revalidate_control_plane(&self) -> Result<(), CoordinatorError> {
         self.install_lock.revalidate(&self.authority.root)?;
         self.channel_lock
