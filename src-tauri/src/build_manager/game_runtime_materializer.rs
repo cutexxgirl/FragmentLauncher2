@@ -1,13 +1,15 @@
 use super::{
+    artifact_plan::PlannedGameGenerationBindingV2,
     cas::VerifiedCasObject,
     contracts::{
         domain_digest, EmbeddedInstallerEntry, GameRuntimeLock, GameRuntimeRole, GameRuntimeSource,
         NormalizedProcessorArgument, OfflineProcessorVerification, ProcessorInput,
         ProcessorMaterializationAccess, ProcessorMaterializationId,
     },
+    game_generation::GameGenerationProcessorBuild,
     managed_fs::{
-        atomic_write_small, ensure_directory_chain, ExclusiveManagedFile, GuardedDirectoryChain,
-        ImmutableManagedFile, RelativeManagedPath,
+        atomic_write_small, ensure_directory_chain, ExclusiveManagedFile, FileIdentity,
+        GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath,
     },
     storage::{inspect_existing_ancestors, is_windows_reparse_point, OwnedCasRoot},
 };
@@ -32,9 +34,9 @@ const MAX_INPUT_TREE_ENTRIES: usize = 256;
 const MAX_INSTALLER_ZIP_ENTRIES: usize = 4_096;
 const MAX_INSTALLER_DECLARED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_STATE_MARKER_BYTES: usize = 256 * 1024;
-const MAX_SCRATCH_ENTRIES: usize = 512;
-const MAX_SCRATCH_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const STATE_MARKER_PATH: &str = "materialized-input-state-v2.json";
+pub(super) const MAX_SCRATCH_ENTRIES: usize = 512;
+pub(super) const MAX_SCRATCH_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const STATE_MARKER_PATH: &str = "materialized-input-state-v2.json";
 const USER_HOME_PATH: &str = "state/user-home";
 const WORKSPACE_LAYOUT: [&str; 4] = ["inputs", "outputs", "temp", "state"];
 
@@ -128,6 +130,10 @@ pub(super) struct ProcessorWorkspace {
     temp: PathBuf,
     state: PathBuf,
     input_state_sha256: String,
+    generation_binding: PlannedGameGenerationBindingV2,
+    game_runtime_lock_sha256: String,
+    java_runtime_lock_sha256: String,
+    processor_receipt_sha256: String,
     state_marker_bytes: Vec<u8>,
     state_marker: ImmutableManagedFile,
     input_lease: ProcessorInputLease,
@@ -159,6 +165,57 @@ impl ProcessorWorkspace {
 
     pub(super) fn input_state_sha256(&self) -> &str {
         &self.input_state_sha256
+    }
+
+    pub(super) fn generation_binding(&self) -> &PlannedGameGenerationBindingV2 {
+        &self.generation_binding
+    }
+
+    pub(super) fn game_runtime_lock_sha256(&self) -> &str {
+        &self.game_runtime_lock_sha256
+    }
+
+    pub(super) fn java_runtime_lock_sha256(&self) -> &str {
+        &self.java_runtime_lock_sha256
+    }
+
+    pub(super) fn processor_receipt_sha256(&self) -> &str {
+        &self.processor_receipt_sha256
+    }
+
+    pub(super) fn directory_identity(&self) -> FileIdentity {
+        self._workspace_guard.leaf().info().identity.clone()
+    }
+
+    /// Rebinds every filesystem and signed-lock fact immediately before processor execution or
+    /// publication. A workspace cannot be transplanted between roots, operations or releases.
+    pub(super) fn validate_binding_for_build(
+        &self,
+        build: &GameGenerationProcessorBuild<'_, '_>,
+    ) -> Result<(), String> {
+        let authority = build.authority();
+        validate_generation_root_binding(build, &self.generation_binding)?;
+        if self.root != build.workspaces_root().join(build.workspace_name())
+            || self.game_runtime_lock_sha256 != authority.game_runtime_lock_sha256()
+            || self.java_runtime_lock_sha256 != authority.runtime_lock_sha256()
+            || self.processor_receipt_sha256
+                != verified_receipt_sha256(authority.game_runtime_lock())?
+        {
+            return Err("Processor workspace belongs to another sealed generation build".into());
+        }
+        Ok(())
+    }
+
+    /// Full content audit used before processor spawns and commit boundaries. Publication of each
+    /// already-leased output uses the lightweight binding check above plus the exact-six output
+    /// lease, avoiding repeated hashing of the 52 MiB immutable input closure.
+    pub(super) fn validate_for_build(
+        &mut self,
+        build: &GameGenerationProcessorBuild<'_, '_>,
+    ) -> Result<(), String> {
+        self.validate_binding_for_build(build)?;
+        self.revalidate_inputs()?;
+        Ok(())
     }
 
     pub(super) fn revalidate_inputs(&mut self) -> Result<ProcessorInputAudit, String> {
@@ -210,15 +267,62 @@ impl ProcessorWorkspace {
     }
 }
 
-/// Creates one new workspace below an existing trusted workspace directory and materializes the
-/// exact signed processor input closure into it. `workspace_name` must be one Windows-safe path
-/// component and must not already exist.
+/// Creates the only production processor workspace authorized by a sealed immutable-generation
+/// build. The workspace parent and unique operation-bound name are fixed by that type-state;
+/// callers cannot choose an arbitrary root or reuse a workspace from another operation.
 pub(super) fn materialize_processor_workspace(
+    build: &GameGenerationProcessorBuild<'_, '_>,
+) -> Result<ProcessorWorkspace, String> {
+    let authority = build.authority();
+    let binding = authority.binding();
+    validate_generation_root_binding(build, &binding)?;
+    let workspace_binding = ProcessorWorkspaceBinding {
+        generation: binding,
+        game_runtime_lock_sha256: authority.game_runtime_lock_sha256(),
+        java_runtime_lock_sha256: authority.runtime_lock_sha256(),
+    };
+    materialize_processor_workspace_at(
+        build.workspaces_root(),
+        build.workspace_name(),
+        build.root(),
+        authority.game_runtime_lock(),
+        |sha256| authority.official_object(sha256),
+        workspace_binding,
+    )
+}
+
+struct ProcessorWorkspaceBinding<'a> {
+    generation: PlannedGameGenerationBindingV2,
+    game_runtime_lock_sha256: &'a str,
+    java_runtime_lock_sha256: &'a str,
+}
+
+/// Lightweight live-root check for processor steps. The 4,022 official CAS objects were sealed by
+/// `PlannedGameGenerationV2`; each of the 26 processor inputs is independently reopened and hashed
+/// while materializing it. Rehashing the entire ~1 GiB official set before every processor spawn
+/// would add no binding strength and would make status/repair paths unusably expensive.
+fn validate_generation_root_binding(
+    build: &GameGenerationProcessorBuild<'_, '_>,
+    binding: &PlannedGameGenerationBindingV2,
+) -> Result<(), String> {
+    build.root().revalidate()?;
+    build.authority().validate_binding(binding)?;
+    let (root_nonce, install_id, _, _) = build.root().binding();
+    if root_nonce != binding.root_binding_nonce() || install_id != binding.install_id() {
+        return Err("Processor generation binding belongs to another owned install root".into());
+    }
+    Ok(())
+}
+
+/// Raw path/materialization helper. It remains private so production callers cannot manufacture
+/// filesystem authority outside `GameGenerationProcessorBuild`.
+fn materialize_processor_workspace_at<'objects>(
     workspaces_root: &Path,
     workspace_name: &str,
     cas_root: &OwnedCasRoot,
     lock: &GameRuntimeLock,
-    cas_objects: &HashMap<String, VerifiedCasObject>,
+    cas_object: impl Fn(&str) -> Result<&'objects VerifiedCasObject, String>,
+    binding: ProcessorWorkspaceBinding<'_>,
 ) -> Result<ProcessorWorkspace, String> {
     lock.validate()?;
     let workspace_relative = RelativeManagedPath::new(workspace_name)
@@ -261,9 +365,9 @@ pub(super) fn materialize_processor_workspace(
     let state = root.join("state");
     let official = expected_official_processor_inputs(lock)?;
     for input in &official {
-        let object = cas_objects.get(&input.sha256).ok_or_else(|| {
+        let object = cas_object(&input.sha256).map_err(|error| {
             format!(
-                "Verified CAS object is missing for processor input {} ({})",
+                "Verified CAS object is missing for processor input {} ({}): {error}",
                 input.path, input.sha256
             )
         })?;
@@ -311,6 +415,10 @@ pub(super) fn materialize_processor_workspace(
         temp,
         state,
         input_state_sha256,
+        generation_binding: binding.generation,
+        game_runtime_lock_sha256: binding.game_runtime_lock_sha256.to_owned(),
+        java_runtime_lock_sha256: binding.java_runtime_lock_sha256.to_owned(),
+        processor_receipt_sha256: verified_receipt_sha256(lock)?.to_owned(),
         state_marker_bytes: marker_bytes,
         state_marker,
         input_lease,
@@ -434,6 +542,15 @@ fn expected_official_processor_inputs(
         ));
     }
     Ok(inputs)
+}
+
+fn verified_receipt_sha256(lock: &GameRuntimeLock) -> Result<&str, String> {
+    match &lock.verification.offline_processors {
+        OfflineProcessorVerification::Verified { receipt_sha256, .. } => Ok(receipt_sha256),
+        OfflineProcessorVerification::Pending { .. } => {
+            Err("Pending processor verification has no signed receipt".into())
+        }
+    }
 }
 
 fn unique_official_path_for_role(
@@ -992,6 +1109,12 @@ impl InputTreeScan<'_> {
                     absolute.display()
                 ));
             }
+            if metadata.is_file() && metadata.permissions().readonly() {
+                return Err(format!(
+                    "Read-only file is forbidden in processor inputs: {}",
+                    absolute.display()
+                ));
+            }
             let relative = relative_manifest_path(self.root, &absolute)?;
             let managed = RelativeManagedPath::new(&relative)
                 .map_err(|error| format!("Processor input path is unsafe: {error}"))?;
@@ -1092,6 +1215,12 @@ fn scan_input_inventory(
         if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
             return Err(format!(
                 "Link/reparse point is forbidden in processor inputs: {}",
+                absolute.display()
+            ));
+        }
+        if metadata.is_file() && metadata.permissions().readonly() {
+            return Err(format!(
+                "Read-only file is forbidden in processor inputs: {}",
                 absolute.display()
             ));
         }
@@ -1268,6 +1397,9 @@ fn scan_safe_scratch_directory(
             .map_err(|error| format!("Cannot inspect {label} metadata: {error}"))?;
         if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
             return Err(format!("Link/reparse point is forbidden in {label}"));
+        }
+        if metadata.is_file() && metadata.permissions().readonly() {
+            return Err(format!("Read-only file is forbidden in {label}"));
         }
         let relative = relative_manifest_path(root, &absolute)?;
         let managed = RelativeManagedPath::new(&relative)
@@ -1669,6 +1801,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn execution_scratch_allows_bounded_files_but_rejects_links_and_state_drift() {
         let root = temp_root("execution-scratch");
         for component in WORKSPACE_LAYOUT {
@@ -1689,6 +1822,17 @@ mod tests {
         assert!(validate_execution_state_directory(&root, b"marker").is_err());
         fs::remove_file(root.join("state/user-home/alias")).unwrap();
         fs::remove_file(root.join("state/user-home/unexpected")).unwrap();
+
+        let read_only = root.join("state/user-home/read-only");
+        fs::write(&read_only, b"x").unwrap();
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        assert!(validate_execution_state_directory(&root, b"marker").is_err());
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        fs::remove_file(read_only).unwrap();
 
         fs::write(root.join("state/unexpected"), b"x").unwrap();
         assert!(validate_execution_state_directory(&root, b"marker").is_err());

@@ -236,6 +236,26 @@ pub(super) struct FileIdentity {
     pub(super) file_id: [u8; 16],
 }
 
+/// Hard limits for one recursive managed-directory removal.
+///
+/// `max_entries` includes the root directory and `max_depth` uses the root as depth zero. Bytes
+/// are charged from the filesystem allocation size of every opened node, not merely logical file
+/// lengths. The caller must choose limits from already-authorized workspace policy rather than
+/// from the directory being removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ManagedDirectoryRemovalLimits {
+    pub(super) max_entries: usize,
+    pub(super) max_allocated_bytes: u64,
+    pub(super) max_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ManagedDirectoryRemovalSummary {
+    pub(super) entries: usize,
+    pub(super) allocated_bytes: u64,
+    pub(super) max_depth: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ManagedNodeKind {
     File,
@@ -250,6 +270,7 @@ pub(super) struct NodeInfo {
     pub(super) reparse_tag: u32,
     pub(super) number_of_links: u32,
     pub(super) size: u64,
+    pub(super) allocation_size: u64,
     pub(super) case_sensitive_directory: bool,
 }
 
@@ -1074,6 +1095,10 @@ impl ResumableManagedFile {
         Ok(self.current_info_with_limit(false)?.size)
     }
 
+    pub(super) fn allocated_size(&self) -> ManagedFsResult<u64> {
+        Ok(self.current_info_with_limit(false)?.allocation_size)
+    }
+
     pub(super) fn truncate_zero(&mut self) -> ManagedFsResult<()> {
         self.current_info_with_limit(false)?;
         self.file.set_len(0).map_err(|error| {
@@ -1732,6 +1757,160 @@ pub(super) struct MovedManagedNode {
     pub(super) kind: ManagedNodeKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MovedManagedDirectory {
+    pub(super) source: RelativeManagedPath,
+    pub(super) destination: RelativeManagedPath,
+    pub(super) identity: FileIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ConditionalManagedDirectoryMoveOutcome {
+    Cancelled,
+    Moved(MovedManagedDirectory),
+}
+
+/// Conditionally publishes one exact real directory at one absent managed destination.
+///
+/// The source and both lexical parent chains stay handle-bound throughout the operation. The
+/// predicate is the final cancellation boundary: it runs only after every identity, volume and
+/// destination-absence check, immediately before the handle rename. Once the rename begins this
+/// function can only report the actual move result or `AppliedButDurabilityUnconfirmed`; it never
+/// converts an applied namespace mutation into cancellation.
+pub(super) fn move_managed_directory_no_replace_if<F>(
+    root: &Path,
+    source: RelativeManagedPath,
+    destination: RelativeManagedPath,
+    should_move: F,
+) -> ManagedFsResult<ConditionalManagedDirectoryMoveOutcome>
+where
+    F: FnOnce() -> bool,
+{
+    if source.collision_key() == destination.collision_key() {
+        return Err(ManagedFsError::Conflict(
+            "Managed directory move source and destination collide on Windows".into(),
+        ));
+    }
+    if source.is_prefix_of(&destination) {
+        return Err(ManagedFsError::InvalidPath(
+            "Managed directory move destination cannot be inside the source".into(),
+        ));
+    }
+
+    let source_parent = GuardedDirectoryChain::open_parent(root, &source)?;
+    let destination_parent = GuardedDirectoryChain::open_parent(root, &destination)?;
+    ensure_same_root_and_volume(&source_parent, &destination_parent)?;
+
+    // Flush through an identity-bound directory handle before acquiring DELETE access for the
+    // final rename. The complete source guard is dropped only after the flush; the subsequently
+    // opened rename handle must prove that it still names that same directory identity.
+    let source_flush_guard = GuardedDirectoryChain::open(root, &source)?;
+    source_flush_guard.revalidate()?;
+    source_flush_guard.leaf().sync_directory()?;
+    let flushed_source_identity = source_flush_guard.leaf().info.identity.clone();
+    drop(source_flush_guard);
+
+    let source_path = source.join_to(source_parent.root_path());
+    let source_file = open_for_handle_rename(&source_path)?;
+    let source_info = node_info(&source_file, &source_path)?;
+    source_info.require_real_directory(&source_path)?;
+    verify_handle_path(&source_file, &source_path)?;
+    if source_info.identity != flushed_source_identity {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed directory move source changed after its durability flush: {}",
+            source_path.display()
+        )));
+    }
+    if source_info.identity.volume_serial_number
+        != source_parent.leaf().info.identity.volume_serial_number
+    {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed directory move source crossed a volume boundary: {}",
+            source_path.display()
+        )));
+    }
+
+    let destination_path = destination.join_to(source_parent.root_path());
+    match fs::symlink_metadata(&destination_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(ManagedFsError::Conflict(format!(
+                "Managed directory move destination already exists: {}",
+                destination_path.display()
+            )))
+        }
+        Err(error) => {
+            return Err(ManagedFsError::io(
+                "Cannot inspect managed directory move destination",
+                &destination_path,
+                error,
+            ))
+        }
+    }
+
+    // Re-prove every handle-bound authority after the source flush and destination check. There
+    // must be no fallible validation or path lookup between the cancellation predicate and the
+    // actual no-replace rename below.
+    source_parent.revalidate()?;
+    destination_parent.revalidate()?;
+    ensure_same_root_and_volume(&source_parent, &destination_parent)?;
+    verify_handle_path(&source_file, &source_path)?;
+    let before_commit = node_info(&source_file, &source_path)?;
+    before_commit.require_real_directory(&source_path)?;
+    if before_commit.identity != source_info.identity
+        || before_commit.case_sensitive_directory != source_info.case_sensitive_directory
+    {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed directory move source identity changed before commit: {}",
+            source_path.display()
+        )));
+    }
+
+    if !should_move() {
+        return Ok(ConditionalManagedDirectoryMoveOutcome::Cancelled);
+    }
+    rename_handle(
+        &source_file,
+        &destination_path,
+        ManagedRenameMode::NoReplace,
+    )?;
+
+    if let Err(error) = verify_handle_path(&source_file, &destination_path) {
+        return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: destination_path,
+            detail: format!("cannot verify published managed directory handle: {error}"),
+        });
+    }
+    let after = node_info(&source_file, &destination_path).map_err(|error| {
+        ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: destination_path.clone(),
+            detail: format!("cannot inspect published managed directory handle: {error}"),
+        }
+    })?;
+    if after.identity != source_info.identity
+        || after.kind != ManagedNodeKind::Directory
+        || after.reparse_tag != 0
+        || after.case_sensitive_directory
+    {
+        return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: destination_path,
+            detail: "published managed directory identity or classification changed".into(),
+        });
+    }
+    flush_rename_parents(
+        source_parent.leaf(),
+        destination_parent.leaf(),
+        &destination_path,
+    )?;
+    Ok(ConditionalManagedDirectoryMoveOutcome::Moved(
+        MovedManagedDirectory {
+            source,
+            destination,
+            identity: after.identity,
+        },
+    ))
+}
+
 /// Moves one exact managed node to one deterministic, currently absent destination.
 ///
 /// This is the reversible primitive used by numbered journal backup slots. It opens the source
@@ -1742,6 +1921,15 @@ pub(super) fn move_managed_node_no_replace(
     root: &Path,
     source: RelativeManagedPath,
     destination: RelativeManagedPath,
+) -> ManagedFsResult<MovedManagedNode> {
+    move_managed_node_no_replace_with_expected(root, source, destination, None)
+}
+
+fn move_managed_node_no_replace_with_expected(
+    root: &Path,
+    source: RelativeManagedPath,
+    destination: RelativeManagedPath,
+    expected: Option<(&FileIdentity, ManagedNodeKind)>,
 ) -> ManagedFsResult<MovedManagedNode> {
     if source.collision_key() == destination.collision_key() {
         return Err(ManagedFsError::Conflict(
@@ -1761,6 +1949,14 @@ pub(super) fn move_managed_node_no_replace(
     let source_path = source.join_to(source_parent.root_path());
     let source_file = open_for_handle_rename(&source_path)?;
     let source_info = node_info(&source_file, &source_path)?;
+    if let Some((expected_identity, expected_kind)) = expected {
+        if &source_info.identity != expected_identity || source_info.kind != expected_kind {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed move source no longer has the expected identity or kind: {}",
+                source_path.display()
+            )));
+        }
+    }
     if source_info.kind == ManagedNodeKind::File
         && source_info.reparse_tag == 0
         && source_info.number_of_links != 1
@@ -1794,6 +1990,14 @@ pub(super) fn move_managed_node_no_replace(
             destination: destination_path,
             detail: "moved managed object identity changed".into(),
         });
+    }
+    if let Some((expected_identity, expected_kind)) = expected {
+        if &after.identity != expected_identity || after.kind != expected_kind {
+            return Err(ManagedFsError::AppliedButDurabilityUnconfirmed {
+                destination: destination_path,
+                detail: "moved managed object no longer has the expected identity or kind".into(),
+            });
+        }
     }
     flush_rename_parents(
         source_parent.leaf(),
@@ -1915,6 +2119,343 @@ pub(super) fn remove_verified_managed_file(
     })
 }
 
+/// Recursively removes one exact, bounded managed directory tree.
+///
+/// This is the destructive primitive used by processor-workspace garbage collection. On Windows
+/// it first opens the root and every descendant through no-follow, delete-capable handles which
+/// deny concurrent writers and deletion. The complete tree is then audited (including a second
+/// exact topology/identity pass) before the first delete disposition is issued. Consequently an
+/// unsafe descendant, a stale root identity or a policy-bound violation cannot cause partial
+/// deletion. Files and then directories are removed by their already-validated handles, with
+/// directories ordered deepest-first, and the surviving parent directory is flushed last.
+pub(super) fn remove_bounded_managed_directory_tree(
+    root: &Path,
+    relative: &RelativeManagedPath,
+    expected_root_identity: &FileIdentity,
+    limits: ManagedDirectoryRemovalLimits,
+) -> ManagedFsResult<ManagedDirectoryRemovalSummary> {
+    remove_bounded_managed_directory_tree_with(
+        root,
+        relative,
+        expected_root_identity,
+        limits,
+        || Ok(()),
+    )
+}
+
+#[cfg(windows)]
+struct ManagedRemovalNode {
+    path: PathBuf,
+    depth: usize,
+    handle: Option<File>,
+    info: NodeInfo,
+    children: Option<std::collections::BTreeSet<String>>,
+}
+
+#[cfg(windows)]
+fn remove_bounded_managed_directory_tree_with<F>(
+    root: &Path,
+    relative: &RelativeManagedPath,
+    expected_root_identity: &FileIdentity,
+    limits: ManagedDirectoryRemovalLimits,
+    before_delete: F,
+) -> ManagedFsResult<ManagedDirectoryRemovalSummary>
+where
+    F: FnOnce() -> ManagedFsResult<()>,
+{
+    use std::collections::VecDeque;
+
+    if limits.max_entries == 0 {
+        return Err(ManagedFsError::InvalidPath(
+            "Managed recursive-removal entry limit must include the root".into(),
+        ));
+    }
+
+    // Keep the parent chain live for the complete operation. In particular, the exact root path
+    // cannot be renamed together with an ancestor while we acquire and validate the tree handles.
+    let parent_chain = GuardedDirectoryChain::open_parent(root, relative)?;
+    let root_path = relative.join_to(parent_chain.root_path());
+    let root_handle = open_node_for_recursive_removal(&root_path)?;
+    let root_info = node_info(&root_handle, &root_path)?;
+    root_info.require_real_directory(&root_path)?;
+    verify_handle_path(&root_handle, &root_path)?;
+    if &root_info.identity != expected_root_identity {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed recursive-removal root identity changed: {}",
+            root_path.display()
+        )));
+    }
+    if root_info.identity.volume_serial_number
+        != parent_chain.leaf().info.identity.volume_serial_number
+    {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed recursive-removal root crossed a volume boundary: {}",
+            root_path.display()
+        )));
+    }
+    if root_info.allocation_size > limits.max_allocated_bytes {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed recursive-removal tree exceeds its allocated-byte limit: {}",
+            root_path.display()
+        )));
+    }
+
+    let root_volume = root_info.identity.volume_serial_number;
+    let mut summary = ManagedDirectoryRemovalSummary {
+        entries: 1,
+        allocated_bytes: root_info.allocation_size,
+        max_depth: 0,
+    };
+    let mut nodes = vec![ManagedRemovalNode {
+        path: root_path.clone(),
+        depth: 0,
+        handle: Some(root_handle),
+        info: root_info,
+        children: None,
+    }];
+    let mut pending_directories = VecDeque::from([0_usize]);
+
+    // Audit and retain a DELETE-capable, no-follow handle for every node. No namespace or file
+    // mutation happens anywhere in this phase, including on all error exits.
+    while let Some(directory_index) = pending_directories.pop_front() {
+        let directory_path = nodes[directory_index].path.clone();
+        let directory_depth = nodes[directory_index].depth;
+        let child_names = read_validated_directory_child_names(&directory_path)?;
+        nodes[directory_index].children = Some(child_names.iter().cloned().collect());
+
+        for child_name in child_names {
+            let depth = directory_depth.checked_add(1).ok_or_else(|| {
+                ManagedFsError::UnsafeNode("Managed recursive-removal depth overflowed".into())
+            })?;
+            if depth > limits.max_depth {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed recursive-removal tree exceeds its depth limit: {}",
+                    directory_path.join(&child_name).display()
+                )));
+            }
+            let path = directory_path.join(&child_name);
+            let handle = open_node_for_recursive_removal(&path)?;
+            let info = node_info(&handle, &path)?;
+            match info.kind {
+                ManagedNodeKind::Directory => info.require_real_directory(&path)?,
+                ManagedNodeKind::File => {
+                    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+                    info.require_regular_single_link(&path)?;
+                    // Legacy handle disposition can be rejected for a read-only file. Treat that
+                    // attribute as unsafe during the all-or-nothing pre-audit so it can never be
+                    // discovered only after earlier siblings have already been deleted.
+                    if info.attributes & FILE_ATTRIBUTE_READONLY.0 != 0 {
+                        return Err(ManagedFsError::UnsafeNode(format!(
+                            "Read-only files require quarantine policy repair before recursive removal: {}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            verify_handle_path(&handle, &path)?;
+            if info.identity.volume_serial_number != root_volume {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed recursive-removal tree crossed a volume boundary: {}",
+                    path.display()
+                )));
+            }
+
+            let entries = summary.entries.checked_add(1).ok_or_else(|| {
+                ManagedFsError::UnsafeNode(
+                    "Managed recursive-removal entry count overflowed".into(),
+                )
+            })?;
+            if entries > limits.max_entries {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed recursive-removal tree exceeds its entry limit: {}",
+                    path.display()
+                )));
+            }
+            let allocated_bytes = summary
+                .allocated_bytes
+                .checked_add(info.allocation_size)
+                .ok_or_else(|| {
+                    ManagedFsError::UnsafeNode(
+                        "Managed recursive-removal allocated bytes overflowed".into(),
+                    )
+                })?;
+            if allocated_bytes > limits.max_allocated_bytes {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed recursive-removal tree exceeds its allocated-byte limit: {}",
+                    path.display()
+                )));
+            }
+            summary.entries = entries;
+            summary.allocated_bytes = allocated_bytes;
+            summary.max_depth = summary.max_depth.max(depth);
+
+            let is_directory = info.kind == ManagedNodeKind::Directory;
+            let index = nodes.len();
+            nodes.push(ManagedRemovalNode {
+                path,
+                depth,
+                handle: Some(handle),
+                info,
+                children: None,
+            });
+            if is_directory {
+                pending_directories.push_back(index);
+            }
+        }
+    }
+
+    before_delete()?;
+    parent_chain.revalidate()?;
+
+    // Re-prove every handle identity and exact directory membership after the complete audit and
+    // immediately before the first destructive call. The exclusive handles make overwrite,
+    // replacement and deletion attempts fail; this pass also catches a newly-created child.
+    for node in &nodes {
+        let handle = node
+            .handle
+            .as_ref()
+            .expect("all recursive-removal handles are live before deletion");
+        verify_handle_path(handle, &node.path)?;
+        let current = node_info(handle, &node.path)?;
+        if current != node.info {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed recursive-removal node changed during audit: {}",
+                node.path.display()
+            )));
+        }
+        if node.info.kind == ManagedNodeKind::Directory {
+            let current_children = read_validated_directory_child_names(&node.path)?
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if node.children.as_ref() != Some(&current_children) {
+                return Err(ManagedFsError::UnsafeNode(format!(
+                    "Managed recursive-removal directory membership changed during audit: {}",
+                    node.path.display()
+                )));
+            }
+        }
+    }
+
+    let mut file_indices = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| (node.info.kind == ManagedNodeKind::File).then_some(index))
+        .collect::<Vec<_>>();
+    file_indices.sort_unstable_by_key(|&index| std::cmp::Reverse(nodes[index].depth));
+    for index in file_indices {
+        let node = &mut nodes[index];
+        let handle = node
+            .handle
+            .take()
+            .expect("an audited recursive-removal file has one live handle");
+        delete_open_node(&handle, &node.path)?;
+        drop(handle);
+        confirm_managed_node_absent(&node.path)?;
+    }
+
+    let mut directory_indices = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| (node.info.kind == ManagedNodeKind::Directory).then_some(index))
+        .collect::<Vec<_>>();
+    directory_indices.sort_unstable_by_key(|&index| std::cmp::Reverse(nodes[index].depth));
+    for index in directory_indices {
+        let node = &mut nodes[index];
+        if !read_validated_directory_child_names(&node.path)?.is_empty() {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed recursive-removal directory was not empty at deletion: {}",
+                node.path.display()
+            )));
+        }
+        let handle = node
+            .handle
+            .take()
+            .expect("an audited recursive-removal directory has one live handle");
+        delete_open_node(&handle, &node.path)?;
+        drop(handle);
+        confirm_managed_node_absent(&node.path)?;
+    }
+
+    parent_chain.leaf().sync_directory().map_err(|error| {
+        ManagedFsError::AppliedButDurabilityUnconfirmed {
+            destination: root_path,
+            detail: format!("recursive-removal parent flush failed: {error}"),
+        }
+    })?;
+    Ok(summary)
+}
+
+#[cfg(not(windows))]
+fn remove_bounded_managed_directory_tree_with<F>(
+    _root: &Path,
+    _relative: &RelativeManagedPath,
+    _expected_root_identity: &FileIdentity,
+    _limits: ManagedDirectoryRemovalLimits,
+    _before_delete: F,
+) -> ManagedFsResult<ManagedDirectoryRemovalSummary>
+where
+    F: FnOnce() -> ManagedFsResult<()>,
+{
+    Err(ManagedFsError::Unsupported(
+        "Bounded managed-directory removal requires Windows handle semantics".into(),
+    ))
+}
+
+#[cfg(windows)]
+fn read_validated_directory_child_names(path: &Path) -> ManagedFsResult<Vec<String>> {
+    let entries = fs::read_dir(path).map_err(|error| {
+        ManagedFsError::io(
+            "Cannot enumerate managed recursive-removal directory",
+            path,
+            error,
+        )
+    })?;
+    let mut names = Vec::new();
+    let mut collision_keys = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ManagedFsError::io(
+                "Cannot read managed recursive-removal directory entry",
+                path,
+                error,
+            )
+        })?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            ManagedFsError::UnsafeNode(format!(
+                "Managed recursive-removal directory contains a non-Unicode name: {}",
+                path.display()
+            ))
+        })?;
+        validate_component(&name)?;
+        let collision_key = name.to_lowercase();
+        if !collision_keys.insert(collision_key) {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed recursive-removal directory contains colliding names: {}",
+                path.display()
+            )));
+        }
+        names.push(name);
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+#[cfg(windows)]
+fn confirm_managed_node_absent(path: &Path) -> ManagedFsResult<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ManagedFsError::UnsafeNode(format!(
+            "A filesystem node appeared at a just-deleted managed path: {}",
+            path.display()
+        ))),
+        Err(error) => Err(ManagedFsError::io(
+            "Cannot confirm managed recursive removal",
+            path,
+            error,
+        )),
+    }
+}
+
 /// Moves one exact filesystem object into an existing real quarantine directory. The source is
 /// opened with no-follow semantics and renamed by handle on Windows. Reparse points are moved as
 /// objects and are never traversed. This function never recursively deletes anything.
@@ -1933,6 +2474,39 @@ pub(super) fn quarantine_node(
     let _quarantine_guard = GuardedDirectoryChain::open(root, quarantine_directory)?;
     let destination = quarantine_directory.join_component(&Uuid::new_v4().to_string())?;
     let moved = move_managed_node_no_replace(root, source.clone(), destination.clone())?;
+    Ok(QuarantinedNode {
+        source,
+        destination,
+        identity: moved.identity,
+        kind: moved.kind,
+    })
+}
+
+/// Quarantines a node only if the handle opened for the rename still has the caller's audited
+/// identity and kind. A mismatch is rejected before the namespace commit, leaving both the raced
+/// source and the quarantine directory untouched. The expectation is checked again after rename
+/// so a post-commit discrepancy is reported as applied-but-durability-unconfirmed without
+/// returning a quarantine capability.
+pub(super) fn quarantine_node_if_identity(
+    root: &Path,
+    source: RelativeManagedPath,
+    quarantine_directory: &RelativeManagedPath,
+    expected_identity: &FileIdentity,
+    expected_kind: ManagedNodeKind,
+) -> ManagedFsResult<QuarantinedNode> {
+    if source.is_prefix_of(quarantine_directory) {
+        return Err(ManagedFsError::InvalidPath(
+            "Quarantine directory cannot be inside the quarantined node".into(),
+        ));
+    }
+    let _quarantine_guard = GuardedDirectoryChain::open(root, quarantine_directory)?;
+    let destination = quarantine_directory.join_component(&Uuid::new_v4().to_string())?;
+    let moved = move_managed_node_no_replace_with_expected(
+        root,
+        source.clone(),
+        destination.clone(),
+        Some((expected_identity, expected_kind)),
+    )?;
     Ok(QuarantinedNode {
         source,
         destination,
@@ -2293,6 +2867,31 @@ fn open_file_for_verified_removal(path: &Path) -> ManagedFsResult<File> {
         })
 }
 
+#[cfg(windows)]
+fn open_node_for_recursive_removal(path: &Path) -> ManagedFsResult<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, SYNCHRONIZE,
+    };
+
+    // FILE_SHARE_WRITE and FILE_SHARE_DELETE are deliberately absent. Every audited node remains
+    // open this way until the destructive phase begins, so another process cannot overwrite,
+    // truncate, rename or delete an accepted object behind the audit.
+    OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0 | DELETE.0 | SYNCHRONIZE.0)
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+        .map_err(|error| {
+            ManagedFsError::io(
+                "Cannot open managed node for bounded recursive removal",
+                path,
+                error,
+            )
+        })
+}
+
 #[cfg(not(windows))]
 fn open_file_for_verified_removal(path: &Path) -> ManagedFsResult<File> {
     open_immutable_file_nofollow(path)
@@ -2326,6 +2925,11 @@ fn delete_open_file(file: &File, path: &Path) -> ManagedFsResult<()> {
     })
 }
 
+#[cfg(windows)]
+fn delete_open_node(file: &File, path: &Path) -> ManagedFsResult<()> {
+    delete_open_file(file, path)
+}
+
 #[cfg(not(windows))]
 fn delete_open_file(_file: &File, path: &Path) -> ManagedFsResult<()> {
     fs::remove_file(path)
@@ -2351,6 +2955,7 @@ fn node_info(file: &File, path: &Path) -> ManagedFsResult<NodeInfo> {
             path.display()
         )));
     }
+    reject_named_data_streams(handle, path)?;
     let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
     unsafe {
         GetFileInformationByHandleEx(
@@ -2438,8 +3043,138 @@ fn node_info(file: &File, path: &Path) -> ManagedFsResult<NodeInfo> {
         reparse_tag: if is_reparse { attributes.ReparseTag } else { 0 },
         number_of_links: standard.NumberOfLinks,
         size: standard.EndOfFile.max(0) as u64,
+        allocation_size: standard.AllocationSize.max(0) as u64,
         case_sensitive_directory,
     })
+}
+
+#[cfg(windows)]
+fn reject_named_data_streams(
+    handle: windows::Win32::Foundation::HANDLE,
+    path: &Path,
+) -> ManagedFsResult<()> {
+    use std::mem::{offset_of, size_of};
+    use windows::Win32::Storage::FileSystem::{
+        FileStreamInfo, GetFileInformationByHandleEx, FILE_STREAM_INFO,
+    };
+
+    // A bounded buffer is intentional. More stream metadata than this is itself an unsafe node;
+    // retrying with attacker-controlled allocation would let ADS metadata consume launcher memory.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let stream_query = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStreamInfo,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if let Err(error) = stream_query {
+        let io = windows_error_to_io(&error);
+        // Directories with no named streams commonly report ERROR_HANDLE_EOF instead of an empty
+        // FILE_STREAM_INFO list. This is the only empty-inventory success case.
+        if io.raw_os_error() == Some(38) {
+            return Ok(());
+        }
+        return Err(ManagedFsError::io(
+            "Cannot enumerate managed NTFS streams",
+            path,
+            io,
+        ));
+    }
+
+    let header = offset_of!(FILE_STREAM_INFO, StreamName);
+    let mut offset = 0_usize;
+    let mut entries = 0_usize;
+    loop {
+        entries += 1;
+        if entries > 128 || offset.checked_add(size_of::<FILE_STREAM_INFO>()).is_none() {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed NTFS stream inventory is invalid: {}",
+                path.display()
+            )));
+        }
+        let entry_end = offset + size_of::<FILE_STREAM_INFO>();
+        if entry_end > buffer.len() {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed NTFS stream metadata escaped its buffer: {}",
+                path.display()
+            )));
+        }
+        let entry = unsafe { &*(buffer.as_ptr().add(offset).cast::<FILE_STREAM_INFO>()) };
+        let name_bytes = usize::try_from(entry.StreamNameLength).map_err(|_| {
+            ManagedFsError::UnsafeNode(format!(
+                "Managed NTFS stream name length overflowed: {}",
+                path.display()
+            ))
+        })?;
+        if name_bytes % 2 != 0 {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed NTFS stream name is malformed: {}",
+                path.display()
+            )));
+        }
+        let name_start = offset.checked_add(header).ok_or_else(|| {
+            ManagedFsError::UnsafeNode("Managed NTFS stream offset overflowed".into())
+        })?;
+        let name_end = name_start.checked_add(name_bytes).ok_or_else(|| {
+            ManagedFsError::UnsafeNode("Managed NTFS stream length overflowed".into())
+        })?;
+        if name_end > buffer.len() {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed NTFS stream name escaped its buffer: {}",
+                path.display()
+            )));
+        }
+        let name = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().add(name_start).cast::<u16>(),
+                name_bytes / 2,
+            )
+        };
+        if name != "::$DATA".encode_utf16().collect::<Vec<_>>() {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Named NTFS data streams are forbidden on managed nodes: {}",
+                path.display()
+            )));
+        }
+        if entry.NextEntryOffset == 0 {
+            break;
+        }
+        let next = usize::try_from(entry.NextEntryOffset).map_err(|_| {
+            ManagedFsError::UnsafeNode("Managed NTFS stream offset overflowed".into())
+        })?;
+        if next < header || next % std::mem::align_of::<FILE_STREAM_INFO>() != 0 {
+            return Err(ManagedFsError::UnsafeNode(format!(
+                "Managed NTFS stream chain is malformed: {}",
+                path.display()
+            )));
+        }
+        offset = offset.checked_add(next).ok_or_else(|| {
+            ManagedFsError::UnsafeNode("Managed NTFS stream chain overflowed".into())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn validate_no_named_data_streams(file: &File, path: &Path) -> ManagedFsResult<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+
+    let handle = HANDLE(file.as_raw_handle().cast());
+    if handle.0.is_null() {
+        return Err(ManagedFsError::UnsafeNode(format!(
+            "Managed stream-audit handle is invalid: {}",
+            path.display()
+        )));
+    }
+    reject_named_data_streams(handle, path)
+}
+
+#[cfg(not(windows))]
+pub(super) fn validate_no_named_data_streams(_file: &File, _path: &Path) -> ManagedFsResult<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2475,6 +3210,13 @@ fn node_info(file: &File, path: &Path) -> ManagedFsResult<NodeInfo> {
     };
     #[cfg(not(unix))]
     let links = 1;
+    #[cfg(unix)]
+    let allocation_size = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    };
+    #[cfg(not(unix))]
+    let allocation_size = metadata.len();
     Ok(NodeInfo {
         identity: metadata_identity(&metadata),
         kind: if metadata.is_dir() {
@@ -2486,6 +3228,7 @@ fn node_info(file: &File, path: &Path) -> ManagedFsResult<NodeInfo> {
         reparse_tag: 0,
         number_of_links: links,
         size: metadata.len(),
+        allocation_size,
         case_sensitive_directory: false,
     })
 }
@@ -2988,6 +3731,93 @@ mod tests {
     }
 
     #[test]
+    fn identity_checked_quarantine_moves_the_expected_workspace_directory() {
+        let root = temp_root("identity-quarantine-success");
+        fs::create_dir_all(root.join("runtime/minecraft/workspaces/operation/outputs")).unwrap();
+        fs::create_dir_all(root.join("runtime/minecraft/quarantine")).unwrap();
+        fs::write(
+            root.join("runtime/minecraft/workspaces/operation/outputs/slim.jar"),
+            b"derived output",
+        )
+        .unwrap();
+        let source = RelativeManagedPath::new("runtime/minecraft/workspaces/operation").unwrap();
+        let quarantine = RelativeManagedPath::new("runtime/minecraft/quarantine").unwrap();
+        let expected_identity = GuardedDirectoryChain::open(&root, &source)
+            .unwrap()
+            .leaf()
+            .info
+            .identity
+            .clone();
+
+        let moved = quarantine_node_if_identity(
+            &root,
+            source.clone(),
+            &quarantine,
+            &expected_identity,
+            ManagedNodeKind::Directory,
+        )
+        .unwrap();
+
+        assert_eq!(moved.identity, expected_identity);
+        assert_eq!(moved.kind, ManagedNodeKind::Directory);
+        assert!(!source.join_to(&root).exists());
+        assert_eq!(
+            fs::read(moved.destination.join_to(&root).join("outputs/slim.jar")).unwrap(),
+            b"derived output"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_checked_quarantine_leaves_a_raced_replacement_untouched() {
+        let root = temp_root("identity-quarantine-raced-replacement");
+        fs::create_dir_all(root.join("runtime/minecraft/workspaces/operation")).unwrap();
+        fs::create_dir_all(root.join("runtime/minecraft/quarantine")).unwrap();
+        fs::write(
+            root.join("runtime/minecraft/workspaces/operation/original.marker"),
+            b"original",
+        )
+        .unwrap();
+        let source = RelativeManagedPath::new("runtime/minecraft/workspaces/operation").unwrap();
+        let quarantine = RelativeManagedPath::new("runtime/minecraft/quarantine").unwrap();
+        let expected_identity = GuardedDirectoryChain::open(&root, &source)
+            .unwrap()
+            .leaf()
+            .info
+            .identity
+            .clone();
+        let displaced = root.join("runtime/minecraft/workspaces/displaced-operation");
+        fs::rename(source.join_to(&root), &displaced).unwrap();
+        fs::create_dir(source.join_to(&root)).unwrap();
+        fs::write(
+            source.join_to(&root).join("replacement.marker"),
+            b"replacement",
+        )
+        .unwrap();
+
+        let error = quarantine_node_if_identity(
+            &root,
+            source.clone(),
+            &quarantine,
+            &expected_identity,
+            ManagedNodeKind::Directory,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ManagedFsError::UnsafeNode(_)));
+        assert_eq!(
+            fs::read(source.join_to(&root).join("replacement.marker")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(displaced.join("original.marker")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read_dir(quarantine.join_to(&root)).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn deterministic_managed_move_can_restore_the_same_object() {
         let root = temp_root("move-restore");
         fs::create_dir_all(root.join("instances")).unwrap();
@@ -3037,6 +3867,189 @@ mod tests {
     }
 
     #[test]
+    fn conditional_directory_move_cancels_before_the_namespace_commit() {
+        let root = temp_root("conditional-directory-cancel");
+        fs::create_dir_all(root.join("runtime/minecraft/staging/lock-hash/image")).unwrap();
+        fs::create_dir_all(root.join("runtime/minecraft/generations")).unwrap();
+        fs::write(
+            root.join("runtime/minecraft/staging/lock-hash/image/client.jar"),
+            b"verified client",
+        )
+        .unwrap();
+        let source = RelativeManagedPath::new("runtime/minecraft/staging/lock-hash").unwrap();
+        let destination =
+            RelativeManagedPath::new("runtime/minecraft/generations/lock-hash").unwrap();
+        let mut predicate_calls = 0;
+
+        let outcome = move_managed_directory_no_replace_if(
+            &root,
+            source.clone(),
+            destination.clone(),
+            || {
+                predicate_calls += 1;
+                false
+            },
+        )
+        .unwrap();
+
+        assert_eq!(predicate_calls, 1);
+        assert_eq!(outcome, ConditionalManagedDirectoryMoveOutcome::Cancelled);
+        assert_eq!(
+            fs::read(source.join_to(&root).join("image/client.jar")).unwrap(),
+            b"verified client"
+        );
+        assert!(!destination.join_to(&root).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conditional_directory_move_rejects_a_preexisting_destination_without_cancelling() {
+        let root = temp_root("conditional-directory-collision");
+        fs::create_dir_all(root.join("runtime/minecraft/staging/lock-hash")).unwrap();
+        fs::create_dir_all(root.join("runtime/minecraft/generations/lock-hash")).unwrap();
+        fs::write(
+            root.join("runtime/minecraft/staging/lock-hash/source.marker"),
+            b"source",
+        )
+        .unwrap();
+        fs::write(
+            root.join("runtime/minecraft/generations/lock-hash/existing.marker"),
+            b"existing",
+        )
+        .unwrap();
+        let source = RelativeManagedPath::new("runtime/minecraft/staging/lock-hash").unwrap();
+        let destination =
+            RelativeManagedPath::new("runtime/minecraft/generations/lock-hash").unwrap();
+        let mut predicate_called = false;
+
+        let error = move_managed_directory_no_replace_if(
+            &root,
+            source.clone(),
+            destination.clone(),
+            || {
+                predicate_called = true;
+                true
+            },
+        )
+        .unwrap_err();
+
+        assert!(!predicate_called);
+        assert!(matches!(error, ManagedFsError::Conflict(_)));
+        assert_eq!(
+            fs::read(source.join_to(&root).join("source.marker")).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            fs::read(destination.join_to(&root).join("existing.marker")).unwrap(),
+            b"existing"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conditional_directory_move_never_replaces_a_commit_boundary_collision() {
+        let root = temp_root("conditional-directory-racing-collision");
+        fs::create_dir_all(root.join("runtime/minecraft/staging/lock-hash")).unwrap();
+        fs::create_dir_all(root.join("runtime/minecraft/generations")).unwrap();
+        fs::write(
+            root.join("runtime/minecraft/staging/lock-hash/source.marker"),
+            b"source",
+        )
+        .unwrap();
+        let source = RelativeManagedPath::new("runtime/minecraft/staging/lock-hash").unwrap();
+        let destination =
+            RelativeManagedPath::new("runtime/minecraft/generations/lock-hash").unwrap();
+
+        let error = move_managed_directory_no_replace_if(
+            &root,
+            source.clone(),
+            destination.clone(),
+            || {
+                fs::create_dir(destination.join_to(&root)).unwrap();
+                fs::write(
+                    destination.join_to(&root).join("racing.marker"),
+                    b"racing destination",
+                )
+                .unwrap();
+                true
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ManagedFsError::Conflict(_)));
+        assert_eq!(
+            fs::read(source.join_to(&root).join("source.marker")).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            fs::read(destination.join_to(&root).join("racing.marker")).unwrap(),
+            b"racing destination"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conditional_directory_move_keeps_the_handle_bound_source_during_a_swap_attempt() {
+        let root = temp_root("conditional-directory-source-swap");
+        fs::create_dir_all(root.join("runtime/minecraft/staging/lock-hash/image")).unwrap();
+        fs::create_dir_all(root.join("runtime/minecraft/generations")).unwrap();
+        fs::write(
+            root.join("runtime/minecraft/staging/lock-hash/image/client.jar"),
+            b"original verified client",
+        )
+        .unwrap();
+        let source = RelativeManagedPath::new("runtime/minecraft/staging/lock-hash").unwrap();
+        let destination =
+            RelativeManagedPath::new("runtime/minecraft/generations/lock-hash").unwrap();
+        let displaced = root.join("runtime/minecraft/staging/displaced-lock-hash");
+        let original_identity = GuardedDirectoryChain::open(&root, &source)
+            .unwrap()
+            .leaf()
+            .info
+            .identity
+            .clone();
+        let mut swap_succeeded = false;
+
+        let outcome = move_managed_directory_no_replace_if(
+            &root,
+            source.clone(),
+            destination.clone(),
+            || {
+                if fs::rename(source.join_to(&root), &displaced).is_ok() {
+                    swap_succeeded = true;
+                    fs::create_dir(source.join_to(&root)).unwrap();
+                    fs::write(
+                        source.join_to(&root).join("replacement.marker"),
+                        b"replacement",
+                    )
+                    .unwrap();
+                }
+                true
+            },
+        )
+        .unwrap();
+
+        let ConditionalManagedDirectoryMoveOutcome::Moved(moved) = outcome else {
+            panic!("a true final predicate must attempt the namespace commit");
+        };
+        assert_eq!(moved.identity, original_identity);
+        assert_eq!(
+            fs::read(destination.join_to(&root).join("image/client.jar")).unwrap(),
+            b"original verified client"
+        );
+        if swap_succeeded {
+            assert_eq!(
+                fs::read(source.join_to(&root).join("replacement.marker")).unwrap(),
+                b"replacement"
+            );
+        } else {
+            assert!(!source.join_to(&root).exists());
+        }
+        assert!(!displaced.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn verified_managed_removal_hashes_and_deletes_the_exact_file() {
         let root = temp_root("verified-remove");
         fs::create_dir_all(root.join("outputs")).unwrap();
@@ -3081,6 +4094,247 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
+    fn recursive_removal_fixture(label: &str) -> (PathBuf, RelativeManagedPath, FileIdentity) {
+        let root = temp_root(label);
+        fs::create_dir_all(root.join("quarantine/workspace/nested")).unwrap();
+        fs::write(root.join("quarantine/workspace/root.bin"), b"root").unwrap();
+        fs::write(root.join("quarantine/workspace/nested/child.bin"), b"child").unwrap();
+        let relative = RelativeManagedPath::new("quarantine/workspace").unwrap();
+        let identity = GuardedDirectoryChain::open(&root, &relative)
+            .unwrap()
+            .leaf()
+            .info
+            .identity
+            .clone();
+        (root, relative, identity)
+    }
+
+    #[cfg(windows)]
+    fn generous_recursive_removal_limits() -> ManagedDirectoryRemovalLimits {
+        ManagedDirectoryRemovalLimits {
+            max_entries: 64,
+            max_allocated_bytes: 64 * 1024 * 1024,
+            max_depth: 8,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_recursive_removal_deletes_the_exact_safe_tree() {
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-safe");
+
+        let summary = remove_bounded_managed_directory_tree(
+            &root,
+            &relative,
+            &identity,
+            generous_recursive_removal_limits(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.entries, 4);
+        assert_eq!(summary.max_depth, 2);
+        assert!(!relative.join_to(&root).exists());
+        assert!(root.join("quarantine").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_recursive_removal_rejects_wrong_root_identity_without_deletion() {
+        let (root, relative, mut identity) =
+            recursive_removal_fixture("bounded-tree-wrong-identity");
+        identity.file_id[0] ^= 0xff;
+
+        assert!(remove_bounded_managed_directory_tree(
+            &root,
+            &relative,
+            &identity,
+            generous_recursive_removal_limits(),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(relative.join_to(&root).join("nested/child.bin")).unwrap(),
+            b"child"
+        );
+        assert_eq!(
+            fs::read(relative.join_to(&root).join("root.bin")).unwrap(),
+            b"root"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn bounded_recursive_removal_rejects_unsafe_descendants_without_partial_deletion() {
+        // Hard links are rejected even when both names are inside the otherwise-safe tree.
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-hardlink");
+        fs::hard_link(
+            relative.join_to(&root).join("root.bin"),
+            relative.join_to(&root).join("root-alias.bin"),
+        )
+        .unwrap();
+        assert!(remove_bounded_managed_directory_tree(
+            &root,
+            &relative,
+            &identity,
+            generous_recursive_removal_limits(),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(relative.join_to(&root).join("nested/child.bin")).unwrap(),
+            b"child"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // A named stream is not represented by read_dir, so every opened node must independently
+        // query its exact NTFS stream inventory before any deletion is allowed.
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-ads");
+        fs::write(relative.join_to(&root).join("root.bin:payload"), b"hidden").unwrap();
+        assert!(remove_bounded_managed_directory_tree(
+            &root,
+            &relative,
+            &identity,
+            generous_recursive_removal_limits(),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(relative.join_to(&root).join("nested/child.bin")).unwrap(),
+            b"child"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // Read-only is a known delete-disposition blocker. It is rejected during pre-audit so a
+        // later sibling can never be the first place that reveals the attribute.
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-readonly");
+        let read_only = relative.join_to(&root).join("root.bin");
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        assert!(remove_bounded_managed_directory_tree(
+            &root,
+            &relative,
+            &identity,
+            generous_recursive_removal_limits(),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(relative.join_to(&root).join("nested/child.bin")).unwrap(),
+            b"child"
+        );
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        // Symlink creation is privilege-dependent on Windows developer mode. When available, a
+        // directory reparse point must be rejected as an object and never traversed.
+        use std::os::windows::fs::symlink_dir;
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-reparse");
+        let outside = temp_root("bounded-tree-reparse-outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("outside.bin"), b"outside").unwrap();
+        if symlink_dir(&outside, relative.join_to(&root).join("alias")).is_ok() {
+            assert!(remove_bounded_managed_directory_tree(
+                &root,
+                &relative,
+                &identity,
+                generous_recursive_removal_limits(),
+            )
+            .is_err());
+            assert_eq!(
+                fs::read(relative.join_to(&root).join("nested/child.bin")).unwrap(),
+                b"child"
+            );
+            assert_eq!(fs::read(outside.join("outside.bin")).unwrap(), b"outside");
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_recursive_removal_limits_fail_before_any_deletion() {
+        let mut limits = generous_recursive_removal_limits();
+        limits.max_entries = 1;
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-entry-limit");
+        assert!(
+            remove_bounded_managed_directory_tree(&root, &relative, &identity, limits).is_err()
+        );
+        assert!(relative.join_to(&root).join("root.bin").is_file());
+        assert!(relative.join_to(&root).join("nested/child.bin").is_file());
+        fs::remove_dir_all(root).unwrap();
+
+        let mut limits = generous_recursive_removal_limits();
+        limits.max_depth = 1;
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-depth-limit");
+        assert!(
+            remove_bounded_managed_directory_tree(&root, &relative, &identity, limits).is_err()
+        );
+        assert!(relative.join_to(&root).join("root.bin").is_file());
+        assert!(relative.join_to(&root).join("nested/child.bin").is_file());
+        fs::remove_dir_all(root).unwrap();
+
+        let root = temp_root("bounded-tree-byte-limit");
+        fs::create_dir_all(root.join("quarantine/workspace")).unwrap();
+        fs::write(
+            root.join("quarantine/workspace/large.bin"),
+            vec![0xa5; 1024 * 1024],
+        )
+        .unwrap();
+        let relative = RelativeManagedPath::new("quarantine/workspace").unwrap();
+        let root_guard = GuardedDirectoryChain::open(&root, &relative).unwrap();
+        let identity = root_guard.leaf().info.identity.clone();
+        let root_allocated = root_guard.leaf().info.allocation_size;
+        drop(root_guard);
+        let file = ImmutableManagedFile::open(
+            &root,
+            &RelativeManagedPath::new("quarantine/workspace/large.bin").unwrap(),
+        )
+        .unwrap();
+        let exact_allocated = root_allocated + file.info().allocation_size;
+        drop(file);
+        assert!(exact_allocated > 0);
+        let limits = ManagedDirectoryRemovalLimits {
+            max_entries: 8,
+            max_allocated_bytes: exact_allocated - 1,
+            max_depth: 2,
+        };
+        assert!(
+            remove_bounded_managed_directory_tree(&root, &relative, &identity, limits).is_err()
+        );
+        assert!(relative.join_to(&root).join("large.bin").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_recursive_removal_holds_exclusive_handles_through_final_audit() {
+        let (root, relative, identity) = recursive_removal_fixture("bounded-tree-concurrency");
+        let workspace = relative.join_to(&root);
+        let file = workspace.join("root.bin");
+        let moved = root.join("quarantine/moved-workspace");
+
+        let summary = remove_bounded_managed_directory_tree_with(
+            &root,
+            &relative,
+            &identity,
+            generous_recursive_removal_limits(),
+            || {
+                assert!(OpenOptions::new().write(true).open(&file).is_err());
+                assert!(fs::rename(&workspace, &moved).is_err());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.entries, 4);
+        assert!(!workspace.exists());
+        assert!(!moved.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn hard_link_is_rejected_for_immutable_reads() {
         let root = temp_root("hard-link");
@@ -3093,6 +4347,37 @@ mod tests {
             &RelativeManagedPath::new("instances/original.jar").unwrap(),
         );
         assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_ntfs_stream_is_rejected_on_managed_files() {
+        let root = temp_root("named-stream");
+        fs::create_dir_all(root.join("objects")).unwrap();
+        fs::write(root.join("objects/file.bin"), b"default stream").unwrap();
+        fs::write(root.join("objects/file.bin:payload"), b"hidden payload").unwrap();
+        let relative = RelativeManagedPath::new("objects/file.bin").unwrap();
+        let error = match ImmutableManagedFile::open(&root, &relative) {
+            Ok(_) => panic!("managed file with ADS was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Named NTFS data streams"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_directory_stream_inventory_is_valid_but_directory_ads_is_rejected() {
+        let root = temp_root("directory-stream");
+        fs::create_dir_all(root.join("objects")).unwrap();
+        GuardedDirectoryChain::open(&root, &RelativeManagedPath::new("objects").unwrap()).unwrap();
+
+        fs::write(root.join("objects:payload"), b"hidden directory payload").unwrap();
+        assert!(
+            GuardedDirectoryChain::open(&root, &RelativeManagedPath::new("objects").unwrap(),)
+                .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

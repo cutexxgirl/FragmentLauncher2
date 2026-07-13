@@ -7,6 +7,8 @@ mod cas;
 #[allow(dead_code)]
 mod contracts;
 #[allow(dead_code)]
+mod game_generation;
+#[allow(dead_code)]
 mod game_runtime;
 #[allow(dead_code)]
 mod game_runtime_executor;

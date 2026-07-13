@@ -448,6 +448,28 @@ pub(super) fn revalidate_runtime_installation(
     Ok(verified)
 }
 
+/// Reconstructs Java launch authority only when it is still bound to the exact live Fragment
+/// install root owned by the enclosing game-generation operation. A same-lock runtime copied or
+/// installed under another Fragment root is not processor authority.
+pub(super) fn revalidate_runtime_installation_for_root(
+    installed: &RuntimeInstallation,
+    lock: &RuntimeLock,
+    owned_root: &OwnedCasRoot,
+) -> Result<RuntimeInstallation, String> {
+    let binding = installed
+        .binding
+        .as_ref()
+        .ok_or_else(|| "Synthetic Java runtime is not root-bound launch authority".to_string())?;
+    binding.validate_owned(owned_root)?;
+    let verified = revalidate_runtime_installation(installed, lock)?;
+    let verified_binding = verified
+        .binding
+        .as_ref()
+        .ok_or_else(|| "Revalidated Java runtime lost its root binding".to_string())?;
+    verified_binding.validate_owned(owned_root)?;
+    Ok(verified)
+}
+
 /// Audits the one canonical Java generation beneath an already validated Fragment install.
 /// Missing state is not an error, but an existing malformed/mismatched generation fails closed.
 /// This is deliberately the only path used by the artifact availability scanner to claim that
@@ -1491,6 +1513,31 @@ mod tests {
         let reinstall = install_runtime_from_path(&install_root, &archive, &runtime_hash, &lock);
         assert!(reinstall.is_ok(), "reinstall failed: {reinstall:?}");
         let _ = fs::remove_dir_all(archive.parent().unwrap());
+    }
+
+    #[test]
+    fn root_bound_revalidation_rejects_same_lock_runtime_from_another_install() {
+        let (archive, lock, runtime_hash) = fixture(None);
+        let fixture_root = archive.parent().unwrap().to_path_buf();
+        let selected = select_install_directory(&fixture_root.join("owned-install")).unwrap();
+        let owned_root = selected.into_owned_cas_root();
+        let mut archive_file = fs::File::open(&archive).unwrap();
+        let installed =
+            install_runtime_from_reader(&owned_root, &mut archive_file, &runtime_hash, &lock)
+                .unwrap();
+        assert_eq!(
+            revalidate_runtime_installation_for_root(&installed, &lock, &owned_root).unwrap(),
+            installed
+        );
+
+        let foreign = select_install_directory(&fixture_root.join("foreign-install"))
+            .unwrap()
+            .into_owned_cas_root();
+        assert!(revalidate_runtime_installation_for_root(&installed, &lock, &foreign).is_err());
+        drop(installed);
+        drop(foreign);
+        drop(owned_root);
+        let _ = fs::remove_dir_all(fixture_root);
     }
 
     #[test]

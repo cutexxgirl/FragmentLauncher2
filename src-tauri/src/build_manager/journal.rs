@@ -126,6 +126,7 @@ pub struct DiskBudgetV2 {
     pub missing_download_bytes: u64,
     pub java_extracted_bytes: u64,
     pub game_extracted_bytes: u64,
+    pub processor_workspace_bytes: u64,
     pub staging_bytes: u64,
     pub journal_reserve_bytes: u64,
     pub safety_margin_bytes: u64,
@@ -139,10 +140,27 @@ impl DiskBudgetV2 {
         game_extracted_bytes: u64,
         staging_bytes: u64,
     ) -> Result<Self, String> {
+        Self::new_with_processor_workspace(
+            missing_download_bytes,
+            java_extracted_bytes,
+            game_extracted_bytes,
+            0,
+            staging_bytes,
+        )
+    }
+
+    pub fn new_with_processor_workspace(
+        missing_download_bytes: u64,
+        java_extracted_bytes: u64,
+        game_extracted_bytes: u64,
+        processor_workspace_bytes: u64,
+        staging_bytes: u64,
+    ) -> Result<Self, String> {
         let subtotal = [
             missing_download_bytes,
             java_extracted_bytes,
             game_extracted_bytes,
+            processor_workspace_bytes,
             staging_bytes,
             JOURNAL_RESERVE_BYTES,
         ]
@@ -158,6 +176,7 @@ impl DiskBudgetV2 {
             missing_download_bytes,
             java_extracted_bytes,
             game_extracted_bytes,
+            processor_workspace_bytes,
             staging_bytes,
             journal_reserve_bytes: JOURNAL_RESERVE_BYTES,
             safety_margin_bytes,
@@ -166,10 +185,11 @@ impl DiskBudgetV2 {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        let expected = Self::new(
+        let expected = Self::new_with_processor_workspace(
             self.missing_download_bytes,
             self.java_extracted_bytes,
             self.game_extracted_bytes,
+            self.processor_workspace_bytes,
             self.staging_bytes,
         )?;
         if *self != expected {
@@ -1639,6 +1659,25 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn disk_budget_serializes_and_validates_processor_workspace_reserve_canonically() {
+        let budget = DiskBudgetV2::new_with_processor_workspace(1, 2, 3, 4, 5).unwrap();
+        assert_eq!(budget.processor_workspace_bytes, 4);
+        budget.validate().unwrap();
+
+        let mut value = serde_json::to_value(&budget).unwrap();
+        assert_eq!(value["processorWorkspaceBytes"], 4);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("processorWorkspaceBytes");
+        assert!(serde_json::from_value::<DiskBudgetV2>(value).is_err());
+
+        let mut forged = budget;
+        forged.processor_workspace_bytes += 1;
+        assert!(forged.validate().is_err());
     }
 
     fn repair_after(plan: &ReconcilePlanV2) -> ReconcilePlanV2 {

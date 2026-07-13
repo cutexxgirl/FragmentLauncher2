@@ -1,7 +1,10 @@
 use super::{
     artifact_plan::{ArtifactInventoryV2, ArtifactPlanV2, MutableBootstrapPlanV2},
     availability::VerifiedAvailabilityV2,
-    contracts::{GameRuntimeSource, RuntimeLock},
+    contracts::{
+        GameRuntimeLock, GameRuntimeRole, GameRuntimeSource, NormalizedProcessorArgument,
+        OfflineProcessorVerification, ProcessorInput, ProcessorMaterializationAccess, RuntimeLock,
+    },
     instance_state::ActiveInstanceV2,
     journal::{DiskBudgetV2, JournalMutation, OperationKind, PlannedFileV2, ReconcilePlanV2},
     reconciler::InstanceAudit,
@@ -16,6 +19,13 @@ use thiserror::Error;
 use uuid::{Uuid, Version};
 
 const RECONCILE_PLAN_SCHEMA_VERSION: u8 = 2;
+// These are executor-enforced maxima, not estimates derived from host free-space behavior. The
+// processor owns two independently writable trees (`temp` and `state/user-home`) and a bounded
+// state marker. Everything else in the processor workspace budget comes from the signed lock.
+const PROCESSOR_SCRATCH_TREE_BYTES: u64 = 256 * 1024 * 1024;
+const PROCESSOR_SCRATCH_TREE_COUNT: u64 = 2;
+const PROCESSOR_STATE_MARKER_RESERVE_BYTES: u64 = 256 * 1024;
+const PROCESSOR_EMERGENCY_RECOVERY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlannedBuildState {
@@ -378,10 +388,16 @@ pub(super) fn plan_build(request: PlannerRequestV2<'_>) -> Result<PlannedBuildV2
             })
             .ok_or(PlannerError::Overflow("game runtime extracted bytes"))?
     };
-    let disk_budget = DiskBudgetV2::new(
+    let processor_workspace_bytes = if game_generation_verified {
+        0
+    } else {
+        processor_workspace_bytes(request.trusted_release.game_runtime_lock())?
+    };
+    let disk_budget = DiskBudgetV2::new_with_processor_workspace(
         requirements,
         java_extracted_bytes,
         game_extracted_bytes,
+        processor_workspace_bytes,
         staging_bytes,
     )
     .map_err(PlannerError::Plan)?;
@@ -868,6 +884,183 @@ fn sum_java_files(lock: &RuntimeLock) -> Result<u64, PlannerError> {
         .ok_or(PlannerError::Overflow("Java runtime extracted bytes"))
 }
 
+/// Pessimistic peak space retained while building a missing immutable game generation.
+///
+/// The final 4,028-file generation and missing CAS objects are budgeted separately. This reserve
+/// covers the independent processor-input copies, embedded patch, signed output/write-set,
+/// executor-bounded scratch/state, a physically preallocated emergency recovery reserve, and one
+/// largest-file incoming copy that can coexist with the completed staging tree immediately before
+/// publication.
+fn processor_workspace_bytes(lock: &GameRuntimeLock) -> Result<u64, PlannerError> {
+    let minecraft_client = unique_official_runtime_path(lock, GameRuntimeRole::MinecraftClient)?;
+    let minecraft_mappings =
+        unique_official_runtime_path(lock, GameRuntimeRole::MinecraftClientMappings)?;
+    let installer = unique_official_runtime_path(lock, GameRuntimeRole::NeoforgeInstaller)?;
+
+    let mut upstream = BTreeMap::new();
+    for step in &lock.provenance.processor_plans.upstream.steps {
+        if upstream.insert(step.upstream_index, step).is_some() {
+            return Err(PlannerError::Plan(
+                "Processor plan contains duplicate upstream indices".into(),
+            ));
+        }
+    }
+    let mut official_paths = BTreeSet::from([installer]);
+    for reference in &lock.provenance.processor_plans.executable.steps {
+        let step = upstream.get(&reference.upstream_index).ok_or_else(|| {
+            PlannerError::Plan(format!(
+                "Executable processor step {} is absent from the upstream plan",
+                reference.upstream_index
+            ))
+        })?;
+        official_paths.insert(step.jar_path.clone());
+        official_paths.extend(step.classpath.iter().cloned());
+        for argument in &step.arguments {
+            match argument {
+                NormalizedProcessorArgument::Path { path } => {
+                    official_paths.insert(path.clone());
+                }
+                NormalizedProcessorArgument::Input {
+                    input: ProcessorInput::MinecraftClient,
+                } => {
+                    official_paths.insert(minecraft_client.clone());
+                }
+                NormalizedProcessorArgument::Input {
+                    input: ProcessorInput::MinecraftClientMappings,
+                }
+                | NormalizedProcessorArgument::Materialization {
+                    access: ProcessorMaterializationAccess::Read,
+                    ..
+                } => {
+                    official_paths.insert(minecraft_mappings.clone());
+                }
+                NormalizedProcessorArgument::Materialization {
+                    access: ProcessorMaterializationAccess::Write,
+                    ..
+                } => {
+                    return Err(PlannerError::Plan(
+                        "Executable processor plan contains a writable input materialization"
+                            .into(),
+                    ));
+                }
+                NormalizedProcessorArgument::Literal { .. }
+                | NormalizedProcessorArgument::Input {
+                    input: ProcessorInput::ClientPatch,
+                }
+                | NormalizedProcessorArgument::Output { .. } => {}
+            }
+        }
+    }
+
+    let mut official_input_bytes = 0_u64;
+    for path in official_paths {
+        let file = lock
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                PlannerError::Plan(format!(
+                    "Processor input is absent from the signed game runtime: {path}"
+                ))
+            })?;
+        let GameRuntimeSource::Official { size, .. } = &file.source else {
+            return Err(PlannerError::Plan(format!(
+                "Processor input is not an official artifact: {path}"
+            )));
+        };
+        official_input_bytes = official_input_bytes
+            .checked_add(*size)
+            .ok_or(PlannerError::Overflow("processor official input bytes"))?;
+    }
+
+    let mut derived_output_bytes = 0_u64;
+    let mut largest_incoming_copy_bytes = 0_u64;
+    for file in &lock.files {
+        let size = game_runtime_file_size(&file.source);
+        largest_incoming_copy_bytes = largest_incoming_copy_bytes.max(size);
+        if matches!(&file.source, GameRuntimeSource::Derived { .. }) {
+            derived_output_bytes = derived_output_bytes
+                .checked_add(size)
+                .ok_or(PlannerError::Overflow("processor derived output bytes"))?;
+        }
+    }
+    if largest_incoming_copy_bytes == 0 {
+        return Err(PlannerError::Plan(
+            "Game runtime has no non-empty file for the incoming-copy reserve".into(),
+        ));
+    }
+
+    let mut transient_sizes = BTreeMap::new();
+    let OfflineProcessorVerification::Verified { runs, .. } = &lock.verification.offline_processors
+    else {
+        return Err(PlannerError::Plan(
+            "Pending processor verification cannot be disk-budgeted".into(),
+        ));
+    };
+    for run in runs.iter() {
+        for step in &run.steps {
+            for artifact in &step.removed_transient_artifacts {
+                if transient_sizes
+                    .insert(artifact.path.clone(), artifact.size)
+                    .is_some_and(|existing| existing != artifact.size)
+                {
+                    return Err(PlannerError::Plan(
+                        "Processor receipt reuses a transient path with another size".into(),
+                    ));
+                }
+            }
+        }
+    }
+    let transient_output_bytes = transient_sizes
+        .values()
+        .try_fold(0_u64, |total, size| total.checked_add(*size))
+        .ok_or(PlannerError::Overflow("processor transient output bytes"))?;
+    let scratch_bytes = PROCESSOR_SCRATCH_TREE_BYTES
+        .checked_mul(PROCESSOR_SCRATCH_TREE_COUNT)
+        .ok_or(PlannerError::Overflow("processor scratch bytes"))?;
+
+    [
+        official_input_bytes,
+        lock.provenance.client_patch.size,
+        derived_output_bytes,
+        transient_output_bytes,
+        scratch_bytes,
+        PROCESSOR_STATE_MARKER_RESERVE_BYTES,
+        PROCESSOR_EMERGENCY_RECOVERY_RESERVE_BYTES,
+        largest_incoming_copy_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, value| total.checked_add(value))
+    .ok_or(PlannerError::Overflow("processor workspace bytes"))
+}
+
+fn unique_official_runtime_path(
+    lock: &GameRuntimeLock,
+    role: GameRuntimeRole,
+) -> Result<String, PlannerError> {
+    let mut matching = lock.files.iter().filter(|file| {
+        file.role == role && matches!(&file.source, GameRuntimeSource::Official { .. })
+    });
+    let path = matching
+        .next()
+        .map(|file| file.path.clone())
+        .ok_or_else(|| {
+            PlannerError::Plan(format!("Official processor role is missing: {role:?}"))
+        })?;
+    if matching.next().is_some() {
+        return Err(PlannerError::Plan(format!(
+            "Official processor role is ambiguous: {role:?}"
+        )));
+    }
+    Ok(path)
+}
+
+fn game_runtime_file_size(source: &GameRuntimeSource) -> u64 {
+    match source {
+        GameRuntimeSource::Official { size, .. } | GameRuntimeSource::Derived { size, .. } => *size,
+    }
+}
+
 fn staging_proof_matches(plan: &ReconcilePlanV2, proofs: &[StagingFileProofV2]) -> bool {
     let expected = plan
         .mutations
@@ -1304,6 +1497,9 @@ pub(crate) mod tests {
         assert!(plan.disk_budget.missing_download_bytes > 0);
         assert!(plan.disk_budget.java_extracted_bytes > 0);
         assert!(plan.disk_budget.game_extracted_bytes > 0);
+        // The synthetic lock deliberately concentrates its asset bytes into one very large file;
+        // the incoming-copy reserve must therefore be derived rather than hard-coded.
+        assert_eq!(plan.disk_budget.processor_workspace_bytes, 1_534_569_589);
         assert!(plan.disk_budget.safety_margin_bytes >= 256 * 1024 * 1024);
         assert!(plan.disk_budget.required_bytes > plan.disk_budget.staging_bytes);
         assert_eq!(
@@ -1345,6 +1541,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(planned.state, PlannedBuildState::Ready);
         assert!(planned.plan.is_none());
+        assert_eq!(planned.disk_budget.processor_workspace_bytes, 0);
         assert_eq!(
             planned.disk_budget.required_bytes,
             256 * 1024 * 1024 + 64 * 1024 * 1024 + 64 * 1024
@@ -1613,6 +1810,15 @@ pub(crate) mod tests {
 
     #[test]
     fn disk_budget_overflow_is_fail_closed() {
-        assert!(DiskBudgetV2::new(u64::MAX, 1, 0, 0).is_err());
+        assert!(DiskBudgetV2::new_with_processor_workspace(u64::MAX, 1, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn processor_workspace_budget_matches_the_canonical_release_lock() {
+        let lock = GameRuntimeLock::parse_and_validate(include_bytes!(
+            "../../tests/fixtures/game-runtime-lock-v2-release-canonical-verified.json"
+        ))
+        .unwrap();
+        assert_eq!(processor_workspace_bytes(&lock).unwrap(), 749_101_988);
     }
 }

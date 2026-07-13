@@ -1,5 +1,6 @@
 use super::{
     availability::{ArtifactAvailabilityStateV2, VerifiedAvailabilityV2},
+    cas::VerifiedCasObject,
     contracts::{
         validate_manifest_path, validate_official_game_source, GameRuntimeLock, GameRuntimeRole,
         GameRuntimeSource, RuntimeLock,
@@ -154,6 +155,30 @@ pub(super) struct PlannedJavaArchiveV2<'a> {
     binding: &'a ArtifactBindingV2,
     inventory: &'a ArtifactInventoryV2,
     planned: &'a PlannedArtifactV2,
+}
+
+/// Non-serializable authority for assembling the immutable 4,028-file game generation. It can
+/// only be extracted from a sealed reconcile plan which contains every official game requirement,
+/// and it owns the exact post-download, root-bound CAS capabilities for that set.
+pub(super) struct PlannedGameGenerationV2<'a> {
+    binding: &'a ArtifactBindingV2,
+    inventory: &'a ArtifactInventoryV2,
+    plan: &'a ArtifactPlanV2,
+    official_objects: BTreeMap<String, VerifiedCasObject>,
+    generation_binding: PlannedGameGenerationBindingV2,
+}
+
+/// Opaque, cloneable correlation token for processor/publication results. Private fields prevent
+/// another module from manufacturing a result for a different operation, release, root or lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlannedGameGenerationBindingV2 {
+    digest: String,
+    install_id: Uuid,
+    operation_id: Uuid,
+    root_binding_nonce: Uuid,
+    inventory_fingerprint: String,
+    runtime_lock_sha256: String,
+    game_runtime_lock_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +428,18 @@ impl ArtifactInventoryV2 {
         self.binding.install_id
     }
 
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.binding.operation_id
+    }
+
+    pub(super) fn release_id(&self) -> &str {
+        &self.binding.release_id
+    }
+
+    pub(super) fn trusted_evidence(&self) -> &TrustedReleaseEvidence {
+        &self.binding.evidence
+    }
+
     pub(super) fn runtime_lock(&self) -> &RuntimeLock {
         &self.runtime_lock
     }
@@ -417,6 +454,24 @@ impl ArtifactInventoryV2 {
 
     pub(super) fn game_runtime_lock_sha256(&self) -> &str {
         &self.binding.evidence.game_runtime_lock.sha256
+    }
+
+    pub(super) fn java_archive_sha256(&self) -> &str {
+        &self.java_archive_sha256
+    }
+
+    pub(super) fn official_game_sha256(&self) -> &[String] {
+        &self.official_sha256
+    }
+
+    pub(super) fn is_java_archive_sha256(&self, sha256: &str) -> bool {
+        self.java_archive_sha256 == sha256
+    }
+
+    pub(super) fn is_official_game_sha256(&self, sha256: &str) -> bool {
+        self.official_sha256
+            .binary_search_by(|candidate| candidate.as_str().cmp(sha256))
+            .is_ok()
     }
 
     pub(super) fn fingerprint(&self) -> &str {
@@ -561,6 +616,73 @@ impl ArtifactPlanV2 {
         })
     }
 
+    pub(super) fn game_generation<'a>(
+        &'a self,
+        root: &OwnedCasRoot,
+        inventory: &'a ArtifactInventoryV2,
+        official_objects: Vec<VerifiedCasObject>,
+    ) -> Result<PlannedGameGenerationV2<'a>, String> {
+        self.validate_game_generation_plan(root, inventory)?;
+        let official_objects = collect_exact_official_objects(
+            inventory,
+            official_objects,
+            |object| (object.sha256(), object.size()),
+            |object| {
+                object
+                    .open(root)
+                    .map(drop)
+                    .map_err(|error| format!("Official CAS capability is not live: {error}"))
+            },
+        )?;
+        let digest = game_generation_binding_digest(&self.binding, inventory)?;
+        Ok(PlannedGameGenerationV2 {
+            binding: &self.binding,
+            inventory,
+            plan: self,
+            official_objects,
+            generation_binding: PlannedGameGenerationBindingV2 {
+                digest,
+                install_id: self.binding.install_id,
+                operation_id: self.binding.operation_id,
+                root_binding_nonce: self.binding.cas_root.binding_nonce,
+                inventory_fingerprint: inventory.fingerprint.clone(),
+                runtime_lock_sha256: inventory.java_runtime_lock_sha256().to_owned(),
+                game_runtime_lock_sha256: inventory.game_runtime_lock_sha256().to_owned(),
+            },
+        })
+    }
+
+    fn validate_game_generation_plan(
+        &self,
+        root: &OwnedCasRoot,
+        inventory: &ArtifactInventoryV2,
+    ) -> Result<(), String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        validate_exact_official_inventory(inventory)?;
+        if inventory_fingerprint(&inventory.binding, &inventory.artifacts)? != inventory.fingerprint
+        {
+            return Err("Game generation inventory fingerprint changed".into());
+        }
+        let planned_official = self
+            .requirements
+            .iter()
+            .filter(|planned| planned.requirement.authority == ArtifactAuthorityV2::OfficialHttps)
+            .collect::<Vec<_>>();
+        if planned_official.len() != inventory.official_sha256.len() {
+            return Err(
+                "Artifact plan does not authorize the exact official game artifact set".into(),
+            );
+        }
+        for (planned, expected_sha256) in planned_official.iter().zip(&inventory.official_sha256) {
+            let expected = inventory.requirement(expected_sha256)?;
+            if planned.requirement.sha256 != *expected_sha256 || &planned.requirement != expected {
+                return Err("Artifact plan contains a forged official game requirement".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn network_bytes(&self) -> u64 {
         self.network_bytes
     }
@@ -636,6 +758,148 @@ impl PlannedJavaArchiveV2<'_> {
 
     pub(super) fn runtime_lock_sha256(&self) -> &str {
         self.inventory.java_runtime_lock_sha256()
+    }
+}
+
+impl PlannedGameGenerationV2<'_> {
+    pub(super) fn validate_root(&self, root: &OwnedCasRoot) -> Result<(), String> {
+        self.plan
+            .validate_game_generation_plan(root, self.inventory)?;
+        if self.binding != &self.inventory.binding
+            || self.generation_binding.digest
+                != game_generation_binding_digest(self.binding, self.inventory)?
+            || self.official_objects.len() != self.inventory.official_sha256.len()
+        {
+            return Err("Planned game generation binding is invalid".into());
+        }
+        for (sha256, object) in &self.official_objects {
+            let expected = self.inventory.requirement(sha256)?;
+            if expected.authority != ArtifactAuthorityV2::OfficialHttps
+                || object.sha256() != sha256
+                || object.size() != expected.size
+            {
+                return Err("Planned game generation CAS set changed".into());
+            }
+            object
+                .open(root)
+                .map(drop)
+                .map_err(|error| format!("Official CAS capability is no longer live: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn binding(&self) -> PlannedGameGenerationBindingV2 {
+        self.generation_binding.clone()
+    }
+
+    pub(super) fn validate_binding(
+        &self,
+        candidate: &PlannedGameGenerationBindingV2,
+    ) -> Result<(), String> {
+        if candidate != &self.generation_binding {
+            return Err("Game generation result belongs to another sealed plan".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn binding_digest(&self) -> &str {
+        &self.generation_binding.digest
+    }
+
+    pub(super) fn inventory_fingerprint(&self) -> &str {
+        &self.inventory.fingerprint
+    }
+
+    pub(super) fn install_id(&self) -> Uuid {
+        self.binding.install_id
+    }
+
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.binding.operation_id
+    }
+
+    pub(super) fn root_binding_nonce(&self) -> Uuid {
+        self.binding.cas_root.binding_nonce
+    }
+
+    pub(super) fn release_id(&self) -> &str {
+        &self.binding.release_id
+    }
+
+    pub(super) fn trusted_evidence(&self) -> &TrustedReleaseEvidence {
+        &self.binding.evidence
+    }
+
+    pub(super) fn runtime_lock(&self) -> &RuntimeLock {
+        &self.inventory.runtime_lock
+    }
+
+    pub(super) fn game_runtime_lock(&self) -> &GameRuntimeLock {
+        &self.inventory.game_runtime_lock
+    }
+
+    pub(super) fn runtime_lock_sha256(&self) -> &str {
+        self.inventory.java_runtime_lock_sha256()
+    }
+
+    pub(super) fn game_runtime_lock_sha256(&self) -> &str {
+        self.inventory.game_runtime_lock_sha256()
+    }
+
+    pub(super) fn official_object_count(&self) -> usize {
+        self.official_objects.len()
+    }
+
+    pub(super) fn official_object(&self, sha256: &str) -> Result<&VerifiedCasObject, String> {
+        if self
+            .inventory
+            .official_sha256
+            .binary_search_by(|candidate| candidate.as_str().cmp(sha256))
+            .is_err()
+        {
+            return Err("Game generation requested a non-official CAS object".into());
+        }
+        self.official_objects
+            .get(sha256)
+            .ok_or_else(|| "Game generation is missing an official CAS capability".into())
+    }
+
+    pub(super) fn official_objects(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&str, &VerifiedCasObject)> {
+        self.official_objects
+            .iter()
+            .map(|(sha256, object)| (sha256.as_str(), object))
+    }
+}
+
+impl PlannedGameGenerationBindingV2 {
+    pub(super) fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(super) fn install_id(&self) -> Uuid {
+        self.install_id
+    }
+
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub(super) fn root_binding_nonce(&self) -> Uuid {
+        self.root_binding_nonce
+    }
+
+    pub(super) fn inventory_fingerprint(&self) -> &str {
+        &self.inventory_fingerprint
+    }
+
+    pub(super) fn runtime_lock_sha256(&self) -> &str {
+        &self.runtime_lock_sha256
+    }
+
+    pub(super) fn game_runtime_lock_sha256(&self) -> &str {
+        &self.game_runtime_lock_sha256
     }
 }
 
@@ -743,6 +1007,10 @@ fn missing_requirements(
             | ArtifactAvailabilityStateV2::Missing
             | ArtifactAvailabilityStateV2::Corrupt => 0,
             ArtifactAvailabilityStateV2::Partial { bytes } => bytes,
+            ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+            | ArtifactAvailabilityStateV2::CoveredByGameGeneration => {
+                return Err("A generation-covered artifact cannot enter a download plan".into());
+            }
         };
         if resume_from > expected.size {
             return Err("Partial artifact availability is not resumable".into());
@@ -778,6 +1046,8 @@ fn valid_planned_availability(planned: &PlannedArtifactV2) -> bool {
         ArtifactAvailabilityStateV2::Complete
         | ArtifactAvailabilityStateV2::Missing
         | ArtifactAvailabilityStateV2::Corrupt => planned.resume_from == 0,
+        ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+        | ArtifactAvailabilityStateV2::CoveredByGameGeneration => false,
     }
 }
 
@@ -875,6 +1145,125 @@ fn inventory_fingerprint(
     })
     .map_err(|error| format!("Cannot bind artifact inventory: {error}"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn game_generation_binding_digest(
+    binding: &ArtifactBindingV2,
+    inventory: &ArtifactInventoryV2,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Envelope<'a> {
+        domain: &'static str,
+        binding: &'a ArtifactBindingV2,
+        inventory_fingerprint: &'a str,
+        runtime_lock_sha256: &'a str,
+        game_runtime_lock_sha256: &'a str,
+        official_sha256: &'a [String],
+    }
+    let bytes = serde_json::to_vec(&Envelope {
+        domain: "ru.fragmc.launcher.planned-game-generation.v2",
+        binding,
+        inventory_fingerprint: &inventory.fingerprint,
+        runtime_lock_sha256: inventory.java_runtime_lock_sha256(),
+        game_runtime_lock_sha256: inventory.game_runtime_lock_sha256(),
+        official_sha256: &inventory.official_sha256,
+    })
+    .map_err(|error| format!("Cannot bind planned game generation: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_exact_official_inventory(inventory: &ArtifactInventoryV2) -> Result<(), String> {
+    let mut expected = BTreeMap::<String, ArtifactRequirementV2>::new();
+    for file in &inventory.game_runtime_lock.files {
+        let GameRuntimeSource::Official {
+            url,
+            size,
+            sha1,
+            sha256,
+        } = &file.source
+        else {
+            continue;
+        };
+        insert_requirement(
+            &mut expected,
+            ArtifactRequirementV2 {
+                sha256: sha256.clone(),
+                size: *size,
+                authority: ArtifactAuthorityV2::OfficialHttps,
+                source: ArtifactSourceV2::OfficialHttps {
+                    url: url.clone(),
+                    sha1: sha1.clone(),
+                },
+                provenances: vec![ArtifactProvenanceV2 {
+                    kind: ArtifactProvenanceKindV2::GameRuntimeOfficial,
+                    path: file.path.clone(),
+                    role: Some(role_name(file.role)?),
+                }],
+            },
+        )?;
+    }
+    let expected_hashes = expected.keys().cloned().collect::<Vec<_>>();
+    if expected_hashes != inventory.official_sha256 {
+        return Err("Artifact inventory official game set is missing, extra or duplicated".into());
+    }
+    let inventory_official = inventory
+        .artifacts
+        .iter()
+        .filter(|requirement| requirement.authority == ArtifactAuthorityV2::OfficialHttps)
+        .collect::<Vec<_>>();
+    if inventory_official.len() != expected.len() {
+        return Err("Artifact inventory contains an extra official requirement".into());
+    }
+    for (sha256, requirement) in expected {
+        if inventory.requirement(&sha256)? != &requirement {
+            return Err("Artifact inventory official requirement metadata changed".into());
+        }
+    }
+    Ok(())
+}
+
+fn collect_exact_official_objects<T, D, V>(
+    inventory: &ArtifactInventoryV2,
+    objects: Vec<T>,
+    mut describe: D,
+    mut validate: V,
+) -> Result<BTreeMap<String, T>, String>
+where
+    D: FnMut(&T) -> (&str, u64),
+    V: FnMut(&T) -> Result<(), String>,
+{
+    validate_exact_official_inventory(inventory)?;
+    if objects.len() != inventory.official_sha256.len() {
+        return Err("Official CAS capability set is missing or contains extras".into());
+    }
+    let mut exact = BTreeMap::new();
+    for object in objects {
+        let (sha256, size) = describe(&object);
+        let sha256 = sha256.to_owned();
+        let expected = inventory
+            .official_sha256
+            .binary_search(&sha256)
+            .ok()
+            .and_then(|_| inventory.requirement(&sha256).ok())
+            .ok_or_else(|| "Official CAS capability set contains an unsigned extra".to_string())?;
+        if size != expected.size {
+            return Err("Official CAS capability size differs from signed metadata".into());
+        }
+        validate(&object)?;
+        if exact.insert(sha256, object).is_some() {
+            return Err("Official CAS capability set contains a duplicate".into());
+        }
+    }
+    if exact.len() != inventory.official_sha256.len()
+        || exact
+            .keys()
+            .zip(&inventory.official_sha256)
+            .any(|(actual, expected)| actual != expected)
+    {
+        return Err("Official CAS capability set is not exact".into());
+    }
+    Ok(exact)
 }
 
 fn register_path(
@@ -1301,6 +1690,149 @@ mod tests {
     }
 
     #[test]
+    fn game_generation_plan_accepts_post_download_capabilities_and_rejects_ready_rebound_plans() {
+        let root = TestRoot::new("game-authority");
+        let release = trusted('a', 1);
+        let sealed_inventory = inventory(&root, &release, Uuid::new_v4());
+
+        // An initial install is planned from Missing availability. Completion is proved later by
+        // the exact live VerifiedCasObject set, not by the pre-download snapshot.
+        let missing = VerifiedAvailabilityV2::for_test(&sealed_inventory, [], false, false);
+        let download_plan = ArtifactPlanV2::for_reconcile(&sealed_inventory, &missing, []).unwrap();
+        download_plan
+            .validate_game_generation_plan(root.root(), &sealed_inventory)
+            .unwrap();
+
+        #[derive(Debug)]
+        struct FakeCapability {
+            sha256: String,
+            size: u64,
+            live: bool,
+        }
+        let downloaded = sealed_inventory
+            .official_sha256
+            .iter()
+            .map(|sha256| FakeCapability {
+                sha256: sha256.clone(),
+                size: sealed_inventory.requirement(sha256).unwrap().size,
+                live: true,
+            })
+            .collect::<Vec<_>>();
+        let exact = collect_exact_official_objects(
+            &sealed_inventory,
+            downloaded,
+            |object| (object.sha256.as_str(), object.size),
+            |object| object.live.then_some(()).ok_or_else(|| "wrong root".into()),
+        )
+        .unwrap();
+        assert_eq!(exact.len(), 4_022);
+
+        let already_ready = VerifiedAvailabilityV2::for_test(&sealed_inventory, [], false, true);
+        let no_generation_authority =
+            ArtifactPlanV2::for_reconcile(&sealed_inventory, &already_ready, []).unwrap();
+        assert!(no_generation_authority
+            .execution_view(root.root(), &sealed_inventory)
+            .unwrap()
+            .items()
+            .all(|item| !sealed_inventory.is_official_game_sha256(item.sha256())));
+        assert!(no_generation_authority
+            .validate_game_generation_plan(root.root(), &sealed_inventory)
+            .is_err());
+
+        let rebound = TestRoot::from_owner_marker("game-authority-rebound", &root);
+        assert!(download_plan
+            .validate_game_generation_plan(rebound.root(), &sealed_inventory)
+            .is_err());
+
+        let other_operation = inventory(&root, &release, Uuid::new_v4());
+        assert!(download_plan
+            .validate_game_generation_plan(root.root(), &other_operation)
+            .is_err());
+        let other_release = inventory(&root, &trusted('b', 2), Uuid::new_v4());
+        assert!(download_plan
+            .validate_game_generation_plan(root.root(), &other_release)
+            .is_err());
+    }
+
+    #[test]
+    fn exact_official_capability_set_rejects_missing_extra_duplicate_size_and_root() {
+        #[derive(Debug)]
+        struct FakeCapability {
+            sha256: String,
+            size: u64,
+            live: bool,
+        }
+
+        let root = TestRoot::new("game-capability-set");
+        let inventory = inventory(&root, &trusted('a', 1), Uuid::new_v4());
+        let make_exact = || {
+            inventory
+                .official_sha256
+                .iter()
+                .map(|sha256| FakeCapability {
+                    sha256: sha256.clone(),
+                    size: inventory.requirement(sha256).unwrap().size,
+                    live: true,
+                })
+                .collect::<Vec<_>>()
+        };
+        let validate = |objects| {
+            collect_exact_official_objects(
+                &inventory,
+                objects,
+                |object: &FakeCapability| (object.sha256.as_str(), object.size),
+                |object| object.live.then_some(()).ok_or_else(|| "wrong root".into()),
+            )
+        };
+
+        let mut missing = make_exact();
+        missing.pop();
+        assert!(validate(missing).is_err());
+
+        let mut extra = make_exact();
+        extra[0].sha256 = "0".repeat(64);
+        assert!(validate(extra).is_err());
+
+        let mut duplicate = make_exact();
+        duplicate[1].sha256 = duplicate[0].sha256.clone();
+        duplicate[1].size = duplicate[0].size;
+        assert!(validate(duplicate).is_err());
+
+        let mut wrong_size = make_exact();
+        wrong_size[0].size = wrong_size[0].size.saturating_add(1);
+        assert!(validate(wrong_size).is_err());
+
+        let mut wrong_root = make_exact();
+        wrong_root[0].live = false;
+        assert!(validate(wrong_root).is_err());
+    }
+
+    #[test]
+    fn game_generation_binding_digest_covers_operation_release_root_and_lock_set() {
+        let root = TestRoot::new("game-binding-digest");
+        let release = trusted('a', 1);
+        let first = inventory(&root, &release, Uuid::new_v4());
+        let second_operation = inventory(&root, &release, Uuid::new_v4());
+        let second_release = inventory(&root, &trusted('b', 2), Uuid::new_v4());
+        let first_digest = game_generation_binding_digest(&first.binding, &first).unwrap();
+        assert_ne!(
+            first_digest,
+            game_generation_binding_digest(&second_operation.binding, &second_operation).unwrap()
+        );
+        assert_ne!(
+            first_digest,
+            game_generation_binding_digest(&second_release.binding, &second_release).unwrap()
+        );
+
+        let rebound = TestRoot::from_owner_marker("game-binding-digest-rebound", &root);
+        let rebound_inventory = inventory(&rebound, &release, Uuid::new_v4());
+        assert_ne!(
+            first_digest,
+            game_generation_binding_digest(&rebound_inventory.binding, &rebound_inventory).unwrap()
+        );
+    }
+
+    #[test]
     fn mutable_bootstrap_contains_only_missing_signed_defaults() {
         let root = TestRoot::new("mutable");
         let release = trusted('a', 1);
@@ -1332,5 +1864,44 @@ mod tests {
         );
         assert_eq!(cached.network_bytes(), 0);
         assert_eq!(cached.disk_download_reserve_bytes(), 0);
+    }
+
+    #[test]
+    fn generation_covered_states_can_never_become_download_authority() {
+        let root = TestRoot::new("covered-plan-state");
+        let inventory = inventory(&root, &trusted('a', 1), Uuid::new_v4());
+        let java_hash = inventory.java_archive_sha256().to_owned();
+        let official_hash = inventory.official_game_sha256()[0].clone();
+
+        for (sha256, state) in [
+            (
+                java_hash.clone(),
+                ArtifactAvailabilityStateV2::CoveredByJavaGeneration,
+            ),
+            (
+                official_hash.clone(),
+                ArtifactAvailabilityStateV2::CoveredByGameGeneration,
+            ),
+        ] {
+            let availability = VerifiedAvailabilityV2::for_test(
+                &inventory,
+                [(sha256.clone(), state)],
+                false,
+                false,
+            );
+            assert!(missing_requirements(
+                &inventory,
+                &availability,
+                BTreeSet::from([sha256.clone()])
+            )
+            .is_err());
+
+            let planned = PlannedArtifactV2 {
+                requirement: inventory.requirement(&sha256).unwrap().clone(),
+                availability: state,
+                resume_from: 0,
+            };
+            assert!(!valid_planned_availability(&planned));
+        }
     }
 }

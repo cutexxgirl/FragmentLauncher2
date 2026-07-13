@@ -4,10 +4,14 @@ use super::{
         RuntimeLock, UpstreamProcessorStep,
     },
     game_runtime_invocation::PreparedProcessorInvocation,
-    managed_fs::{GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath},
+    game_runtime_materializer::{MAX_SCRATCH_ENTRIES, MAX_SCRATCH_TOTAL_BYTES, STATE_MARKER_PATH},
+    managed_fs::{
+        validate_no_named_data_streams, ExclusiveManagedFile, FileDigests, GuardedDirectoryChain,
+        ImmutableManagedFile, ManagedFsError, RelativeManagedPath, ResumableManagedFile,
+    },
     process_supervisor::{spawn as spawn_process, ProcessSpec},
-    runtime::{revalidate_runtime_installation, RuntimeInstallation},
-    storage::is_windows_reparse_point,
+    runtime::{revalidate_runtime_installation_for_root, RuntimeInstallation},
+    storage::{is_windows_reparse_point, open_regular_single_link, OwnedCasRoot},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -32,6 +36,12 @@ const MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+// This is a fail-closed detector rather than an OS disk quota: a child can write between scans.
+// The physically-verified reserve below remains handle-protected during that window and releases
+// at least 64 MiB of filesystem allocation after the Job Object has terminated the process tree.
+const WORKSPACE_MONITOR_INTERVAL: Duration = Duration::from_millis(25);
+const PROCESSOR_RECOVERY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+const RECOVERY_RESERVE_PATH: &str = "state/processor-recovery-reserve.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExecutableProcessorStep {
@@ -94,6 +104,70 @@ impl GameRuntimeOutputLease {
         validate_output_inventory(&self.expected, &observed)?;
         validate_output_tree_inventory(&self.root, &self.expected, &self.expected_directories)
     }
+
+    fn revalidate_namespace(&self) -> Result<(), String> {
+        let mut observed = BTreeSet::new();
+        for held in &self.held_outputs {
+            held.file.revalidate().map_err(|error| {
+                format!("Game runtime output handle changed before publication: {error}")
+            })?;
+            if !observed.insert(held.key.clone()) {
+                return Err("Game runtime output lease contains a duplicate path".into());
+            }
+        }
+        if observed != self.expected.keys().cloned().collect() {
+            return Err("Game runtime output lease inventory is incomplete".into());
+        }
+        validate_output_tree_inventory(&self.root, &self.expected, &self.expected_directories)
+    }
+
+    /// Streams one exact signed derived output into a fresh exclusive destination while the
+    /// complete exact-six output namespace remains leased. The caller supplies the identity from
+    /// its sealed game-generation authority; a path-only lookup is deliberately insufficient.
+    ///
+    /// This never exposes a workspace path and never hard-links processor output into the final
+    /// generation. Both signed digests are computed over the bytes actually written.
+    pub(super) fn copy_expected_to(
+        &mut self,
+        path: &str,
+        size: u64,
+        sha1: &str,
+        sha256: &str,
+        destination: &mut ExclusiveManagedFile,
+    ) -> Result<FileDigests, String> {
+        self.revalidate_namespace()?;
+        let managed = RelativeManagedPath::new(path)
+            .map_err(|error| format!("Derived output publication path is unsafe: {error}"))?;
+        let key = managed.collision_key();
+        let expected = self.expected.get(key).ok_or_else(|| {
+            "Requested publication file is not a signed derived output".to_string()
+        })?;
+        if expected.path != managed.as_str()
+            || expected.size != size
+            || expected.sha1 != sha1
+            || expected.sha256 != sha256
+        {
+            return Err(
+                "Requested publication identity differs from the signed derived output".into(),
+            );
+        }
+        let held = self
+            .held_outputs
+            .iter_mut()
+            .find(|held| held.key == key)
+            .ok_or_else(|| {
+                "Signed derived output is absent from the live output lease".to_string()
+            })?;
+        let written = held
+            .file
+            .copy_to_exclusive(destination, size)
+            .map_err(|error| format!("Cannot copy leased processor output: {error}"))?;
+        if written.size != size || written.sha1 != sha1 || written.sha256 != sha256 {
+            return Err("Published processor output bytes differ from the signed identity".into());
+        }
+        self.revalidate_namespace()?;
+        Ok(written)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +175,41 @@ pub(super) struct JavaProcessLimits {
     pub(super) timeout: Duration,
     pub(super) max_stream_bytes: u64,
     pub(super) max_diagnostic_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProcessorWorkspaceMonitorLimits {
+    pub(super) output_max_entries: usize,
+    pub(super) output_max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceTreeLimit {
+    max_entries: usize,
+    max_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkspaceTreeUsage {
+    entries: usize,
+    bytes: u64,
+}
+
+struct ProcessorWorkspaceMonitor {
+    root: PathBuf,
+    inputs: PathBuf,
+    temp: PathBuf,
+    home: PathBuf,
+    outputs: PathBuf,
+    input_usage: WorkspaceTreeUsage,
+    scratch_limit: WorkspaceTreeLimit,
+    output_limit: WorkspaceTreeLimit,
+}
+
+struct ProcessorRecoveryReserve {
+    // `ResumableManagedFile` is opened with no sharing on Windows, so the child cannot consume,
+    // truncate, link or delete the recovery allocation before the supervisor releases it.
+    file: Option<ResumableManagedFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +234,368 @@ struct JavaProcessRequest<'a> {
     cwd: &'a Path,
     environment: &'a [(OsString, OsString)],
     limits: JavaProcessLimits,
+    workspace_monitor: Option<ProcessorWorkspaceMonitor>,
+    recovery_reserve: Option<ProcessorRecoveryReserve>,
     cancelled: Arc<AtomicBool>,
+}
+
+impl ProcessorWorkspaceMonitor {
+    fn for_invocation(
+        invocation: &PreparedProcessorInvocation,
+        limits: ProcessorWorkspaceMonitorLimits,
+    ) -> Result<Self, String> {
+        if limits.output_max_entries == 0 || limits.output_max_bytes == 0 {
+            return Err("Processor live output monitor limits are empty".into());
+        }
+        let root = invocation.cwd();
+        if !root.is_absolute() {
+            return Err("Processor workspace monitor root is not absolute".into());
+        }
+        let inputs = root.join("inputs");
+        let input_usage = audit_live_workspace_tree(
+            &inputs,
+            "processor inputs",
+            WorkspaceTreeLimit {
+                max_entries: 4_096,
+                max_bytes: 1024 * 1024 * 1024,
+            },
+        )?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            inputs,
+            temp: root.join("temp"),
+            home: root.join("state/user-home"),
+            outputs: root.join("outputs"),
+            input_usage,
+            scratch_limit: WorkspaceTreeLimit {
+                max_entries: MAX_SCRATCH_ENTRIES,
+                max_bytes: MAX_SCRATCH_TOTAL_BYTES,
+            },
+            output_limit: WorkspaceTreeLimit {
+                max_entries: limits.output_max_entries,
+                max_bytes: limits.output_max_bytes,
+            },
+        })
+    }
+
+    fn audit(&self) -> Result<(), String> {
+        audit_live_workspace_root(&self.root)?;
+        audit_live_workspace_state(&self.root.join("state"))?;
+        let input_usage = audit_live_workspace_tree(
+            &self.inputs,
+            "processor inputs",
+            WorkspaceTreeLimit {
+                max_entries: self.input_usage.entries,
+                max_bytes: self.input_usage.bytes,
+            },
+        )?;
+        if input_usage != self.input_usage {
+            return Err("Live processor input topology or byte total changed".into());
+        }
+        let _ = audit_live_workspace_tree(&self.temp, "processor temp", self.scratch_limit)?;
+        let _ = audit_live_workspace_tree(&self.home, "processor user-home", self.scratch_limit)?;
+        let _ = audit_live_workspace_tree(&self.outputs, "processor outputs", self.output_limit)?;
+        Ok(())
+    }
+}
+
+impl ProcessorRecoveryReserve {
+    fn allocate(workspace_root: &Path, reserve_bytes: u64) -> Result<Self, String> {
+        if reserve_bytes == 0 {
+            return Err("Processor recovery reserve cannot be empty".into());
+        }
+        let relative = RelativeManagedPath::new(RECOVERY_RESERVE_PATH)
+            .expect("static processor recovery reserve path is valid");
+        let mut file =
+            ResumableManagedFile::open_or_create(workspace_root, relative.clone(), reserve_bytes)
+                .map_err(|error| format!("Cannot open processor recovery reserve: {error}"))?;
+        if file
+            .len()
+            .map_err(|error| format!("Cannot inspect processor recovery reserve: {error}"))?
+            != 0
+        {
+            file.discard()
+                .map_err(|error| format!("Cannot discard stale processor reserve: {error}"))?;
+            file = ResumableManagedFile::open_or_create(workspace_root, relative, reserve_bytes)
+                .map_err(|error| format!("Cannot recreate processor recovery reserve: {error}"))?;
+        }
+
+        let mut chunk = vec![0_u8; 1024 * 1024];
+        fill_incompressible_reserve_chunk(&mut chunk);
+        let allocation = (|| -> Result<(), String> {
+            let mut offset = 0_u64;
+            while offset < reserve_bytes {
+                let remaining = reserve_bytes - offset;
+                let write_len = usize::try_from(remaining.min(chunk.len() as u64))
+                    .expect("bounded reserve chunk length fits usize");
+                offset = file
+                    .write_all_at(offset, &chunk[..write_len])
+                    .map_err(|error| format!("Cannot allocate processor reserve: {error}"))?;
+            }
+            file.sync_all()
+                .map_err(|error| format!("Cannot flush processor recovery reserve: {error}"))?;
+            let logical = file
+                .len()
+                .map_err(|error| format!("Cannot verify processor reserve length: {error}"))?;
+            let allocated = file
+                .allocated_size()
+                .map_err(|error| format!("Cannot verify processor reserve allocation: {error}"))?;
+            if logical != reserve_bytes || allocated < reserve_bytes {
+                return Err(format!(
+                    "Processor recovery reserve is not fully allocated (logical {logical}, allocated {allocated}, required {reserve_bytes})"
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            let cleanup = file.discard().err().map(|value| value.to_string());
+            return Err(append_cleanup_error(error, cleanup));
+        }
+        Ok(Self { file: Some(file) })
+    }
+
+    fn release(mut self) -> Result<(), String> {
+        self.file
+            .take()
+            .expect("live processor recovery reserve owns its file")
+            .discard()
+            .map_err(|error| format!("Cannot release processor recovery reserve: {error}"))
+    }
+}
+
+impl Drop for ProcessorRecoveryReserve {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.discard();
+        }
+    }
+}
+
+fn fill_incompressible_reserve_chunk(chunk: &mut [u8]) {
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    for byte in chunk {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+}
+
+fn audit_live_workspace_root(root: &Path) -> Result<(), String> {
+    let guard = GuardedDirectoryChain::root_snapshot(root)
+        .map_err(|error| format!("Live processor workspace root is unsafe: {error}"))?;
+    let expected = ["inputs", "outputs", "state", "temp"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(guard.leaf().path())
+        .map_err(|error| format!("Cannot enumerate live processor workspace root: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("Cannot inspect live processor workspace root: {error}"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "Live processor workspace root entry is not UTF-8".to_string())?
+            .to_owned();
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            format!("Cannot inspect live processor workspace root entry: {error}")
+        })?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || is_windows_reparse_point(&metadata)
+            || !expected.contains(name.as_str())
+            || !observed.insert(name.clone())
+        {
+            return Err(format!(
+                "Live processor workspace root contains an unexpected entry: {name}"
+            ));
+        }
+        let relative = RelativeManagedPath::new(&name)
+            .map_err(|error| format!("Live processor workspace root path is unsafe: {error}"))?;
+        GuardedDirectoryChain::open_snapshot(root, &relative)
+            .map_err(|error| format!("Live processor workspace directory is unsafe: {error}"))?;
+    }
+    if observed != expected {
+        return Err("Live processor workspace root topology changed".into());
+    }
+    Ok(())
+}
+
+fn audit_live_workspace_state(state: &Path) -> Result<(), String> {
+    let guard = GuardedDirectoryChain::root_snapshot(state)
+        .map_err(|error| format!("Live processor state root is unsafe: {error}"))?;
+    let expected = [
+        STATE_MARKER_PATH,
+        "processor-recovery-reserve.bin",
+        "user-home",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(guard.leaf().path())
+        .map_err(|error| format!("Cannot enumerate live processor state root: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Cannot inspect live processor state root: {error}"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "Live processor state entry is not UTF-8".to_string())?
+            .to_owned();
+        if !expected.contains(name.as_str()) || !observed.insert(name.clone()) {
+            return Err(format!("Unexpected live processor state entry: {name}"));
+        }
+        let absolute = entry.path();
+        let metadata = fs::symlink_metadata(&absolute)
+            .map_err(|error| format!("Cannot inspect live processor state entry: {error}"))?;
+        if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+            return Err(format!(
+                "Link/reparse point is forbidden in live processor state: {name}"
+            ));
+        }
+        match name.as_str() {
+            "user-home" if metadata.is_dir() => {
+                GuardedDirectoryChain::root_snapshot(&absolute).map_err(|error| {
+                    format!("Live processor user-home directory is unsafe: {error}")
+                })?;
+            }
+            STATE_MARKER_PATH if metadata.is_file() => {
+                let file = open_regular_single_link(&absolute, false)
+                    .map_err(|error| format!("Live processor state marker is unsafe: {error}"))?;
+                validate_no_named_data_streams(&file, &absolute).map_err(|error| {
+                    format!("Live processor state marker stream is unsafe: {error}")
+                })?;
+            }
+            // The reserve is held with share_mode(0); its own live handle was already validated,
+            // synced and allocation-size checked before spawn, so reopening it here must fail.
+            "processor-recovery-reserve.bin" if metadata.is_file() => {}
+            _ => return Err(format!("Live processor state entry changed type: {name}")),
+        }
+    }
+    if observed != expected {
+        return Err("Live processor state topology changed".into());
+    }
+    Ok(())
+}
+
+fn audit_live_workspace_tree(
+    root: &Path,
+    label: &str,
+    limit: WorkspaceTreeLimit,
+) -> Result<WorkspaceTreeUsage, String> {
+    let root_guard = GuardedDirectoryChain::root_snapshot(root)
+        .map_err(|error| format!("Live {label} root is unsafe: {error}"))?;
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    let mut collision_keys = BTreeSet::new();
+    scan_live_workspace_directory(
+        root_guard.root_path(),
+        root_guard.leaf().path(),
+        label,
+        limit,
+        &mut entries,
+        &mut bytes,
+        &mut collision_keys,
+    )?;
+    Ok(WorkspaceTreeUsage { entries, bytes })
+}
+
+fn scan_live_workspace_directory(
+    root: &Path,
+    directory: &Path,
+    label: &str,
+    limit: WorkspaceTreeLimit,
+    entries: &mut usize,
+    bytes: &mut u64,
+    collision_keys: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let directory_entries = fs::read_dir(directory)
+        .map_err(|error| format!("Cannot enumerate live {label}: {error}"))?;
+    for entry in directory_entries {
+        let entry = entry.map_err(|error| format!("Cannot inspect live {label}: {error}"))?;
+        let absolute = entry.path();
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot inspect live {label} metadata: {error}")),
+        };
+        *entries = entries
+            .checked_add(1)
+            .ok_or_else(|| format!("Live {label} entry counter overflowed"))?;
+        if *entries > limit.max_entries {
+            return Err(format!("Live {label} exceeds its entry limit"));
+        }
+        if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+            return Err(format!("Link/reparse point is forbidden in live {label}"));
+        }
+        if metadata.is_file() && metadata.permissions().readonly() {
+            return Err(format!("Read-only file is forbidden in live {label}"));
+        }
+        let relative = absolute
+            .strip_prefix(root)
+            .map_err(|_| format!("Live {label} entry escaped its root"))?
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .ok_or_else(|| format!("Live {label} path is not UTF-8"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/");
+        let managed = RelativeManagedPath::new(&relative)
+            .map_err(|error| format!("Live {label} path is unsafe: {error}"))?;
+        if !collision_keys.insert(managed.collision_key().to_owned()) {
+            return Err(format!("Live {label} contains a Windows path collision"));
+        }
+        if metadata.is_dir() {
+            let child_guard = match GuardedDirectoryChain::open_snapshot(root, &managed) {
+                Ok(guard) => guard,
+                Err(ManagedFsError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue
+                }
+                Err(error) => return Err(format!("Live {label} directory is unsafe: {error}")),
+            };
+            let stable = child_guard.leaf().path().to_path_buf();
+            scan_live_workspace_directory(
+                root,
+                &stable,
+                label,
+                limit,
+                entries,
+                bytes,
+                collision_keys,
+            )?;
+        } else if metadata.is_file() {
+            let file = match open_regular_single_link(&absolute, false) {
+                Ok(file) => file,
+                Err(error) => match fs::symlink_metadata(&absolute) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => return Err(format!("Live {label} file is unsafe: {error}")),
+                },
+            };
+            validate_no_named_data_streams(&file, &absolute)
+                .map_err(|error| format!("Live {label} file stream is unsafe: {error}"))?;
+            let size = file
+                .metadata()
+                .map_err(|error| format!("Cannot inspect live {label} file handle: {error}"))?
+                .len();
+            *bytes = bytes
+                .checked_add(size)
+                .ok_or_else(|| format!("Live {label} byte total overflowed"))?;
+            if *bytes > limit.max_bytes {
+                return Err(format!("Live {label} exceeds its byte limit"));
+            }
+        } else {
+            return Err(format!("Special file is forbidden in live {label}"));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn reconstruct_executable_processor_steps(
@@ -331,6 +801,12 @@ impl OutputTreeScan<'_> {
                     absolute.display()
                 ));
             }
+            if metadata.is_file() && metadata.permissions().readonly() {
+                return Err(format!(
+                    "Read-only file is forbidden in outputs: {}",
+                    absolute.display()
+                ));
+            }
             let relative = relative_output_path(self.root, &absolute)?;
             let managed = RelativeManagedPath::new(&relative)
                 .map_err(|error| format!("Game runtime output path is unsafe: {error}"))?;
@@ -431,6 +907,12 @@ fn scan_output_inventory(
         if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
             return Err(format!(
                 "Link/reparse point is forbidden in outputs: {}",
+                absolute.display()
+            ));
+        }
+        if metadata.is_file() && metadata.permissions().readonly() {
+            return Err(format!(
+                "Read-only file is forbidden in outputs: {}",
                 absolute.display()
             ));
         }
@@ -567,34 +1049,81 @@ pub(super) fn run_prepared_java_process(
     invocation: &PreparedProcessorInvocation,
     runtime_lock: &RuntimeLock,
     runtime: &RuntimeInstallation,
+    owned_root: &OwnedCasRoot,
     limits: JavaProcessLimits,
+    monitor_limits: ProcessorWorkspaceMonitorLimits,
     cancelled: Arc<AtomicBool>,
 ) -> Result<JavaProcessOutput, String> {
-    let verified = revalidate_runtime_installation(runtime, runtime_lock)?;
-    if invocation.executable() != verified.java_console() {
-        return Err("Prepared processor executable is not the revalidated Java console".into());
-    }
-    run_java_process(JavaProcessRequest {
+    let monitor = ProcessorWorkspaceMonitor::for_invocation(invocation, monitor_limits)?;
+    let reserve =
+        ProcessorRecoveryReserve::allocate(invocation.cwd(), PROCESSOR_RECOVERY_RESERVE_BYTES)?;
+    let mut request = JavaProcessRequest {
         executable: invocation.executable(),
         arguments: invocation.arguments(),
         cwd: invocation.cwd(),
         environment: invocation.environment(),
         limits,
+        workspace_monitor: Some(monitor),
+        recovery_reserve: Some(reserve),
         cancelled,
-    })
+    };
+    let preflight = (|| {
+        validate_process_request_before_spawn(&request)?;
+        // Keep the exact root-bound Java audit as the final filesystem trust operation before the
+        // native process supervisor receives the already-validated request.
+        let verified = revalidate_runtime_installation_for_root(runtime, runtime_lock, owned_root)?;
+        if invocation.executable() != verified.java_console() {
+            return Err("Prepared processor executable is not the revalidated Java console".into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = preflight {
+        let cleanup = request
+            .recovery_reserve
+            .take()
+            .and_then(|reserve| reserve.release().err());
+        return Err(append_cleanup_error(error, cleanup));
+    }
+    run_java_process_validated(request)
 }
 
 fn run_java_process(request: JavaProcessRequest<'_>) -> Result<JavaProcessOutput, String> {
-    validate_process_request(&request)?;
+    validate_process_request_before_spawn(&request)?;
+    run_java_process_validated(request)
+}
+
+fn validate_process_request_before_spawn(request: &JavaProcessRequest<'_>) -> Result<(), String> {
+    validate_process_request(request)?;
     if request.cancelled.load(Ordering::Acquire) {
         return Err("NeoForge processor execution was cancelled".into());
     }
-    let (mut child, pipes) = spawn_process(ProcessSpec {
+    if let Some(monitor) = &request.workspace_monitor {
+        monitor.audit().map_err(|error| {
+            format!("NeoForge processor workspace monitor rejected pre-spawn state: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+fn run_java_process_validated(
+    mut request: JavaProcessRequest<'_>,
+) -> Result<JavaProcessOutput, String> {
+    let spawned = spawn_process(ProcessSpec {
         executable: request.executable,
         arguments: request.arguments,
         cwd: request.cwd,
         environment: request.environment,
-    })?;
+    });
+    let (mut child, pipes) = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let reserve = request
+                .recovery_reserve
+                .take()
+                .and_then(|reserve| reserve.release().err());
+            return Err(append_cleanup_error(error, reserve));
+        }
+    };
     let (failure_tx, failure_rx) = mpsc::channel::<String>();
     let stdout_result = capture_stream(
         pipes.stdout,
@@ -612,6 +1141,7 @@ fn run_java_process(request: JavaProcessRequest<'_>) -> Result<JavaProcessOutput
     );
 
     let started = Instant::now();
+    let mut next_workspace_audit = started + WORKSPACE_MONITOR_INTERVAL;
     let mut terminal_error = None;
     let mut status = None;
     loop {
@@ -621,13 +1151,32 @@ fn run_java_process(request: JavaProcessRequest<'_>) -> Result<JavaProcessOutput
             terminal_error = Some("NeoForge processor execution timed out".to_string());
         } else if let Ok(error) = failure_rx.try_recv() {
             terminal_error = Some(error);
+        } else if Instant::now() >= next_workspace_audit {
+            if let Some(monitor) = &request.workspace_monitor {
+                if let Err(error) = monitor.audit() {
+                    terminal_error = Some(format!(
+                        "NeoForge processor workspace limit was exceeded during execution: {error}"
+                    ));
+                }
+            }
+            next_workspace_audit = Instant::now() + WORKSPACE_MONITOR_INTERVAL;
         }
         if terminal_error.is_some() {
             break;
         }
         match child.try_wait() {
             Ok(Some(exit)) => {
-                status = Some(exit);
+                if let Some(monitor) = &request.workspace_monitor {
+                    if let Err(error) = monitor.audit() {
+                        terminal_error = Some(format!(
+                            "NeoForge processor workspace limit was exceeded before exit acceptance: {error}"
+                        ));
+                    } else {
+                        status = Some(exit);
+                    }
+                } else {
+                    status = Some(exit);
+                }
                 break;
             }
             Ok(None) => {}
@@ -647,22 +1196,35 @@ fn run_java_process(request: JavaProcessRequest<'_>) -> Result<JavaProcessOutput
     let drain_deadline = Instant::now() + STREAM_DRAIN_TIMEOUT;
     let stdout = receive_stream_capture(stdout_result, "stdout", drain_deadline);
     let stderr = receive_stream_capture(stderr_result, "stderr", drain_deadline);
-    if let Some(error) = terminal_error {
+    let mut result = if let Some(error) = terminal_error {
         let error = append_cleanup_error(error, cleanup.err());
         let error = append_cleanup_error(error, stdout.as_ref().err().cloned());
-        return Err(append_cleanup_error(error, stderr.as_ref().err().cloned()));
+        Err(append_cleanup_error(error, stderr.as_ref().err().cloned()))
+    } else {
+        (|| {
+            cleanup?;
+            let stdout = stdout?;
+            let stderr = stderr?;
+            let exit_code =
+                status.ok_or_else(|| "NeoForge processor status is missing".to_string())?;
+            let transcript_sha256 = transcript_digest(&stdout, &stderr)?;
+            Ok(JavaProcessOutput {
+                exit_code,
+                stdout,
+                stderr,
+                transcript_sha256,
+            })
+        })()
+    };
+    if let Some(reserve) = request.recovery_reserve.take() {
+        if let Err(error) = reserve.release() {
+            result = match result {
+                Ok(_) => Err(error),
+                Err(existing) => Err(append_cleanup_error(existing, Some(error))),
+            };
+        }
     }
-    cleanup?;
-    let stdout = stdout?;
-    let stderr = stderr?;
-    let exit_code = status.ok_or_else(|| "NeoForge processor status is missing".to_string())?;
-    let transcript_sha256 = transcript_digest(&stdout, &stderr)?;
-    Ok(JavaProcessOutput {
-        exit_code,
-        stdout,
-        stderr,
-        transcript_sha256,
-    })
+    result
 }
 
 fn append_cleanup_error(error: String, cleanup: Option<String>) -> String {
@@ -821,6 +1383,7 @@ mod tests {
     };
 
     const CHILD_MODE_ENV: &str = "FRAGMENT_GAME_RUNTIME_CHILD_MODE";
+    const CHILD_SCRATCH_ENV: &str = "FRAGMENT_GAME_RUNTIME_SCRATCH_PATH";
 
     fn child_arguments() -> Vec<OsString> {
         vec![
@@ -893,6 +1456,18 @@ mod tests {
         }
     }
 
+    fn live_monitor_root(label: &str) -> PathBuf {
+        let root = temp_output_root(label);
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("inputs")).unwrap();
+        fs::create_dir(root.join("temp")).unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        fs::create_dir(root.join("state/user-home")).unwrap();
+        fs::create_dir(root.join("outputs")).unwrap();
+        fs::write(root.join("state").join(STATE_MARKER_PATH), b"test marker").unwrap();
+        root
+    }
+
     fn fixture_lock() -> GameRuntimeLock {
         GameRuntimeLock::parse_and_validate(include_bytes!(
             "../../tests/fixtures/game-runtime-lock-v2-release-canonical-verified.json"
@@ -942,6 +1517,57 @@ mod tests {
         lease.revalidate().unwrap();
         drop(lease);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn output_lease_streams_only_the_exact_signed_identity_to_an_exclusive_file() {
+        let root = temp_output_root("lease-copy-source");
+        let destination_root = temp_output_root("lease-copy-destination");
+        write_small_output_tree(&root);
+        fs::create_dir(&destination_root).unwrap();
+        let expected = small_expected_outputs();
+        let identity = expected
+            .get(
+                RelativeManagedPath::new("libraries/neoforge/client.jar")
+                    .unwrap()
+                    .collision_key(),
+            )
+            .unwrap()
+            .clone();
+        let mut lease = audit_output_tree(&root, expected).unwrap();
+        let destination_relative = RelativeManagedPath::new("copied-client.jar").unwrap();
+        let mut destination =
+            ExclusiveManagedFile::create(&destination_root, destination_relative).unwrap();
+
+        assert!(lease
+            .copy_expected_to(
+                &identity.path,
+                identity.size,
+                &identity.sha1,
+                &"0".repeat(64),
+                &mut destination,
+            )
+            .is_err());
+        let written = lease
+            .copy_expected_to(
+                &identity.path,
+                identity.size,
+                &identity.sha1,
+                &identity.sha256,
+                &mut destination,
+            )
+            .unwrap();
+        assert_eq!(written.size, identity.size);
+        assert_eq!(written.sha1, identity.sha1);
+        assert_eq!(written.sha256, identity.sha256);
+        drop(destination.seal_in_place().unwrap());
+        drop(lease);
+        assert_eq!(
+            fs::read(destination_root.join("copied-client.jar")).unwrap(),
+            b"patched"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
     }
 
     #[test]
@@ -1028,6 +1654,8 @@ mod tests {
                 max_stream_bytes: 16 * 1024 * 1024,
                 max_diagnostic_bytes: 64 * 1024,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
@@ -1077,6 +1705,8 @@ mod tests {
                 max_stream_bytes: 1024 * 1024,
                 max_diagnostic_bytes: 1024,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
@@ -1093,6 +1723,8 @@ mod tests {
                 max_stream_bytes: 1024 * 1024,
                 max_diagnostic_bytes: 1024,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
@@ -1117,6 +1749,8 @@ mod tests {
                 max_stream_bytes: 1024,
                 max_diagnostic_bytes: 128,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         });
         assert!(result.unwrap_err().contains("ambiguous"));
@@ -1136,9 +1770,139 @@ mod tests {
                 max_stream_bytes: 1024,
                 max_diagnostic_bytes: 128,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(true)),
         });
         assert!(result.unwrap_err().contains("cancelled"));
+    }
+
+    #[test]
+    fn live_workspace_monitor_terminates_a_child_before_exit_and_releases_reserve() {
+        let root = live_monitor_root("live-monitor-termination");
+        let executable = std::env::current_exe().unwrap();
+        let arguments = child_arguments();
+        let scratch = root.join("temp/flood.bin");
+        let environment = vec![
+            (
+                OsString::from(CHILD_MODE_ENV),
+                OsString::from("scratch-flood"),
+            ),
+            (
+                OsString::from(CHILD_SCRATCH_ENV),
+                scratch.as_os_str().to_owned(),
+            ),
+        ];
+        let input_usage = audit_live_workspace_tree(
+            &root.join("inputs"),
+            "processor inputs",
+            WorkspaceTreeLimit {
+                max_entries: 16,
+                max_bytes: 1024,
+            },
+        )
+        .unwrap();
+        let monitor = ProcessorWorkspaceMonitor {
+            root: root.clone(),
+            inputs: root.join("inputs"),
+            temp: root.join("temp"),
+            home: root.join("state/user-home"),
+            outputs: root.join("outputs"),
+            input_usage,
+            scratch_limit: WorkspaceTreeLimit {
+                max_entries: 16,
+                max_bytes: 64 * 1024,
+            },
+            output_limit: WorkspaceTreeLimit {
+                max_entries: 16,
+                max_bytes: 1024 * 1024,
+            },
+        };
+        let reserve = ProcessorRecoveryReserve::allocate(&root, 1024 * 1024).unwrap();
+        assert!(root.join(RECOVERY_RESERVE_PATH).is_file());
+        let started = Instant::now();
+        let result = run_java_process(JavaProcessRequest {
+            executable: &executable,
+            arguments: &arguments,
+            cwd: &root,
+            environment: &environment,
+            limits: JavaProcessLimits {
+                timeout: Duration::from_secs(10),
+                max_stream_bytes: 1024 * 1024,
+                max_diagnostic_bytes: 1024,
+            },
+            workspace_monitor: Some(monitor),
+            recovery_reserve: Some(reserve),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("workspace limit"),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!root.join(RECOVERY_RESERVE_PATH).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn live_workspace_monitor_rejects_root_input_and_state_bypasses() {
+        let root = live_monitor_root("live-monitor-topology");
+        fs::write(root.join("inputs/pinned.bin"), b"pinned").unwrap();
+        let input_usage = audit_live_workspace_tree(
+            &root.join("inputs"),
+            "processor inputs",
+            WorkspaceTreeLimit {
+                max_entries: 16,
+                max_bytes: 1024,
+            },
+        )
+        .unwrap();
+        let monitor = ProcessorWorkspaceMonitor {
+            root: root.clone(),
+            inputs: root.join("inputs"),
+            temp: root.join("temp"),
+            home: root.join("state/user-home"),
+            outputs: root.join("outputs"),
+            input_usage,
+            scratch_limit: WorkspaceTreeLimit {
+                max_entries: 16,
+                max_bytes: 1024,
+            },
+            output_limit: WorkspaceTreeLimit {
+                max_entries: 16,
+                max_bytes: 1024,
+            },
+        };
+        let reserve = ProcessorRecoveryReserve::allocate(&root, 1024 * 1024).unwrap();
+        monitor.audit().unwrap();
+
+        fs::write(root.join("rogue.bin"), b"rogue").unwrap();
+        assert!(monitor.audit().is_err());
+        fs::remove_file(root.join("rogue.bin")).unwrap();
+
+        fs::write(root.join("state/rogue.bin"), b"rogue").unwrap();
+        assert!(monitor.audit().is_err());
+        fs::remove_file(root.join("state/rogue.bin")).unwrap();
+
+        fs::write(root.join("inputs/extra.bin"), b"extra").unwrap();
+        assert!(monitor.audit().is_err());
+        fs::remove_file(root.join("inputs/extra.bin")).unwrap();
+
+        let read_only = root.join("temp/read-only.bin");
+        fs::write(&read_only, b"read-only").unwrap();
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        assert!(monitor.audit().is_err());
+        let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&read_only, permissions).unwrap();
+        fs::remove_file(read_only).unwrap();
+        monitor.audit().unwrap();
+        reserve.release().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1157,6 +1921,8 @@ mod tests {
                 max_stream_bytes: 1024 * 1024,
                 max_diagnostic_bytes: 1024,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         });
         assert!(result.unwrap_err().contains("timed out"));
@@ -1178,6 +1944,8 @@ mod tests {
                 max_stream_bytes: 1024,
                 max_diagnostic_bytes: 128,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         });
         assert!(result.unwrap_err().contains("exceeded the byte limit"));
@@ -1205,6 +1973,8 @@ mod tests {
                 max_stream_bytes: 1024 * 1024,
                 max_diagnostic_bytes: 1024,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled,
         });
         trigger.join().unwrap();
@@ -1232,6 +2002,8 @@ mod tests {
                 max_stream_bytes: 1024 * 1024,
                 max_diagnostic_bytes: 1024,
             },
+            workspace_monitor: None,
+            recovery_reserve: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
@@ -1261,6 +2033,16 @@ mod tests {
                 for _ in 0..4 {
                     stdout.write_all(&chunk).unwrap();
                     stdout.flush().unwrap();
+                }
+            }
+            Some("scratch-flood") => {
+                let path = PathBuf::from(std::env::var_os(CHILD_SCRATCH_ENV).unwrap());
+                let mut file = fs::File::create(path).unwrap();
+                let chunk = vec![b'x'; 64 * 1024];
+                loop {
+                    file.write_all(&chunk).unwrap();
+                    file.flush().unwrap();
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
             _ => {}

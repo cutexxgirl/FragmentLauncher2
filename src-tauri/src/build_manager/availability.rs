@@ -1,6 +1,8 @@
 use super::{
     artifact_plan::ArtifactInventoryV2,
     cas::{audit_object_availability, CasObjectAvailability, ExpectedObject},
+    game_generation::{audit_installed_game_generation, GameRuntimeInstallation},
+    managed_fs::{GuardedDirectoryChain, ManagedFsError, RelativeManagedPath},
     runtime::{audit_installed_runtime_generation, RuntimeInstallation},
     storage::OwnedCasRoot,
 };
@@ -14,6 +16,8 @@ pub(super) enum ArtifactAvailabilityStateV2 {
     Partial { bytes: u64 },
     Complete,
     Corrupt,
+    CoveredByJavaGeneration,
+    CoveredByGameGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,9 +36,9 @@ pub(super) struct VerifiedAvailabilityV2 {
     root_binding_nonce: Uuid,
     artifacts: Vec<VerifiedArtifactAvailabilityV2>,
     java_installation: Option<RuntimeInstallation>,
-    // No full immutable 4,028-file game generation/publisher exists yet. The exact-six processor
-    // output lease is not sufficient proof, so production scanning deliberately leaves this false.
-    game_generation_complete: bool,
+    game_installation: Option<GameRuntimeInstallation>,
+    #[cfg(test)]
+    synthetic_game_generation_complete: bool,
 }
 
 impl VerifiedAvailabilityV2 {
@@ -47,33 +51,19 @@ impl VerifiedAvailabilityV2 {
         if install_id != inventory.install_id() {
             return Err("Owned CAS root belongs to another artifact inventory".into());
         }
-        let mut artifacts = Vec::with_capacity(inventory.artifacts().len());
-        for expected in inventory.artifacts() {
-            root.revalidate()?;
-            let state = audit_object_availability(
-                root,
-                &ExpectedObject {
-                    sha256: expected.sha256().to_owned(),
-                    size: expected.size(),
-                },
-            )
-            .map_err(|error| format!("Cannot audit artifact {}: {error}", expected.sha256()))?;
-            artifacts.push(VerifiedArtifactAvailabilityV2 {
-                sha256: expected.sha256().to_owned(),
-                state: match state {
-                    CasObjectAvailability::Missing => ArtifactAvailabilityStateV2::Missing,
-                    CasObjectAvailability::Partial { bytes } => {
-                        ArtifactAvailabilityStateV2::Partial { bytes }
-                    }
-                    CasObjectAvailability::Complete => ArtifactAvailabilityStateV2::Complete,
-                    CasObjectAvailability::Corrupt => ArtifactAvailabilityStateV2::Corrupt,
-                },
-            });
-        }
         let java_installation = audit_installed_runtime_generation(
             root,
             inventory.java_runtime_lock_sha256(),
             inventory.runtime_lock(),
+        )?;
+        root.revalidate()?;
+        let game_installation = audit_repairable_game_generation(root, inventory)?;
+        root.revalidate()?;
+        let artifacts = scan_artifact_states(
+            root,
+            inventory,
+            java_installation.is_some(),
+            game_installation.is_some(),
         )?;
         inventory.validate_root(root)?;
         Ok(Self {
@@ -82,7 +72,9 @@ impl VerifiedAvailabilityV2 {
             root_binding_nonce: binding_nonce,
             artifacts,
             java_installation,
-            game_generation_complete: false,
+            game_installation,
+            #[cfg(test)]
+            synthetic_game_generation_complete: false,
         })
     }
 
@@ -103,11 +95,48 @@ impl VerifiedAvailabilityV2 {
                     return Err("Verified partial artifact exceeds its signed size".into());
                 }
             }
+            match actual.state {
+                ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+                    if !self.java_generation_complete()
+                        || !inventory.is_java_archive_sha256(expected.sha256()) =>
+                {
+                    return Err("Java-covered availability is not backed by its generation".into());
+                }
+                ArtifactAvailabilityStateV2::CoveredByGameGeneration
+                    if !self.game_generation_complete()
+                        || !inventory.is_official_game_sha256(expected.sha256()) =>
+                {
+                    return Err("Game-covered availability is not backed by its generation".into());
+                }
+                _ => {}
+            }
         }
         if self.java_installation.as_ref().is_some_and(|runtime| {
             runtime.runtime_lock_sha256() != inventory.java_runtime_lock_sha256()
         }) {
             return Err("Verified Java generation belongs to another runtime lock".into());
+        }
+        if self.game_installation.as_ref().is_some_and(|runtime| {
+            runtime.game_runtime_lock_sha256() != inventory.game_runtime_lock_sha256()
+                || runtime.install_id() != inventory.install_id()
+                || runtime.root_binding_nonce() != inventory.root_binding_nonce()
+                || runtime.inventory_fingerprint() != inventory.fingerprint()
+        }) {
+            return Err("Verified game generation belongs to another inventory/root".into());
+        }
+        if self.java_generation_complete()
+            && self.state(inventory.java_archive_sha256())?
+                != &ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+        {
+            return Err("Verified Java generation does not cover its archive".into());
+        }
+        if self.game_generation_complete()
+            && inventory.official_game_sha256().iter().any(|sha256| {
+                self.state(sha256).ok()
+                    != Some(&ArtifactAvailabilityStateV2::CoveredByGameGeneration)
+            })
+        {
+            return Err("Verified game generation does not cover its official artifacts".into());
         }
         Ok(())
     }
@@ -125,7 +154,23 @@ impl VerifiedAvailabilityV2 {
     }
 
     pub(super) fn game_generation_complete(&self) -> bool {
-        self.game_generation_complete
+        let complete = self.game_installation.is_some();
+        #[cfg(test)]
+        {
+            complete || self.synthetic_game_generation_complete
+        }
+        #[cfg(not(test))]
+        {
+            complete
+        }
+    }
+
+    pub(super) fn java_installation(&self) -> Option<&RuntimeInstallation> {
+        self.java_installation.as_ref()
+    }
+
+    pub(super) fn game_installation(&self) -> Option<&GameRuntimeInstallation> {
+        self.game_installation.as_ref()
     }
 
     #[cfg(test)]
@@ -141,10 +186,20 @@ impl VerifiedAvailabilityV2 {
             .iter()
             .map(|expected| VerifiedArtifactAvailabilityV2 {
                 sha256: expected.sha256().to_owned(),
-                state: overrides
-                    .get(expected.sha256())
-                    .copied()
-                    .unwrap_or(ArtifactAvailabilityStateV2::Missing),
+                state: if java_generation_complete
+                    && inventory.is_java_archive_sha256(expected.sha256())
+                {
+                    ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+                } else if game_generation_complete
+                    && inventory.is_official_game_sha256(expected.sha256())
+                {
+                    ArtifactAvailabilityStateV2::CoveredByGameGeneration
+                } else {
+                    overrides
+                        .get(expected.sha256())
+                        .copied()
+                        .unwrap_or(ArtifactAvailabilityStateV2::Missing)
+                },
             })
             .collect();
         Self {
@@ -161,9 +216,140 @@ impl VerifiedAvailabilityV2 {
                     inventory.java_runtime_lock_sha256().to_owned(),
                 )
             }),
-            game_generation_complete,
+            game_installation: None,
+            synthetic_game_generation_complete: game_generation_complete,
         }
     }
+
+    #[cfg(test)]
+    fn scan_with_synthetic_generation_coverage(
+        root: &OwnedCasRoot,
+        inventory: &ArtifactInventoryV2,
+        java_generation_complete: bool,
+        game_generation_complete: bool,
+    ) -> Result<Self, String> {
+        inventory.validate_root(root)?;
+        let (binding_nonce, install_id, _, _) = root.binding();
+        let artifacts = scan_artifact_states(
+            root,
+            inventory,
+            java_generation_complete,
+            game_generation_complete,
+        )?;
+        Ok(Self {
+            install_id,
+            inventory_fingerprint: inventory.fingerprint().to_owned(),
+            root_binding_nonce: binding_nonce,
+            artifacts,
+            java_installation: java_generation_complete.then(|| {
+                RuntimeInstallation::synthetic(
+                    "java-generation".into(),
+                    "java-generation/image".into(),
+                    "java-generation/image/bin/javaw.exe".into(),
+                    "java-generation/image/bin/java.exe".into(),
+                    inventory.java_runtime_lock_sha256().to_owned(),
+                )
+            }),
+            game_installation: None,
+            synthetic_game_generation_complete: game_generation_complete,
+        })
+    }
+}
+
+fn audit_repairable_game_generation(
+    root: &OwnedCasRoot,
+    inventory: &ArtifactInventoryV2,
+) -> Result<Option<GameRuntimeInstallation>, String> {
+    match audit_installed_game_generation(root, inventory) {
+        Ok(installed) => Ok(installed),
+        Err(audit_error) => {
+            let relative = RelativeManagedPath::new(&format!(
+                "runtime/minecraft/generations/{}",
+                inventory.game_runtime_lock_sha256()
+            ))
+            .map_err(|error| format!("Cannot construct game generation path: {error}"))?;
+            match GuardedDirectoryChain::open(root.install_root(), &relative) {
+                Ok(existing) => {
+                    existing
+                        .revalidate()
+                        .map_err(|error| format!("Unsafe game generation: {error}"))?;
+                    // A real root-bound directory with bad/incomplete contents is repairable. It
+                    // covers nothing; the ordinary CAS scan below becomes the source of truth.
+                    Ok(None)
+                }
+                Err(ManagedFsError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(format!(
+                    "Cannot inspect game runtime generation after {audit_error}: {error}"
+                )),
+            }
+        }
+    }
+}
+
+fn scan_artifact_states(
+    root: &OwnedCasRoot,
+    inventory: &ArtifactInventoryV2,
+    java_generation_complete: bool,
+    game_generation_complete: bool,
+) -> Result<Vec<VerifiedArtifactAvailabilityV2>, String> {
+    scan_artifact_states_with(
+        inventory,
+        java_generation_complete,
+        game_generation_complete,
+        |expected| {
+            root.revalidate()?;
+            audit_object_availability(
+                root,
+                &ExpectedObject {
+                    sha256: expected.sha256().to_owned(),
+                    size: expected.size(),
+                },
+            )
+            .map_err(|error| format!("Cannot audit artifact {}: {error}", expected.sha256()))
+        },
+    )
+}
+
+fn scan_artifact_states_with(
+    inventory: &ArtifactInventoryV2,
+    java_generation_complete: bool,
+    game_generation_complete: bool,
+    mut audit: impl FnMut(
+        &super::artifact_plan::ArtifactRequirementV2,
+    ) -> Result<CasObjectAvailability, String>,
+) -> Result<Vec<VerifiedArtifactAvailabilityV2>, String> {
+    inventory
+        .artifacts()
+        .iter()
+        .map(|expected| {
+            let state = if java_generation_complete
+                && inventory.is_java_archive_sha256(expected.sha256())
+            {
+                ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+            } else if game_generation_complete
+                && inventory.is_official_game_sha256(expected.sha256())
+            {
+                ArtifactAvailabilityStateV2::CoveredByGameGeneration
+            } else {
+                match audit(expected)? {
+                    CasObjectAvailability::Missing => ArtifactAvailabilityStateV2::Missing,
+                    CasObjectAvailability::Partial { bytes } => {
+                        ArtifactAvailabilityStateV2::Partial { bytes }
+                    }
+                    CasObjectAvailability::Complete => ArtifactAvailabilityStateV2::Complete,
+                    CasObjectAvailability::Corrupt => ArtifactAvailabilityStateV2::Corrupt,
+                }
+            };
+            Ok(VerifiedArtifactAvailabilityV2 {
+                sha256: expected.sha256().to_owned(),
+                state,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -430,16 +616,134 @@ mod tests {
     }
 
     #[test]
-    fn exact_six_processor_outputs_never_claim_a_full_game_generation() {
+    fn incomplete_game_generation_never_covers_official_cas() {
         let root = TestRoot::new("game-generation");
         let release = fixture_release(b"game", 4);
         let inventory = inventory(&root, &release);
         let fake = root
             .path
-            .join("runtime/game/generations")
+            .join("runtime/minecraft/generations")
             .join(inventory.game_runtime_lock_sha256());
         fs::create_dir_all(fake).unwrap();
         let scanned = VerifiedAvailabilityV2::scan(root.root(), &inventory).unwrap();
         assert!(!scanned.game_generation_complete());
+        assert!(inventory.official_game_sha256().iter().all(|sha256| {
+            scanned.state(sha256).unwrap() != &ArtifactAvailabilityStateV2::CoveredByGameGeneration
+        }));
+    }
+
+    #[test]
+    fn generation_coverage_skips_every_owned_artifact_class_with_zero_cas_audits() {
+        let root = TestRoot::new("coverage-counter");
+        let release = fixture_release(b"coverage", 4);
+        let inventory = inventory(&root, &release);
+        let mut audited = Vec::new();
+        let states = scan_artifact_states_with(&inventory, true, true, |expected| {
+            audited.push(expected.sha256().to_owned());
+            Ok(CasObjectAvailability::Missing)
+        })
+        .unwrap();
+
+        assert!(audited.iter().all(|sha256| {
+            !inventory.is_java_archive_sha256(sha256) && !inventory.is_official_game_sha256(sha256)
+        }));
+        assert_eq!(
+            audited.len(),
+            inventory.artifacts().len() - inventory.official_game_sha256().len() - 1
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|entry| {
+                    entry.state == ArtifactAvailabilityStateV2::CoveredByGameGeneration
+                })
+                .count(),
+            inventory.official_game_sha256().len()
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|entry| {
+                    entry.state == ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn verified_game_coverage_ignores_unsafe_official_cas_but_corrupt_generation_falls_back() {
+        let root = TestRoot::new("coverage-adversarial");
+        let release = fixture_release(b"coverage", 4);
+        let inventory = inventory(&root, &release);
+        let official = inventory.official_game_sha256()[0].clone();
+        let corrupt_official = inventory.official_game_sha256()[1].clone();
+        let (official_final, _) = object_paths(root.root(), &official);
+        let (corrupt_final, _) = object_paths(root.root(), &corrupt_official);
+        fs::create_dir_all(&official_final).unwrap();
+        write(&corrupt_final, b"wrong");
+
+        let covered = VerifiedAvailabilityV2::scan_with_synthetic_generation_coverage(
+            root.root(),
+            &inventory,
+            false,
+            true,
+        )
+        .unwrap();
+        covered.validate_for(&inventory).unwrap();
+        assert_eq!(
+            covered.state(&official).unwrap(),
+            &ArtifactAvailabilityStateV2::CoveredByGameGeneration
+        );
+        assert_eq!(
+            covered.state(&corrupt_official).unwrap(),
+            &ArtifactAvailabilityStateV2::CoveredByGameGeneration
+        );
+
+        // With no verified game generation, the same unsafe CAS node is inspected and rejected.
+        assert!(VerifiedAvailabilityV2::scan(root.root(), &inventory).is_err());
+        fs::remove_dir(&official_final).unwrap();
+        write(&official_final, b"wrong");
+        let corrupt_generation = root
+            .path
+            .join("runtime/minecraft/generations")
+            .join(inventory.game_runtime_lock_sha256());
+        fs::create_dir_all(corrupt_generation).unwrap();
+
+        let fallback = VerifiedAvailabilityV2::scan(root.root(), &inventory).unwrap();
+        assert!(!fallback.game_generation_complete());
+        assert_eq!(
+            fallback.state(&official).unwrap(),
+            &ArtifactAvailabilityStateV2::Corrupt
+        );
+    }
+
+    #[test]
+    fn covered_states_without_matching_sealed_capability_are_rejected() {
+        let root = TestRoot::new("forged-coverage");
+        let release = fixture_release(b"coverage", 4);
+        let inventory = inventory(&root, &release);
+        let mut forged = VerifiedAvailabilityV2::for_test(
+            &inventory,
+            [(
+                inventory.java_archive_sha256().to_owned(),
+                ArtifactAvailabilityStateV2::CoveredByJavaGeneration,
+            )],
+            false,
+            false,
+        );
+        assert!(forged.validate_for(&inventory).is_err());
+
+        forged.artifacts = VerifiedAvailabilityV2::for_test(
+            &inventory,
+            [(
+                inventory.official_game_sha256()[0].clone(),
+                ArtifactAvailabilityStateV2::CoveredByGameGeneration,
+            )],
+            false,
+            false,
+        )
+        .artifacts;
+        assert!(forged.validate_for(&inventory).is_err());
     }
 }

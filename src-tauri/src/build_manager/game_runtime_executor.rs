@@ -1,20 +1,22 @@
 use super::{
+    artifact_plan::PlannedGameGenerationBindingV2,
     contracts::{
-        domain_digest, GameRuntimeLock, GameRuntimeSource, OfflineProcessorVerification,
-        ProcessorArtifactState, RuntimeLock, VerifiedProcessorStep,
+        domain_digest, GameRuntimeFile, GameRuntimeLock, GameRuntimeSource,
+        OfflineProcessorVerification, ProcessorArtifactState, RuntimeLock, VerifiedProcessorStep,
     },
+    game_generation::GameGenerationProcessorBuild,
     game_runtime::{
         audit_existing_game_runtime_outputs, run_prepared_java_process, GameRuntimeOutputLease,
-        JavaProcessLimits, JavaProcessOutput, StreamCapture,
+        JavaProcessLimits, JavaProcessOutput, ProcessorWorkspaceMonitorLimits, StreamCapture,
     },
     game_runtime_invocation::{prepare_processor_invocations, PreparedProcessorInvocation},
     game_runtime_materializer::ProcessorWorkspace,
     managed_fs::{
-        ensure_directory_chain, remove_verified_managed_file, FileDigests, GuardedDirectoryChain,
-        ImmutableManagedFile, RelativeManagedPath,
+        ensure_directory_chain, remove_verified_managed_file, ExclusiveManagedFile, FileDigests,
+        GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath,
     },
-    runtime::{revalidate_runtime_installation, RuntimeInstallation},
-    storage::is_windows_reparse_point,
+    runtime::{revalidate_runtime_installation_for_root, RuntimeInstallation},
+    storage::{is_windows_reparse_point, OwnedCasRoot},
 };
 use serde::Serialize;
 use std::{
@@ -107,6 +109,8 @@ pub(super) struct ProcessorStepProof {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ProcessorExecutionProof {
     pub(super) java_runtime_lock_sha256: String,
+    pub(super) game_runtime_lock_sha256: String,
+    pub(super) generation_binding_sha256: String,
     pub(super) processor_receipt_sha256: String,
     pub(super) input_state_sha256: String,
     pub(super) steps: Vec<ProcessorStepProof>,
@@ -120,6 +124,7 @@ pub(super) struct ProcessorExecutionProof {
 /// immediately before publishing it.
 pub(super) struct ProcessorExecutionResult {
     workspace: ProcessorWorkspace,
+    generation_binding: PlannedGameGenerationBindingV2,
     proof: ProcessorExecutionProof,
     outputs: GameRuntimeOutputLease,
 }
@@ -135,6 +140,10 @@ impl ProcessorExecutionResult {
             return Err("Processor input state changed before output commit".into());
         }
         self.workspace.revalidate_execution_scratch()?;
+        self.revalidate_output_proof()
+    }
+
+    fn revalidate_output_proof(&mut self) -> Result<(), String> {
         self.outputs.revalidate()?;
         if self.outputs.audit().file_count != self.proof.output_file_count
             || self.outputs.audit().total_bytes != self.proof.output_total_bytes
@@ -144,6 +153,93 @@ impl ProcessorExecutionResult {
         }
         Ok(())
     }
+
+    fn validate_publish_binding(
+        &self,
+        build: &GameGenerationProcessorBuild<'_, '_>,
+    ) -> Result<(), String> {
+        let authority = build.authority();
+        authority.validate_binding(&self.generation_binding)?;
+        self.workspace.validate_binding_for_build(build)?;
+        if self.workspace.generation_binding() != &self.generation_binding
+            || self.proof.generation_binding_sha256 != authority.binding_digest()
+            || self.proof.game_runtime_lock_sha256 != authority.game_runtime_lock_sha256()
+            || self.proof.java_runtime_lock_sha256 != authority.runtime_lock_sha256()
+            || self.proof.processor_receipt_sha256
+                != verified_receipt_sha256(authority.game_runtime_lock())?
+            || self.workspace.game_runtime_lock_sha256() != self.proof.game_runtime_lock_sha256
+            || self.workspace.java_runtime_lock_sha256() != self.proof.java_runtime_lock_sha256
+            || self.workspace.processor_receipt_sha256() != self.proof.processor_receipt_sha256
+        {
+            return Err("Processor result belongs to another sealed generation build".into());
+        }
+        Ok(())
+    }
+
+    /// Revalidates the complete processor workspace/result against the exact sealed generation
+    /// type-state. This rejects transplanting an otherwise valid exact-six result between roots,
+    /// releases, operations, runtime locks or game-runtime locks.
+    pub(super) fn validate_for_publish(
+        &mut self,
+        build: &GameGenerationProcessorBuild<'_, '_>,
+    ) -> Result<(), String> {
+        self.validate_publish_binding(build)?;
+        self.revalidate_for_commit()
+    }
+
+    /// Streams one exact signed derived file through its held processor-output handle into a
+    /// fresh exclusive generation file. No workspace/output path is disclosed to the publisher,
+    /// and no hardlink can cross this boundary.
+    pub(super) fn copy_derived_output(
+        &mut self,
+        build: &GameGenerationProcessorBuild<'_, '_>,
+        expected: &GameRuntimeFile,
+        destination: &mut ExclusiveManagedFile,
+    ) -> Result<FileDigests, String> {
+        self.validate_publish_binding(build)?;
+        let (path, size, sha1, sha256) =
+            signed_derived_identity(build.authority().game_runtime_lock(), expected)?;
+        let written = self
+            .outputs
+            .copy_expected_to(path, size, sha1, sha256, destination)?;
+        self.validate_publish_binding(build)?;
+        Ok(written)
+    }
+
+    /// Consumes the sealed processor result after every derived output has been copied. All input,
+    /// output and workspace leases are dropped before the exact operation-bound workspace is
+    /// removed by the bounded, handle-audited managed-tree GC.
+    pub(super) fn remove_workspace_after_publish(
+        mut self,
+        build: &GameGenerationProcessorBuild<'_, '_>,
+    ) -> Result<ProcessorExecutionProof, String> {
+        self.validate_publish_binding(build)?;
+        self.revalidate_output_proof()?;
+        let proof = self.proof.clone();
+        let binding = self.generation_binding.clone();
+        let expected_identity = self.workspace.directory_identity();
+        // Managed-tree GC must open every source node through delete-capable no-follow handles,
+        // so every lease owned by the result has to be released first. Retain the sealed binding
+        // and root identity as the cleanup acceptance contract.
+        drop(self);
+        validate_result_root_after_drop(build, &binding)?;
+        build.remove_processor_workspace(&expected_identity)?;
+        validate_result_root_after_drop(build, &binding)?;
+        Ok(proof)
+    }
+}
+
+fn validate_result_root_after_drop(
+    build: &GameGenerationProcessorBuild<'_, '_>,
+    binding: &PlannedGameGenerationBindingV2,
+) -> Result<(), String> {
+    build.root().revalidate()?;
+    build.authority().validate_binding(binding)?;
+    let (root_nonce, install_id, _, _) = build.root().binding();
+    if root_nonce != binding.root_binding_nonce() || install_id != binding.install_id() {
+        return Err("Processor result root changed before workspace cleanup".into());
+    }
+    Ok(())
 }
 
 trait RuntimeRevalidator {
@@ -157,6 +253,7 @@ trait PreparedProcessSpawner {
     fn spawn(
         &mut self,
         invocation: &PreparedProcessorInvocation,
+        monitor_limits: ProcessorWorkspaceMonitorLimits,
         cancelled: Arc<AtomicBool>,
     ) -> Result<JavaProcessOutput, String>;
 }
@@ -164,6 +261,7 @@ trait PreparedProcessSpawner {
 struct NativeProcessorHost<'a> {
     runtime_lock: &'a RuntimeLock,
     runtime: &'a RuntimeInstallation,
+    root: &'a OwnedCasRoot,
 }
 
 impl RuntimeRevalidator for NativeProcessorHost<'_> {
@@ -171,7 +269,7 @@ impl RuntimeRevalidator for NativeProcessorHost<'_> {
         &mut self,
         installed: &RuntimeInstallation,
     ) -> Result<RuntimeInstallation, String> {
-        revalidate_runtime_installation(installed, self.runtime_lock)
+        revalidate_runtime_installation_for_root(installed, self.runtime_lock, self.root)
     }
 }
 
@@ -179,13 +277,16 @@ impl PreparedProcessSpawner for NativeProcessorHost<'_> {
     fn spawn(
         &mut self,
         invocation: &PreparedProcessorInvocation,
+        monitor_limits: ProcessorWorkspaceMonitorLimits,
         cancelled: Arc<AtomicBool>,
     ) -> Result<JavaProcessOutput, String> {
         run_prepared_java_process(
             invocation,
             self.runtime_lock,
             self.runtime,
+            self.root,
             processor_limits(),
+            monitor_limits,
             cancelled,
         )
     }
@@ -199,31 +300,54 @@ fn processor_limits() -> JavaProcessLimits {
     }
 }
 
+fn workspace_monitor_limits(
+    step: &ProcessorStepContract,
+) -> Result<ProcessorWorkspaceMonitorLimits, String> {
+    let output_max_bytes = step
+        .after_write
+        .values()
+        .try_fold(0_u64, |total, artifact| {
+            total
+                .checked_add(artifact.size)
+                .ok_or_else(|| "Processor live output byte limit overflowed".to_string())
+        })?;
+    Ok(ProcessorWorkspaceMonitorLimits {
+        output_max_entries: MAX_PARTIAL_OUTPUT_ENTRIES,
+        output_max_bytes,
+    })
+}
+
 /// Executes the pinned NeoForge 21.1.235 offline plan in one fresh, materialized workspace.
 ///
 /// An error never publishes, resumes or broadly cleans the workspace. In particular, signed
 /// transient sidecars are removed only after the complete post-step inventory has been proven.
 pub(super) fn execute_game_runtime_processors(
     mut workspace: ProcessorWorkspace,
-    game_lock: &GameRuntimeLock,
-    runtime_lock: &RuntimeLock,
+    build: &GameGenerationProcessorBuild<'_, '_>,
     runtime: &RuntimeInstallation,
     cancelled: Arc<AtomicBool>,
 ) -> Result<ProcessorExecutionResult, String> {
+    let authority = build.authority();
+    workspace.validate_for_build(build)?;
+    if runtime.runtime_lock_sha256() != authority.runtime_lock_sha256() {
+        return Err("Java runtime belongs to another sealed generation build".into());
+    }
+    let runtime_lock = authority.runtime_lock();
+    let generation_binding = authority.binding();
+    let initially_verified_runtime =
+        revalidate_runtime_installation_for_root(runtime, runtime_lock, build.root())?;
+    if &initially_verified_runtime != runtime {
+        return Err("Java runtime root revalidation returned a different capability".into());
+    }
     let mut host = NativeProcessorHost {
         runtime_lock,
         runtime,
+        root: build.root(),
     };
-    let executed = execute_with_host(
-        &mut workspace,
-        game_lock,
-        runtime_lock,
-        runtime,
-        cancelled,
-        &mut host,
-    )?;
+    let executed = execute_with_host(&mut workspace, build, runtime, cancelled, &mut host)?;
     Ok(ProcessorExecutionResult {
         workspace,
+        generation_binding,
         proof: executed.proof,
         outputs: executed.outputs,
     })
@@ -236,8 +360,7 @@ struct ExecutedProcessorArtifacts {
 
 fn execute_with_host<H>(
     workspace: &mut ProcessorWorkspace,
-    game_lock: &GameRuntimeLock,
-    runtime_lock: &RuntimeLock,
+    build: &GameGenerationProcessorBuild<'_, '_>,
     runtime: &RuntimeInstallation,
     cancelled: Arc<AtomicBool>,
     host: &mut H,
@@ -245,9 +368,13 @@ fn execute_with_host<H>(
 where
     H: RuntimeRevalidator + PreparedProcessSpawner,
 {
+    let authority = build.authority();
+    let game_lock = authority.game_runtime_lock();
+    let runtime_lock = authority.runtime_lock();
     game_lock.validate()?;
     runtime_lock.validate()?;
     require_not_cancelled(&cancelled)?;
+    workspace.validate_for_build(build)?;
 
     let contract = ProcessorExecutionContract::from_lock(game_lock)?;
     workspace.prepare_execution_scratch()?;
@@ -269,6 +396,7 @@ where
     let mut retained = BTreeMap::new();
     for (position, step) in contract.steps.iter().enumerate() {
         require_not_cancelled(&cancelled)?;
+        workspace.validate_for_build(build)?;
         if retained != expected_before_step(&contract.steps, position) {
             return Err("Internal processor cumulative output state diverged".into());
         }
@@ -306,7 +434,11 @@ where
                 .ok_or_else(|| "Prepared processor invocation is missing".to_string())?;
             validate_prepared_invocation(invocation, step, workspace.outputs())?;
             require_not_cancelled(&cancelled)?;
-            let output = host.spawn(invocation, Arc::clone(&cancelled))?;
+            let output = host.spawn(
+                invocation,
+                workspace_monitor_limits(step)?,
+                Arc::clone(&cancelled),
+            )?;
             require_successful_exit(&step.id, step.upstream_index, &output)?;
             output
         };
@@ -385,6 +517,7 @@ where
         return Err("NeoForge processor run did not retain exactly six derived outputs".into());
     }
     require_not_cancelled(&cancelled)?;
+    workspace.validate_for_build(build)?;
     let final_inputs = workspace.revalidate_inputs()?;
     if final_inputs.input_state_sha256 != input_state_sha256 {
         return Err("Processor input state changed before final audit".into());
@@ -406,9 +539,12 @@ where
         return Err("Processor input state changed while final outputs were leased".into());
     }
     require_not_cancelled(&cancelled)?;
+    workspace.validate_for_build(build)?;
 
     let proof = ProcessorExecutionProof {
         java_runtime_lock_sha256: runtime.runtime_lock_sha256().to_owned(),
+        game_runtime_lock_sha256: authority.game_runtime_lock_sha256().to_owned(),
+        generation_binding_sha256: authority.binding_digest().to_owned(),
         processor_receipt_sha256: verified_receipt_sha256(game_lock)?.to_owned(),
         input_state_sha256,
         steps: proofs,
@@ -424,6 +560,27 @@ fn verified_receipt_sha256(lock: &GameRuntimeLock) -> Result<&str, String> {
         OfflineProcessorVerification::Verified { receipt_sha256, .. } => Ok(receipt_sha256),
         OfflineProcessorVerification::Pending { .. } => {
             Err("Pending processor verification has no signed receipt".into())
+        }
+    }
+}
+
+fn signed_derived_identity<'lock>(
+    lock: &'lock GameRuntimeLock,
+    expected: &GameRuntimeFile,
+) -> Result<(&'lock str, u64, &'lock str, &'lock str), String> {
+    let signed = lock
+        .files
+        .iter()
+        .find(|candidate| std::ptr::eq(*candidate, expected))
+        .ok_or_else(|| {
+            "Derived output reference does not belong to the sealed game runtime lock".to_string()
+        })?;
+    match &signed.source {
+        GameRuntimeSource::Derived {
+            size, sha1, sha256, ..
+        } => Ok((&signed.path, *size, sha1, sha256)),
+        GameRuntimeSource::Official { .. } => {
+            Err("Processor result cannot publish an official game runtime file".into())
         }
     }
 }
@@ -947,6 +1104,9 @@ fn scan_partial_output_tree(
         if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
             return Err("Link/reparse point is forbidden in processor outputs".into());
         }
+        if metadata.is_file() && metadata.permissions().readonly() {
+            return Err("Read-only file is forbidden in processor outputs".into());
+        }
         let relative = relative_managed_path(root, &absolute)?;
         let key = relative.collision_key().to_owned();
         if metadata.is_dir() {
@@ -1049,6 +1209,9 @@ fn scan_partial_inventory_only(
             .map_err(|error| format!("Cannot inspect processor output metadata: {error}"))?;
         if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
             return Err("Link/reparse point is forbidden in processor outputs".into());
+        }
+        if metadata.is_file() && metadata.permissions().readonly() {
+            return Err("Read-only file is forbidden in processor outputs".into());
         }
         let relative = relative_managed_path(root, &absolute)?;
         let key = relative.collision_key().to_owned();
@@ -1248,6 +1411,31 @@ mod tests {
     }
 
     #[test]
+    fn publisher_accepts_only_a_derived_reference_from_the_exact_signed_lock() {
+        let lock = fixture_lock();
+        let derived = lock
+            .files
+            .iter()
+            .find(|file| matches!(&file.source, GameRuntimeSource::Derived { .. }))
+            .unwrap();
+        let identity = signed_derived_identity(&lock, derived).unwrap();
+        assert_eq!(identity.0, derived.path);
+
+        let detached_clone = derived.clone();
+        assert!(signed_derived_identity(&lock, &detached_clone)
+            .unwrap_err()
+            .contains("does not belong"));
+        let official = lock
+            .files
+            .iter()
+            .find(|file| matches!(&file.source, GameRuntimeSource::Official { .. }))
+            .unwrap();
+        assert!(signed_derived_identity(&lock, official)
+            .unwrap_err()
+            .contains("cannot publish an official"));
+    }
+
+    #[test]
     fn exact_inventory_rejects_missing_extra_and_wrong_identity() {
         let one = artifact("a/one.bin", b"one");
         let two = artifact("a/b/two.bin", b"two");
@@ -1357,7 +1545,8 @@ mod tests {
     #[test]
     fn partial_audit_rejects_hard_link_and_unexpected_empty_directory() {
         let one = artifact("a/one.bin", b"one");
-        let (root, directories, expected) = prepare_small_tree("hardlink", &[one.clone()]);
+        let (root, directories, expected) =
+            prepare_small_tree("hardlink", std::slice::from_ref(&one));
         let original = one.managed_path().unwrap().join_to(&root);
         let alias = root.join("a/alias.bin");
         if fs::hard_link(&original, &alias).is_ok() {
