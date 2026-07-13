@@ -1,0 +1,1624 @@
+use super::{
+    contracts::{
+        is_sha256, valid_java25_version, valid_setting_id, validate_manifest_path, GameRuntimeLock,
+        MutableSettingsFile, RuntimeLock, JAVA_DISTRIBUTION, JAVA_IMAGE_TYPE, JAVA_MAJOR, JAVA_VM,
+    },
+    managed_fs::{
+        validate_materializable_manifest_path, MAX_MANAGED_FILE_BYTES, MAX_MANAGED_RELEASE_BYTES,
+        MAX_MANIFEST_PATH_BYTES, MAX_MANIFEST_PATH_COMPONENTS, MAX_RECONCILE_MUTATIONS,
+        MAX_RELEASE_MANAGED_PATHS, MAX_RELEASE_PATH_COMPONENTS,
+    },
+    neoforge::{
+        MINECRAFT_VERSION, NEOFORGE_INSTALLER_SHA256, NEOFORGE_INSTALLER_URL, NEOFORGE_VERSION,
+    },
+    types::{BuildChannel, PresetId},
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use unicode_normalization::UnicodeNormalization;
+use url::Url;
+
+const REQUIRED_STRICT_ROOTS: [&str; 4] = ["mods", "resourcepacks", "shaderpacks", "config"];
+const REQUIRED_LAUNCH_GUARD: &str = "mods/fragment-launch-guard.jar";
+pub(super) const MAX_FILES_PER_PRESET: usize = 200_000;
+pub(super) const MAX_RECONCILE_PLAN_BYTES: u64 = 64 * 1024 * 1024;
+// `strictRoots` and `preservedPaths` can each contain 4,096 paths of 1,024 UTF-8 bytes:
+// their two compact JSON arrays need at most 8,413,186 bytes. The remaining almost two MiB
+// cover the two bounded active markers, disk budget, identities and every envelope key/comma.
+// Variable desired-file and mutation records are projected independently below.
+const RECONCILE_PLAN_ENVELOPE_RESERVE_BYTES: u64 = 10 * 1024 * 1024;
+
+// Compact serde_json record sizes excluding the UTF-8 path and decimal values. These constants
+// are schema contracts, not estimates; journal tests compare them to the real serialized types.
+const PLANNED_FILE_JSON_BASE_BYTES: u64 = 244;
+const QUARANTINE_JSON_BASE_BYTES: u64 = 51;
+const ENSURE_DIRECTORY_JSON_BASE_BYTES: u64 = 47;
+const INSTALL_FILE_JSON_BASE_BYTES: u64 = 160;
+const FALSE_JSON_DELTA_BYTES: u64 = 1;
+const VALIDATED_MUTABLE_JSON_DELTA_BYTES: u64 = 12;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentPointer {
+    pub schema_version: u8,
+    pub channel: BuildChannel,
+    pub release_id: String,
+    pub manifest_target: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseManifest {
+    pub schema_version: u8,
+    pub project: ReleaseProject,
+    pub release: ReleaseIdentity,
+    pub runtime: ReleaseRuntime,
+    pub integrity: ReleaseIntegrity,
+    pub presets: Vec<ReleasePreset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseProject {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseIdentity {
+    pub id: String,
+    pub version: String,
+    pub created_at: String,
+    pub minimum_launcher_version: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseRuntime {
+    pub minecraft: String,
+    pub loader: ReleaseLoader,
+    pub java: ReleaseJava,
+    pub game: ReleaseGame,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseLoader {
+    pub kind: String,
+    pub version: String,
+    pub installer_url: String,
+    pub installer_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseJava {
+    pub major: u8,
+    pub architecture: String,
+    pub distribution: String,
+    pub image_type: String,
+    pub vm: String,
+    pub version: String,
+    pub runtime_target: String,
+    pub runtime_lock_sha256: String,
+    pub archive: ReleaseObject,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseGame {
+    pub platform: String,
+    pub runtime_target: String,
+    pub runtime_lock_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseObject {
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseIntegrity {
+    pub unknown_policy: String,
+    pub strict_roots: Vec<String>,
+    pub preserved_paths: Vec<String>,
+    pub locked_paths: Vec<String>,
+    pub preset_override_paths: Vec<String>,
+    pub mutable_settings: Vec<MutableSettingsFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasePreset {
+    pub id: PresetId,
+    pub display_name: String,
+    pub jvm: ReleaseJvm,
+    pub files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseJvm {
+    pub min_memory_mi_b: u64,
+    pub max_memory_mi_b: u64,
+    #[serde(default)]
+    pub extra_arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilePolicy {
+    Exact,
+    ValidatedMutable,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub executable: bool,
+    pub policy: FilePolicy,
+}
+
+impl CurrentPointer {
+    pub fn parse_and_validate(
+        bytes: &[u8],
+        expected_channel: BuildChannel,
+    ) -> Result<Self, String> {
+        if bytes.len() > 8 * 1024 {
+            return Err("TUF current target exceeds the launcher limit".into());
+        }
+        let current: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("TUF current target is invalid: {error}"))?;
+        if current.schema_version != 1 || current.channel != expected_channel {
+            return Err("TUF current target belongs to another schema or channel".into());
+        }
+        if !valid_release_id(&current.release_id)
+            || current.manifest_target != format!("release-{}.json", current.release_id)
+        {
+            return Err("TUF current target has an invalid release binding".into());
+        }
+        validate_manifest_path(&current.manifest_target)?;
+        Ok(current)
+    }
+}
+
+impl ReleaseManifest {
+    pub fn parse_and_validate(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err("Release manifest exceeds the launcher limit".into());
+        }
+        let manifest: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("Release manifest JSON is invalid: {error}"))?;
+        // Spark derives release IDs with json-canonicalize, whose JCS/ECMAScript number
+        // serialization must not be approximated with serde_json (mutable numeric bounds are
+        // part of the derivation). TUF authenticates these exact bytes and the refresh caller
+        // separately binds current.releaseId to release.id, so a lossy duplicate check would add
+        // compatibility failures rather than another trust boundary.
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_identity()?;
+        self.validate_runtime()?;
+        self.validate_integrity()?;
+        self.validate_presets()?;
+        self.validate_cross_fields()
+    }
+
+    pub fn bind_runtime_lock(&self, lock: &RuntimeLock) -> Result<(), String> {
+        let java = &self.runtime.java;
+        if java.major != lock.java.major
+            || java.architecture != lock.java.architecture
+            || java.distribution != lock.java.distribution
+            || java.image_type != lock.java.image_type
+            || java.vm != lock.java.vm
+            || java.version != lock.java.version
+            || java.archive.size != lock.java.archive.size
+            || java.archive.sha256 != lock.java.archive.sha256
+            || lock.minecraft.version != self.runtime.minecraft
+        {
+            return Err("Runtime lock does not match the signed release manifest".into());
+        }
+        Ok(())
+    }
+
+    pub fn bind_game_runtime_lock(
+        &self,
+        java_lock: &RuntimeLock,
+        lock: &GameRuntimeLock,
+    ) -> Result<(), String> {
+        if self.runtime.game.platform != "windows-x64"
+            || lock.platform.os != "windows"
+            || lock.platform.architecture != "x64"
+            || lock.provenance.neo_forge_installer.url != self.runtime.loader.installer_url
+            || lock.provenance.neo_forge_installer.sha256 != self.runtime.loader.installer_sha256
+            || lock.id
+                != format!(
+                    "minecraft-{}-{}-{}-windows-x64",
+                    self.runtime.minecraft, self.runtime.loader.kind, self.runtime.loader.version
+                )
+        {
+            return Err("Game runtime lock does not match the signed release manifest".into());
+        }
+        if java_lock.minecraft.version != self.runtime.minecraft
+            || java_lock.minecraft.version_json_url != lock.provenance.minecraft_version_json.url
+            || java_lock.minecraft.version_json_sha1 != lock.provenance.minecraft_version_json.sha1
+        {
+            return Err(
+                "Managed Java and game runtime locks disagree on Minecraft metadata".into(),
+            );
+        }
+        lock.verification.offline_processors.bind_java_runtime(
+            &self.runtime.java.runtime_lock_sha256,
+            &java_lock.java.archive.sha256,
+            &java_lock.extracted_tree_sha256()?,
+            &java_lock.java.version,
+        )?;
+        Ok(())
+    }
+
+    pub fn selected_preset(&self, preset: PresetId) -> Result<&ReleasePreset, String> {
+        self.presets
+            .iter()
+            .find(|candidate| candidate.id == preset)
+            .ok_or_else(|| "Selected preset is missing from the release".into())
+    }
+
+    fn validate_identity(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || !valid_project_id(&self.project.id)
+            || !safe_text(&self.project.display_name, 1, 100, false)
+            || !valid_release_id(&self.release.id)
+            || !safe_text(&self.release.version, 1, 64, true)
+            || self.release.created_at.parse::<jiff::Timestamp>().is_err()
+            || semver::Version::parse(&self.release.minimum_launcher_version).is_err()
+            || self
+                .release
+                .notes
+                .as_ref()
+                .is_some_and(|notes| notes.chars().count() > 4000 || notes.contains('\0'))
+        {
+            return Err("Release identity is invalid or unsupported".into());
+        }
+        Ok(())
+    }
+
+    fn validate_runtime(&self) -> Result<(), String> {
+        let java = &self.runtime.java;
+        let game = &self.runtime.game;
+        if self.runtime.minecraft != MINECRAFT_VERSION
+            || self.runtime.loader.kind != "neoforge"
+            || self.runtime.loader.version != NEOFORGE_VERSION
+            || self.runtime.loader.installer_url != NEOFORGE_INSTALLER_URL
+            || self.runtime.loader.installer_sha256 != NEOFORGE_INSTALLER_SHA256
+            || java.major != JAVA_MAJOR
+            || java.architecture != "x64"
+            || java.distribution != JAVA_DISTRIBUTION
+            || java.image_type != JAVA_IMAGE_TYPE
+            || java.vm != JAVA_VM
+            || !valid_java25_version(&java.version)
+            || java.archive.size == 0
+            || !is_sha256(&java.archive.sha256)
+            || !is_sha256(&java.runtime_lock_sha256)
+            || game.platform != "windows-x64"
+            || !is_sha256(&game.runtime_lock_sha256)
+        {
+            return Err("Release runtime identity is invalid or unsupported".into());
+        }
+        validate_manifest_path(&java.runtime_target)?;
+        if java.runtime_target != format!("runtime-windows-x64-{}.json", java.runtime_lock_sha256) {
+            return Err("Runtime target is not bound to its signed SHA-256".into());
+        }
+        validate_manifest_path(&game.runtime_target)?;
+        if game.runtime_target
+            != format!("game-runtime-windows-x64-{}.json", game.runtime_lock_sha256)
+        {
+            return Err("Game runtime target is not bound to its signed SHA-256".into());
+        }
+        Ok(())
+    }
+
+    fn validate_integrity(&self) -> Result<(), String> {
+        let integrity = &self.integrity;
+        if integrity.unknown_policy != "delete"
+            || integrity.strict_roots.is_empty()
+            || integrity.locked_paths.is_empty()
+            || integrity.preset_override_paths.is_empty()
+            || integrity.mutable_settings.len() > 128
+        {
+            return Err("Release integrity policy is incomplete".into());
+        }
+        for paths in [
+            &integrity.strict_roots,
+            &integrity.preserved_paths,
+            &integrity.locked_paths,
+            &integrity.preset_override_paths,
+        ] {
+            validate_path_list(paths)?;
+        }
+        for required in REQUIRED_STRICT_ROOTS {
+            if !integrity.strict_roots.iter().any(|root| root == required) {
+                return Err(format!("Required strict root is missing: {required}"));
+            }
+        }
+        if !integrity
+            .locked_paths
+            .iter()
+            .any(|path| path == REQUIRED_LAUNCH_GUARD)
+        {
+            return Err("Required Fragment launch guard is not locked".into());
+        }
+        for strict in &integrity.strict_roots {
+            if integrity
+                .preserved_paths
+                .iter()
+                .any(|preserved| paths_overlap(strict, preserved))
+            {
+                return Err(format!("Strict and preserved paths overlap: {strict}"));
+            }
+        }
+        for locked in &integrity.locked_paths {
+            if !is_within_any(locked, &integrity.strict_roots) {
+                return Err(format!("Locked path is outside strict roots: {locked}"));
+            }
+            if integrity
+                .mutable_settings
+                .iter()
+                .any(|settings| paths_overlap(locked, &settings.path))
+            {
+                return Err(format!("Locked path overlaps mutable settings: {locked}"));
+            }
+        }
+        for override_path in &integrity.preset_override_paths {
+            if !is_within_any(override_path, &integrity.strict_roots)
+                || integrity
+                    .locked_paths
+                    .iter()
+                    .any(|locked| paths_overlap(override_path, locked))
+            {
+                return Err(format!("Unsafe preset override path: {override_path}"));
+            }
+        }
+
+        let mut mutable_paths = HashSet::new();
+        let mut setting_ids = HashSet::new();
+        for settings in &integrity.mutable_settings {
+            validate_materializable_manifest_path(&settings.path)
+                .map_err(|error| error.to_string())?;
+            settings.validate()?;
+            let path = path_key(&settings.path);
+            if !mutable_paths.insert(path.clone())
+                || integrity
+                    .preserved_paths
+                    .iter()
+                    .any(|preserved| paths_overlap(&path, preserved))
+            {
+                return Err(format!(
+                    "Unsafe or duplicate mutable path: {}",
+                    settings.path
+                ));
+            }
+            for existing in &mutable_paths {
+                if existing != &path && paths_overlap(existing, &path) {
+                    return Err(format!("Mutable paths overlap: {}", settings.path));
+                }
+            }
+            for field in &settings.fields {
+                for identity in std::iter::once(&field.setting_id).chain(&field.renamed_from) {
+                    if !valid_setting_id(identity) || !setting_ids.insert(identity.clone()) {
+                        return Err(format!("Duplicate mutable setting identity: {identity}"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_presets(&self) -> Result<(), String> {
+        if self.presets.len() != 3 {
+            return Err("Release must contain exactly three presets".into());
+        }
+        let mut ids = HashSet::new();
+        for preset in &self.presets {
+            if !ids.insert(preset.id)
+                || !safe_text(&preset.display_name, 1, 100, false)
+                || preset.jvm.min_memory_mi_b < 1024
+                || preset.jvm.max_memory_mi_b < 2048
+                || preset.jvm.max_memory_mi_b < preset.jvm.min_memory_mi_b
+                || preset.jvm.extra_arguments.len() > 64
+                || preset.files.len() > MAX_FILES_PER_PRESET
+            {
+                return Err(format!("Preset {} is invalid", preset.id.as_str()));
+            }
+            for argument in &preset.jvm.extra_arguments {
+                if argument.is_empty()
+                    || argument.len() > 1024
+                    || argument.chars().any(char::is_control)
+                    || forbidden_jvm_argument(argument)
+                {
+                    return Err(format!("Forbidden preset JVM argument: {argument}"));
+                }
+            }
+            validate_file_list(&preset.files, &self.integrity.strict_roots)?;
+        }
+        if ![PresetId::Low, PresetId::Medium, PresetId::High]
+            .into_iter()
+            .all(|id| ids.contains(&id))
+        {
+            return Err("low, medium and high must each occur exactly once".into());
+        }
+        Ok(())
+    }
+
+    fn validate_cross_fields(&self) -> Result<(), String> {
+        let preset_files: Vec<HashMap<String, &ManifestFile>> = self
+            .presets
+            .iter()
+            .map(|preset| {
+                preset
+                    .files
+                    .iter()
+                    .map(|file| (path_key(&file.path), file))
+                    .collect()
+            })
+            .collect();
+        let mutable_policies: HashMap<String, &MutableSettingsFile> = self
+            .integrity
+            .mutable_settings
+            .iter()
+            .map(|settings| (path_key(&settings.path), settings))
+            .collect();
+
+        for locked in &self.integrity.locked_paths {
+            let key = path_key(locked);
+            let files: Vec<_> = preset_files.iter().map(|preset| preset.get(&key)).collect();
+            if files.iter().any(|file| file.is_none()) {
+                return Err(format!("Locked path is missing: {locked}"));
+            }
+            let first = files[0].expect("checked above");
+            if files.iter().flatten().any(|file| {
+                file.sha256 != first.sha256
+                    || file.size != first.size
+                    || file.executable != first.executable
+                    || file.policy != FilePolicy::Exact
+            }) {
+                return Err(format!("Locked path differs or is mutable: {locked}"));
+            }
+        }
+
+        let all_paths: HashSet<_> = preset_files
+            .iter()
+            .flat_map(|preset| preset.keys().cloned())
+            .collect();
+        for path in all_paths {
+            if self
+                .integrity
+                .preserved_paths
+                .iter()
+                .any(|preserved| paths_overlap(&path, preserved))
+            {
+                return Err(format!("Managed file overlaps preserved data: {path}"));
+            }
+            let mutable_policy = mutable_policies.get(&path).copied();
+            let expected_policy = if mutable_policy.is_some() {
+                FilePolicy::ValidatedMutable
+            } else {
+                FilePolicy::Exact
+            };
+            let files: Vec<_> = preset_files
+                .iter()
+                .map(|preset| preset.get(&path))
+                .collect();
+            if files
+                .iter()
+                .flatten()
+                .any(|file| file.policy != expected_policy)
+            {
+                return Err(format!(
+                    "Manifest file policy does not match integrity rules: {path}"
+                ));
+            }
+            if let Some(policy) = mutable_policy {
+                let max_bytes = u64::try_from(policy.max_bytes)
+                    .map_err(|_| format!("Mutable maxBytes does not fit u64: {}", policy.path))?;
+                if files
+                    .iter()
+                    .flatten()
+                    .any(|file| file.path != policy.path || file.size > max_bytes)
+                {
+                    return Err(format!(
+                        "Mutable default does not match its exact policy path or maxBytes: {}",
+                        policy.path
+                    ));
+                }
+            }
+            let may_differ = self
+                .integrity
+                .preset_override_paths
+                .iter()
+                .any(|override_path| is_within(&path, override_path));
+            if !may_differ {
+                if files.iter().any(|file| file.is_none()) {
+                    return Err(format!("Non-preset file is missing from a preset: {path}"));
+                }
+                let first = files[0].expect("checked above");
+                if files.iter().flatten().any(|file| {
+                    file.sha256 != first.sha256
+                        || file.size != first.size
+                        || file.executable != first.executable
+                }) {
+                    return Err(format!("Non-preset file differs between presets: {path}"));
+                }
+            }
+        }
+        for mutable_path in mutable_policies.keys() {
+            if preset_files
+                .iter()
+                .any(|preset| !preset.contains_key(mutable_path))
+            {
+                return Err(format!(
+                    "Mutable settings default is missing from a preset: {mutable_path}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decimal_json_digits(mut value: u64) -> u64 {
+    let mut digits = 1_u64;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn checked_projection_sum(values: impl IntoIterator<Item = u64>) -> Result<u64, String> {
+    values
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add)
+        .ok_or_else(|| "Reconcile journal byte projection overflowed".to_string())
+}
+
+pub(super) fn projected_planned_file_json_bytes(
+    path: &str,
+    signed_size: u64,
+    installed_size: u64,
+    executable: bool,
+    policy: FilePolicy,
+) -> Result<u64, String> {
+    checked_projection_sum([
+        PLANNED_FILE_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Desired path length does not fit u64".to_string())?,
+        decimal_json_digits(signed_size),
+        decimal_json_digits(installed_size),
+        u64::from(!executable) * FALSE_JSON_DELTA_BYTES,
+        u64::from(policy == FilePolicy::ValidatedMutable) * VALIDATED_MUTABLE_JSON_DELTA_BYTES,
+    ])
+}
+
+pub(super) fn projected_quarantine_json_bytes(path: &str, backup_slot: u64) -> Result<u64, String> {
+    checked_projection_sum([
+        QUARANTINE_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Quarantine path length does not fit u64".to_string())?,
+        decimal_json_digits(backup_slot),
+    ])
+}
+
+pub(super) fn projected_ensure_directory_json_bytes(path: &str) -> Result<u64, String> {
+    checked_projection_sum([
+        ENSURE_DIRECTORY_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Directory path length does not fit u64".to_string())?,
+    ])
+}
+
+pub(super) fn projected_install_file_json_bytes(
+    path: &str,
+    staging_slot: u64,
+    size: u64,
+    executable: bool,
+) -> Result<u64, String> {
+    checked_projection_sum([
+        INSTALL_FILE_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Install path length does not fit u64".to_string())?,
+        decimal_json_digits(staging_slot),
+        decimal_json_digits(size),
+        u64::from(!executable) * FALSE_JSON_DELTA_BYTES,
+    ])
+}
+
+fn projected_json_array_bytes(record_bytes: u64, count: usize) -> Result<u64, String> {
+    let count = u64::try_from(count)
+        .map_err(|_| "Reconcile journal record count does not fit u64".to_string())?;
+    checked_projection_sum([2, record_bytes, count.saturating_sub(1)])
+}
+
+pub(super) fn projected_worst_case_reconcile_plan_bytes(
+    files: &[ManifestFile],
+    parent_directories: &HashMap<String, String>,
+) -> Result<u64, String> {
+    let maximum_slot = u64::try_from(
+        MAX_RECONCILE_MUTATIONS
+            .checked_sub(1)
+            .ok_or_else(|| "Reconcile mutation limit is empty".to_string())?,
+    )
+    .map_err(|_| "Reconcile mutation slot limit does not fit u64".to_string())?;
+    let mut desired_record_bytes = 0_u64;
+    let mut mutation_record_bytes = 0_u64;
+    for file in files {
+        // Signed and installed sizes are independently represented in PlannedFileV2. Project the
+        // longest u64 representation, `false`, and the longer policy token so future processor
+        // outputs or policy changes cannot make this admission optimistic.
+        desired_record_bytes = checked_projection_sum([
+            desired_record_bytes,
+            projected_planned_file_json_bytes(
+                &file.path,
+                u64::MAX,
+                u64::MAX,
+                false,
+                FilePolicy::ValidatedMutable,
+            )?,
+        ])?;
+        // Worst repair can quarantine and reinstall every selected-preset file. The real planner
+        // may collapse overlapping quarantines, but admission never relies on that optimization.
+        mutation_record_bytes = checked_projection_sum([
+            mutation_record_bytes,
+            projected_quarantine_json_bytes(&file.path, maximum_slot)?,
+            projected_install_file_json_bytes(&file.path, maximum_slot, u64::MAX, false)?,
+        ])?;
+    }
+    for parent in parent_directories.values() {
+        mutation_record_bytes = checked_projection_sum([
+            mutation_record_bytes,
+            projected_ensure_directory_json_bytes(parent)?,
+        ])?;
+    }
+    let mutation_count = files
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(parent_directories.len()))
+        .ok_or_else(|| "Reconcile journal mutation projection overflowed".to_string())?;
+    checked_projection_sum([
+        RECONCILE_PLAN_ENVELOPE_RESERVE_BYTES,
+        projected_json_array_bytes(desired_record_bytes, files.len())?,
+        projected_json_array_bytes(mutation_record_bytes, mutation_count)?,
+    ])
+}
+
+fn validate_projected_reconcile_plan_bytes(
+    projected_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<(), String> {
+    if projected_bytes > maximum_bytes {
+        return Err(
+            "Release preset worst-case reconcile journal exceeds the 64 MiB launcher limit".into(),
+        );
+    }
+    Ok(())
+}
+
+fn retain_longest_parent_spelling(
+    parent_directories: &mut HashMap<String, String>,
+    parent_key: String,
+    original_parent: String,
+) {
+    parent_directories
+        .entry(parent_key)
+        .and_modify(|existing| {
+            if existing.len() < original_parent.len() {
+                existing.clone_from(&original_parent);
+            }
+        })
+        .or_insert(original_parent);
+}
+
+pub(super) fn projected_reconcile_directories(
+    files: &[ManifestFile],
+    strict_roots: &[String],
+) -> HashMap<String, String> {
+    let mut directories = HashMap::new();
+    for (path, inclusive) in files
+        .iter()
+        .map(|file| (file.path.as_str(), false))
+        .chain(strict_roots.iter().map(|root| (root.as_str(), true)))
+    {
+        let components = path.split('/').collect::<Vec<_>>();
+        let upper_exclusive = components.len() + usize::from(inclusive);
+        for length in 1..upper_exclusive {
+            let directory = components[..length].join("/");
+            retain_longest_parent_spelling(&mut directories, path_key(&directory), directory);
+        }
+    }
+    directories
+}
+
+fn validate_file_list(files: &[ManifestFile], strict_roots: &[String]) -> Result<(), String> {
+    let mut seen = BTreeMap::new();
+    let mut path_components = 0_usize;
+    let mut total_file_bytes = 0_u64;
+    for file in files {
+        validate_manifest_path(&file.path)?;
+        validate_materializable_manifest_path(&file.path).map_err(|error| error.to_string())?;
+        let component_count = file.path.split('/').count();
+        if file.path.len() > MAX_MANIFEST_PATH_BYTES
+            || component_count > MAX_MANIFEST_PATH_COMPONENTS
+        {
+            return Err(format!(
+                "Manifest path exceeds the materializable path bound: {}",
+                file.path
+            ));
+        }
+        path_components = checked_release_path_component_total(path_components, component_count)?;
+        total_file_bytes = checked_managed_release_file_bytes(total_file_bytes, file.size)?;
+        if file.size > MAX_MANAGED_FILE_BYTES || !is_sha256(&file.sha256) {
+            return Err(format!(
+                "Manifest file has an invalid SHA-256: {}",
+                file.path
+            ));
+        }
+        let key = path_key(&file.path);
+        if seen.insert(key.clone(), file.path.clone()).is_some() {
+            return Err(format!("Duplicate manifest path: {}", file.path));
+        }
+        let key_segments: Vec<_> = key.split('/').collect();
+        for index in 1..key_segments.len() {
+            let parent_key = key_segments[..index].join("/");
+            if seen.contains_key(&parent_key) {
+                return Err(format!("Manifest file/directory collision: {}", file.path));
+            }
+        }
+    }
+    // Planner de-duplicates required directories by lowercase key but serializes one
+    // original-cased path. This set includes file parents plus every strict root and its parents,
+    // exactly matching DesiredTree's clean-install `missing_directories` surface. Unicode
+    // lowercase can shrink UTF-8 (`ẞ` -> `ß`), so the helper retains the longest original spelling
+    // for every key and remains conservative regardless of which representative planner picks.
+    let parent_directories = projected_reconcile_directories(files, strict_roots);
+    checked_projected_reconcile_mutations(files.len(), parent_directories.len())?;
+    validate_projected_reconcile_plan_bytes(
+        projected_worst_case_reconcile_plan_bytes(files, &parent_directories)?,
+        MAX_RECONCILE_PLAN_BYTES,
+    )?;
+    for key in seen.keys() {
+        let segments: Vec<_> = key.split('/').collect();
+        for index in 1..segments.len() {
+            if seen.contains_key(&segments[..index].join("/")) {
+                return Err(format!("Manifest file/directory collision: {key}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_release_path_component_total(
+    current: usize,
+    additional: usize,
+) -> Result<usize, String> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= MAX_RELEASE_PATH_COMPONENTS)
+        .ok_or_else(|| "Manifest file topology exceeds its component budget".to_string())
+}
+
+fn checked_managed_release_file_bytes(current: u64, additional: u64) -> Result<u64, String> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= MAX_MANAGED_RELEASE_BYTES)
+        .ok_or_else(|| "Manifest file bytes exceed the managed release budget".to_string())
+}
+
+fn checked_projected_reconcile_mutations(
+    files: usize,
+    parent_directories: usize,
+) -> Result<usize, String> {
+    files
+        .checked_mul(2)
+        .and_then(|mutations| mutations.checked_add(parent_directories))
+        .filter(|mutations| *mutations <= MAX_RECONCILE_MUTATIONS)
+        .ok_or_else(|| "Manifest topology exceeds the reconcile mutation budget".to_string())
+}
+
+fn validate_path_list(paths: &[String]) -> Result<(), String> {
+    if paths.len() > MAX_RELEASE_MANAGED_PATHS {
+        return Err("Release managed path list exceeds its launcher bound".into());
+    }
+    let mut seen = HashSet::new();
+    for path in paths {
+        validate_manifest_path(path)?;
+        validate_materializable_manifest_path(path).map_err(|error| error.to_string())?;
+        if !seen.insert(path_key(path)) {
+            return Err(format!("Duplicate integrity path: {path}"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_project_id(value: &str) -> bool {
+    (2..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn valid_release_id(value: &str) -> bool {
+    value.len() == 28
+        && value.starts_with("rel_")
+        && value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn safe_text(value: &str, minimum: usize, maximum: usize, trim: bool) -> bool {
+    let length = value.chars().count();
+    value.nfc().collect::<String>() == value
+        && (minimum..=maximum).contains(&length)
+        && !value.chars().any(char::is_control)
+        && (!trim || value.trim() == value)
+}
+
+fn path_key(path: &str) -> String {
+    path.to_lowercase()
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    let left = path_key(left);
+    let right = path_key(right);
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+fn is_within(path: &str, root: &str) -> bool {
+    let path = path_key(path);
+    let root = path_key(root);
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn is_within_any(path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| is_within(path, root))
+}
+
+fn forbidden_jvm_argument(argument: &str) -> bool {
+    if !argument.starts_with('-') || argument == "--" {
+        return true;
+    }
+    if argument
+        .bytes()
+        .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    {
+        return true;
+    }
+    let normalized = argument.to_ascii_lowercase();
+    if let Some(property) = parse_jvm_system_property(argument) {
+        return !allowed_jvm_preset_system_property(&property);
+    }
+    if matches!(
+        normalized.as_str(),
+        "--enable-preview" | "--illegal-native-access=deny" | "-xverify:all"
+    ) {
+        return false;
+    }
+    if normalized.starts_with("-xlog:") {
+        return !allowed_jvm_preset_logging_argument(&normalized);
+    }
+    if normalized.starts_with("-xx:") {
+        return !allowed_jvm_preset_xx_argument(&normalized);
+    }
+    true
+}
+
+fn parse_jvm_system_property(argument: &str) -> Option<String> {
+    let bytes = argument.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'-' || bytes[1] != b'D' {
+        return None;
+    }
+    let suffix = &argument[2..];
+    let key = suffix.split_once('=').map_or(suffix, |(key, _)| key);
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Some(String::new());
+    }
+    Some(key.to_ascii_lowercase())
+}
+
+fn allowed_jvm_preset_system_property(key: &str) -> bool {
+    matches!(
+        key,
+        "file.encoding"
+            | "user.country"
+            | "user.language"
+            | "user.script"
+            | "user.timezone"
+            | "user.variant"
+    )
+}
+
+fn allowed_jvm_preset_logging_argument(normalized: &str) -> bool {
+    let Some(selection) = normalized.strip_prefix("-xlog:") else {
+        return false;
+    };
+    !selection.is_empty()
+        && selection != "help"
+        && selection.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'+' | b'*' | b'.' | b',' | b'=' | b'_' | b'-')
+        })
+}
+
+fn allowed_jvm_preset_xx_argument(normalized: &str) -> bool {
+    if matches!(
+        normalized,
+        "-xx:+alwayspretouch"
+            | "-xx:+disableattachmechanism"
+            | "-xx:-enabledynamicagentloading"
+            | "-xx:+exitonoutofmemoryerror"
+            | "-xx:-omitstacktraceinfastthrow"
+            | "-xx:+parallelrefprocenabled"
+            | "-xx:-startattachlistener"
+            | "-xx:+useg1gc"
+            | "-xx:+useparallelgc"
+            | "-xx:+useserialgc"
+            | "-xx:+usestringdeduplication"
+            | "-xx:+usezgc"
+    ) {
+        return true;
+    }
+    let Some((name, value)) = normalized
+        .strip_prefix("-xx:")
+        .and_then(|body| body.split_once('='))
+    else {
+        return false;
+    };
+    let numeric = value.strip_suffix(['k', 'm', 'g', 't']).unwrap_or(value);
+    if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        name,
+        "activeprocessorcount"
+            | "concgcthreads"
+            | "g1heapregionsize"
+            | "g1heapwastepercent"
+            | "g1maxnewsizepercent"
+            | "g1mixedgccounttarget"
+            | "g1mixedgclivethresholdpercent"
+            | "g1newsizepercent"
+            | "g1reservepercent"
+            | "g1rsetupdatingpausetimepercent"
+            | "initiatingheapoccupancypercent"
+            | "maxgcpausemillis"
+            | "parallelgcthreads"
+            | "softreflrupolicymspermb"
+            | "zcollectioninterval"
+            | "zuncommitdelay"
+    )
+}
+
+fn is_https_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn manifest() -> serde_json::Value {
+        let exact_file = serde_json::json!({
+            "path": "mods/fragment-launch-guard.jar",
+            "size": 4,
+            "sha256": "a".repeat(64),
+            "executable": false,
+            "policy": "exact"
+        });
+        let options = serde_json::json!({
+            "path": "options.txt",
+            "size": 22,
+            "sha256": "b".repeat(64),
+            "executable": false,
+            "policy": "validated-mutable"
+        });
+        let preset = |id: &str| {
+            serde_json::json!({
+                "id": id,
+                "displayName": id,
+                "jvm": { "minMemoryMiB": 2048, "maxMemoryMiB": 4096, "extraArguments": [] },
+                "files": [exact_file.clone(), options.clone()]
+            })
+        };
+        let runtime_hash = "c".repeat(64);
+        serde_json::json!({
+            "schemaVersion": 1,
+            "project": { "id": "fragment", "displayName": "Fragment" },
+            "release": {
+                "id": "rel_aaaaaaaaaaaaaaaaaaaaaaaa",
+                "version": "1.0.0",
+                "createdAt": "2026-07-11T00:00:00Z",
+                "minimumLauncherVersion": "1.0.0"
+            },
+            "runtime": {
+                "minecraft": "1.21.1",
+                "loader": {
+                    "kind": "neoforge",
+                    "version": "21.1.235",
+                    "installerUrl": NEOFORGE_INSTALLER_URL,
+                    "installerSha256": NEOFORGE_INSTALLER_SHA256
+                },
+                "java": {
+                    "major": 25,
+                    "architecture": "x64",
+                    "distribution": "eclipse-temurin",
+                    "imageType": "jre",
+                    "vm": "hotspot",
+                    "version": "25.0.3+9",
+                    "runtimeTarget": format!("runtime-windows-x64-{runtime_hash}.json"),
+                    "runtimeLockSha256": runtime_hash,
+                    "archive": { "size": 123, "sha256": "d".repeat(64) }
+                },
+                "game": {
+                    "platform": "windows-x64",
+                    "runtimeTarget": format!("game-runtime-windows-x64-{runtime_hash}.json"),
+                    "runtimeLockSha256": runtime_hash
+                }
+            },
+            "integrity": {
+                "unknownPolicy": "delete",
+                "strictRoots": ["mods", "resourcepacks", "shaderpacks", "config"],
+                "preservedPaths": ["saves", "screenshots", "logs"],
+                "lockedPaths": ["mods/fragment-launch-guard.jar"],
+                "presetOverridePaths": ["config/graphics.toml"],
+                "mutableSettings": [{
+                    "path": "options.txt",
+                    "validator": "minecraft-options-v1",
+                    "maxBytes": 4096,
+                    "unknownKeyPolicy": "drop",
+                    "duplicateKeyPolicy": "reject",
+                    "invalidValuePolicy": "use-default",
+                    "fields": [{
+                        "settingId": "minecraft.video.render-distance",
+                        "scope": "preset",
+                        "selector": { "kind": "exact", "key": "renderDistance" },
+                        "value": { "type": "integer", "minimum": 2, "maximum": 32 },
+                        "renamedFrom": []
+                    }]
+                }]
+            },
+            "presets": [preset("low"), preset("medium"), preset("high")]
+        })
+    }
+
+    #[test]
+    fn accepts_a_complete_signed_release_contract() {
+        let bytes = serde_json::to_vec(&manifest()).expect("fixture must serialize");
+        let release = ReleaseManifest::parse_and_validate(&bytes).expect("manifest must validate");
+        assert_eq!(
+            release.selected_preset(PresetId::High).unwrap().id,
+            PresetId::High
+        );
+    }
+
+    #[test]
+    fn preset_jvm_arguments_allow_tuning_but_not_launch_authority_overrides() {
+        let parse = |arguments: &[&str]| {
+            let mut value = manifest();
+            for preset in value["presets"].as_array_mut().unwrap() {
+                preset["jvm"]["extraArguments"] = serde_json::json!(arguments);
+            }
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&value).unwrap()).is_ok()
+        };
+
+        assert!(parse(&[
+            "-XX:+UseZGC",
+            "-XX:MaxGCPauseMillis=75",
+            "-XX:G1HeapRegionSize=16m",
+            "-XX:+ExitOnOutOfMemoryError",
+            "-Xlog:gc*=info",
+            "-Xverify:all",
+            "--enable-preview",
+            "--illegal-native-access=deny",
+            "-XX:-EnableDynamicAgentLoading",
+            "-XX:+DisableAttachMechanism",
+            "-Dfile.encoding=UTF-8",
+            "-Duser.language=ru",
+            "-Duser.country=RU",
+            "-Duser.timezone=Europe/Moscow",
+        ]));
+
+        for argument in [
+            "-Xms2G",
+            "-ms2G",
+            "-xMX4g",
+            "-mx4g",
+            "-XX:InitialHeapSize=1g",
+            "-XX:MaxHeapSize=8g",
+            "-XX:MaxRAMPercentage=99",
+            " -Xmx4G",
+            "\u{feff}-Xmx4G",
+            "\u{a0}-Xmx4G",
+            "evil.Main",
+            "evil.jar",
+            "--",
+            "-D",
+            "-d",
+            "-cp",
+            "-classpath=evil.jar",
+            "--class-path",
+            "-p=evil",
+            "--module-path=evil",
+            "--patch-module=java.base=evil.jar",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
+            "--enable-native-access=ALL-UNNAMED",
+            "-Djava.class.path=evil.jar",
+            "-Djava.library.path=evil",
+            "-Djava.home=evil",
+            "-Djava.io.tmpdir=evil",
+            "-Duser.home=evil",
+            "-Duser.dir=evil",
+            "-Duser.name=Impostor",
+            "-Dfragment.identity=Impostor",
+            "-Dminecraft.launcher.brand=Impostor",
+            "-DlibraryDirectory=evil",
+            "-Dlog4j.configurationFile=evil.xml",
+            "-Djna.tmpdir=evil",
+            "-Dorg.lwjgl.system.SharedLibraryExtractPath=evil",
+            "-Dio.netty.native.workdir=evil",
+            "-Djava.system.class.loader=evil.Loader",
+            "-Djdk.module.path=evil",
+            "-Dsun.boot.library.path=C:/evil",
+            "-Djava.nio.file.spi.DefaultFileSystemProvider=evil.Provider",
+            "-Djava.util.logging.config.class=evil.Hook",
+            "-Djava.util.logging.config.file=C:/evil.properties",
+            "-Djava.security.auth.login.config=C:/evil.conf",
+            "-Djavax.net.ssl.keyStore=C:/evil.p12",
+            "-Dorg.lwjgl.libname=C:/evil.dll",
+            "-Dorg.lwjgl.opencl.libname=C:/evil.dll",
+            "-Dorg.lwjgl.opengl.libname=C:/evil.dll",
+            "-Dorg.lwjgl.system.bundledLibrary.pathMapper=evil.Mapper",
+            "-Djava.homebrew=not-allowlisted",
+            "-Dloader.pathname=not-allowlisted",
+            "-javaagent:evil.jar",
+            "-agentlib:jdwp=transport=dt_socket,server=y",
+            "-Xrunjdwp:transport=dt_socket,server=y",
+            "-XX:+EnableDynamicAgentLoading",
+            "-XX:+StartAttachListener",
+            "-XX:-DisableAttachMechanism",
+            "@evil.args",
+            "-jar=evil.jar",
+            "--module=evil/main",
+            "--source=25",
+            "-XX:OnError=evil.exe",
+            "-XX:VMOptionsFile=evil.options",
+            "-XX:SharedArchiveFile=evil.jsa",
+            "-XX:InitialRAMFraction=1",
+            "-XX:MaxRAMFraction=1",
+            "-XX:MinRAMFraction=1",
+            "-XX:LogFile=C:/evil.log",
+            "-XX:ReplayDataFile=C:/evil.log",
+            "-XX:PerfDataSaveFile=C:/evil.log",
+            "-XX:JVMCILibPath=C:/evil",
+            "-XX:+UseJVMCINativeLibrary",
+            "-XX:JVMCINativeLibraryErrorFile=C:/evil.log",
+            "-XX:AllocateHeapAt=C:/outside",
+            "-XX:+ManagementServer",
+            "-XX:+PrintFlagsInitial",
+            "-XX:+UnlockDiagnosticVMOptions",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+IgnoreUnrecognizedVMOptions",
+            "-XX:",
+            "-XX:+",
+            "-XX:-EnableDynamicAgentLoading=1",
+            "-XX:+DisableAttachMechanism=0",
+            "--help-extra",
+            "-Xinternalversion",
+            "-fullversion",
+            "--full-version",
+            "-Xlog:gc:file=C:/evil.log",
+            "-Xloggc:C:/evil.log",
+            "-Xlog:gc:C:/evil.log",
+            "-Xlog:help",
+            "-noverify",
+            "-Xverify:none",
+            "-Xverify:remote",
+            "-XX:-BytecodeVerificationLocal",
+            "-XX:-BytecodeVerificationRemote",
+            "-XX:+UseG1GC -javaagent:evil.jar",
+        ] {
+            assert!(
+                !parse(&[argument]),
+                "forbidden JVM argument passed: {argument}"
+            );
+        }
+        assert!(!parse(&[
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+EnableJVMCI",
+            "-XX:JVMCILibPath=C:/evil",
+            "-XX:+UseJVMCINativeLibrary",
+        ]));
+    }
+
+    #[test]
+    fn release_file_topology_matches_materialization_and_aggregate_bounds() {
+        fn path_with_segments(count: usize) -> String {
+            let mut segments = (0..count - 1)
+                .map(|index| format!("d{index}"))
+                .collect::<Vec<_>>();
+            segments.push("file.jar".into());
+            segments.join("/")
+        }
+        let file = |segments| ManifestFile {
+            path: path_with_segments(segments),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+
+        assert!(validate_file_list(&[file(MAX_MANIFEST_PATH_COMPONENTS)], &[]).is_ok());
+        assert!(validate_file_list(&[file(MAX_MANIFEST_PATH_COMPONENTS + 1)], &[]).is_err());
+        let oversized_path = ManifestFile {
+            path: std::iter::repeat_n("a".repeat(220), 5)
+                .collect::<Vec<_>>()
+                .join("/"),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+        assert!(oversized_path.path.len() > MAX_MANIFEST_PATH_BYTES);
+        assert!(validate_file_list(&[oversized_path], &[]).is_err());
+        let oversized_component = ManifestFile {
+            path: "a".repeat(256),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+        assert!(validate_file_list(&[oversized_component], &[]).is_err());
+        let oversized_utf16_component = ManifestFile {
+            path: "😀".repeat(128),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+        assert_eq!(oversized_utf16_component.path.encode_utf16().count(), 256);
+        assert!(validate_file_list(&[oversized_utf16_component], &[]).is_err());
+        assert_eq!(
+            checked_release_path_component_total(
+                MAX_RELEASE_PATH_COMPONENTS - MAX_MANIFEST_PATH_COMPONENTS,
+                MAX_MANIFEST_PATH_COMPONENTS,
+            )
+            .unwrap(),
+            MAX_RELEASE_PATH_COMPONENTS
+        );
+        assert!(checked_release_path_component_total(MAX_RELEASE_PATH_COMPONENTS, 1).is_err());
+        assert!(checked_release_path_component_total(usize::MAX, 1).is_err());
+        assert_eq!(
+            checked_managed_release_file_bytes(
+                MAX_MANAGED_RELEASE_BYTES - MAX_MANAGED_FILE_BYTES,
+                MAX_MANAGED_FILE_BYTES,
+            )
+            .unwrap(),
+            MAX_MANAGED_RELEASE_BYTES
+        );
+        assert!(checked_managed_release_file_bytes(MAX_MANAGED_RELEASE_BYTES, 1).is_err());
+        let aggregate_oversized = (0..33)
+            .map(|index| ManifestFile {
+                path: format!("large/{index}.bin"),
+                size: MAX_MANAGED_FILE_BYTES,
+                sha256: "a".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_file_list(&aggregate_oversized, &[]).is_err());
+        assert!(validate_file_list(
+            &[ManifestFile {
+                path: "large.bin".into(),
+                size: MAX_MANAGED_FILE_BYTES + 1,
+                sha256: "a".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            }],
+            &[],
+        )
+        .is_err());
+        assert_eq!(
+            checked_projected_reconcile_mutations(MAX_FILES_PER_PRESET, 0).unwrap(),
+            MAX_RECONCILE_MUTATIONS
+        );
+        assert!(checked_projected_reconcile_mutations(MAX_FILES_PER_PRESET, 1).is_err());
+        assert!(checked_projected_reconcile_mutations(usize::MAX, usize::MAX).is_err());
+
+        assert!(validate_path_list(&["a".repeat(256)]).is_err());
+        let too_many_paths = (0..=MAX_RELEASE_MANAGED_PATHS)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>();
+        assert!(validate_path_list(&too_many_paths).is_err());
+    }
+
+    #[test]
+    fn reconcile_journal_projection_is_boundary_exact_and_unicode_conservative() {
+        fn file(path: String) -> ManifestFile {
+            ManifestFile {
+                path,
+                size: 1,
+                sha256: "a".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            }
+        }
+
+        let shallow_files = vec![file("root/file.jar".into())];
+        let shallow_parents = projected_reconcile_directories(&shallow_files, &[]);
+        let shallow_projection =
+            projected_worst_case_reconcile_plan_bytes(&shallow_files, &shallow_parents).unwrap();
+        assert!(
+            validate_projected_reconcile_plan_bytes(shallow_projection, shallow_projection).is_ok()
+        );
+        assert_eq!(
+            validate_projected_reconcile_plan_bytes(shallow_projection, shallow_projection - 1)
+                .unwrap_err(),
+            "Release preset worst-case reconcile journal exceeds the 64 MiB launcher limit"
+        );
+
+        let deep_path = (0..MAX_MANIFEST_PATH_COMPONENTS - 1)
+            .map(|index| format!("d{index}"))
+            .chain(std::iter::once("file.jar".into()))
+            .collect::<Vec<_>>()
+            .join("/");
+        let deep_files = vec![file(deep_path)];
+        let deep_parents = projected_reconcile_directories(&deep_files, &[]);
+        let deep_projection =
+            projected_worst_case_reconcile_plan_bytes(&deep_files, &deep_parents).unwrap();
+        assert!(deep_projection > shallow_projection);
+        assert_eq!(
+            validate_projected_reconcile_plan_bytes(deep_projection, deep_projection - 1)
+                .unwrap_err(),
+            "Release preset worst-case reconcile journal exceeds the 64 MiB launcher limit"
+        );
+
+        let uppercase_sharp_s = "\u{1e9e}".to_string();
+        let lowercase_sharp_s = "\u{00df}".to_string();
+        assert_eq!(path_key(&uppercase_sharp_s), lowercase_sharp_s);
+        assert!(uppercase_sharp_s.len() > lowercase_sharp_s.len());
+        let unicode_files = vec![
+            file(format!("{lowercase_sharp_s}/first.jar")),
+            file(format!("{uppercase_sharp_s}/second.jar")),
+        ];
+        let unicode_parents = projected_reconcile_directories(&unicode_files, &[]);
+        assert_eq!(
+            unicode_parents.get(&lowercase_sharp_s),
+            Some(&uppercase_sharp_s)
+        );
+
+        let strict_roots = (0..MAX_RELEASE_MANAGED_PATHS)
+            .map(|index| {
+                let first = format!("r{index:04}_{}", "a".repeat(214));
+                format!(
+                    "{first}/{}/{}/{}",
+                    "b".repeat(220),
+                    "c".repeat(220),
+                    "d".repeat(220)
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_path_list(&strict_roots).unwrap();
+        let strict_directories = projected_reconcile_directories(&shallow_files, &strict_roots);
+        assert_eq!(
+            strict_directories.len(),
+            MAX_RELEASE_MANAGED_PATHS * 4 + shallow_parents.len()
+        );
+        let strict_projection =
+            projected_worst_case_reconcile_plan_bytes(&shallow_files, &strict_directories).unwrap();
+        let added_ensure_bytes = strict_directories
+            .iter()
+            .filter(|(key, _)| !shallow_parents.contains_key(*key))
+            .map(|(_, path)| projected_ensure_directory_json_bytes(path).unwrap())
+            .sum::<u64>();
+        let added_directory_count =
+            u64::try_from(strict_directories.len() - shallow_parents.len()).unwrap();
+        assert_eq!(
+            strict_projection - shallow_projection,
+            added_ensure_bytes + added_directory_count
+        );
+        assert!(validate_file_list(&shallow_files, &strict_roots).is_ok());
+
+        let maximum_path_array_bytes = 2_u64
+            + u64::try_from(MAX_RELEASE_MANAGED_PATHS).unwrap()
+                * u64::try_from(MAX_MANIFEST_PATH_BYTES + 2).unwrap()
+            + u64::try_from(MAX_RELEASE_MANAGED_PATHS - 1).unwrap();
+        assert!(maximum_path_array_bytes * 2 < RECONCILE_PLAN_ENVELOPE_RESERVE_BYTES);
+    }
+
+    #[test]
+    fn rejects_case_folded_integrity_bypasses_and_mutable_mods() {
+        let mut strict_preserved = manifest();
+        strict_preserved["integrity"]["preservedPaths"] = serde_json::json!(["Config/custom"]);
+        assert!(ReleaseManifest::parse_and_validate(
+            &serde_json::to_vec(&strict_preserved).unwrap()
+        )
+        .is_err());
+
+        let mut mutable_guard = manifest();
+        mutable_guard["integrity"]["mutableSettings"][0]["path"] =
+            serde_json::json!("MODS/fragment-launch-guard.jar");
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&mutable_guard).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn binds_mutable_defaults_to_exact_policy_path_and_max_bytes() {
+        let mut at_limit = manifest();
+        for preset in at_limit["presets"].as_array_mut().unwrap() {
+            preset["files"][1]["size"] = serde_json::json!(4096);
+        }
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&at_limit).unwrap()).is_ok()
+        );
+
+        let mut oversized = manifest();
+        for preset in oversized["presets"].as_array_mut().unwrap() {
+            preset["files"][1]["size"] = serde_json::json!(4097);
+        }
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&oversized).unwrap()).is_err()
+        );
+
+        let mut wrong_case = manifest();
+        for preset in wrong_case["presets"].as_array_mut().unwrap() {
+            preset["files"][1]["path"] = serde_json::json!("OPTIONS.TXT");
+        }
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&wrong_case).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_unknown_optional_fields_and_rejects_runtime_target_mismatch() {
+        let mut unknown = manifest();
+        unknown["futureTopLevel"] = serde_json::json!({ "enabled": true });
+        unknown["project"]["tagline"] = serde_json::json!("future optional project metadata");
+        unknown["release"]["fallbackUrl"] = serde_json::json!("https://evil.invalid");
+        unknown["runtime"]["loader"]["mirrorUrls"] = serde_json::json!([]);
+        unknown["runtime"]["java"]["vendorHint"] = serde_json::json!("future vendor metadata");
+        unknown["runtime"]["java"]["archive"]["format"] = serde_json::json!("zip");
+        unknown["runtime"]["game"]["publisherHint"] = serde_json::json!("future metadata");
+        unknown["integrity"]["repairPolicy"] = serde_json::json!("future-policy");
+        unknown["integrity"]["mutableSettings"][0]["futureValidatorOption"] =
+            serde_json::json!(true);
+        unknown["integrity"]["mutableSettings"][0]["fields"][0]["description"] =
+            serde_json::json!("future field metadata");
+        unknown["integrity"]["mutableSettings"][0]["fields"][0]["selector"]["caseSensitive"] =
+            serde_json::json!(true);
+        unknown["integrity"]["mutableSettings"][0]["fields"][0]["value"]["step"] =
+            serde_json::json!(1);
+        unknown["presets"][0]["icon"] = serde_json::json!("low");
+        unknown["presets"][0]["jvm"]["gcPolicy"] = serde_json::json!("future-default");
+        unknown["presets"][0]["files"][0]["downloadHint"] = serde_json::json!("future-hint");
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&unknown).unwrap()).is_ok()
+        );
+
+        let mut mismatch = manifest();
+        mismatch["runtime"]["java"]["runtimeLockSha256"] = serde_json::json!("e".repeat(64));
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&mismatch).unwrap()).is_err()
+        );
+
+        let mut game_mismatch = manifest();
+        game_mismatch["runtime"]["game"]["runtimeLockSha256"] = serde_json::json!("e".repeat(64));
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&game_mismatch).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_schema_enum_and_discriminator_values() {
+        let mut unknown_schema = manifest();
+        unknown_schema["schemaVersion"] = serde_json::json!(2);
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&unknown_schema).unwrap())
+                .is_err()
+        );
+
+        let mut unknown_preset = manifest();
+        unknown_preset["presets"][0]["id"] = serde_json::json!("ultra");
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&unknown_preset).unwrap())
+                .is_err()
+        );
+
+        let mut unknown_policy = manifest();
+        unknown_policy["presets"][0]["files"][0]["policy"] = serde_json::json!("generated");
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&unknown_policy).unwrap())
+                .is_err()
+        );
+
+        let mut unknown_validator = manifest();
+        unknown_validator["integrity"]["mutableSettings"][0]["validator"] =
+            serde_json::json!("future-validator-v2");
+        assert!(ReleaseManifest::parse_and_validate(
+            &serde_json::to_vec(&unknown_validator).unwrap()
+        )
+        .is_err());
+
+        let mut unknown_selector = manifest();
+        unknown_selector["integrity"]["mutableSettings"][0]["fields"][0]["selector"]["kind"] =
+            serde_json::json!("glob");
+        assert!(ReleaseManifest::parse_and_validate(
+            &serde_json::to_vec(&unknown_selector).unwrap()
+        )
+        .is_err());
+
+        let mut unknown_value_rule = manifest();
+        unknown_value_rule["integrity"]["mutableSettings"][0]["fields"][0]["value"]["type"] =
+            serde_json::json!("vector");
+        assert!(ReleaseManifest::parse_and_validate(
+            &serde_json::to_vec(&unknown_value_rule).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn current_pointer_is_bound_to_channel_release_and_target() {
+        let mut current = serde_json::json!({
+            "schemaVersion": 1,
+            "channel": "dev",
+            "releaseId": "rel_aaaaaaaaaaaaaaaaaaaaaaaa",
+            "manifestTarget": "release-rel_aaaaaaaaaaaaaaaaaaaaaaaa.json"
+        });
+        current["futureOptionalField"] = serde_json::json!(true);
+        let bytes = serde_json::to_vec(&current).unwrap();
+        assert!(CurrentPointer::parse_and_validate(&bytes, BuildChannel::Dev).is_ok());
+        assert!(CurrentPointer::parse_and_validate(&bytes, BuildChannel::Stable).is_err());
+
+        current["schemaVersion"] = serde_json::json!(2);
+        let bytes = serde_json::to_vec(&current).unwrap();
+        assert!(CurrentPointer::parse_and_validate(&bytes, BuildChannel::Dev).is_err());
+
+        current["schemaVersion"] = serde_json::json!(1);
+        current["channel"] = serde_json::json!("canary");
+        let bytes = serde_json::to_vec(&current).unwrap();
+        assert!(CurrentPointer::parse_and_validate(&bytes, BuildChannel::Dev).is_err());
+    }
+
+    #[test]
+    fn validates_https_urls_without_credentials() {
+        assert!(is_https_url("https://fragmc.ru/api/spark2/"));
+        assert!(!is_https_url("http://fragmc.ru/api/spark2/"));
+        assert!(!is_https_url("https://user:pass@fragmc.ru/api/spark2/"));
+    }
+}

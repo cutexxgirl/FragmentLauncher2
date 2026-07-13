@@ -1,40 +1,251 @@
 <script lang="ts">
-	import { Download, Minus, Play, Settings, Sparkles, Square, X } from '@lucide/svelte';
-	import { browser } from '$app/environment';
+	import '$lib/styles/launcher.css';
+	import { Gamepad2 } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { LogicalSize } from '@tauri-apps/api/dpi';
-	import { getLauncherStatus, type LauncherStatus } from '$lib/launcher';
+	import { open } from '@tauri-apps/plugin-dialog';
+	import {
+		beginNativeTelegramLogin,
+		discardLegacyWebviewAuthSession,
+		logoutNativeAuth,
+		pollNativeTelegramLogin,
+		refreshNativeProfile,
+		restoreNativeAuth,
+		updateNativeNickname,
+		type AuthSnapshot,
+		type LauncherProfile,
+	} from '$lib/native-auth';
+	import {
+		acceptsObservedOperationStatus,
+		buildOperationStatusFingerprint,
+		cancelBuildOperation,
+		getLauncherStatus,
+		getBuildStatus,
+		getTgWsProxyStatus,
+		isPendingBuildInspection,
+		installTgWsProxy,
+		setBuildInstallDirectory,
+		startBuildOperation,
+		startGame,
+		type BuildChannel,
+		type BuildStatus,
+		type ObservedBuildOperationStatus,
+		type TgWsProxyStatus,
+	} from '$lib/launcher';
+	import {
+		createBuildProfiles,
+		feedImages,
+		feedItems,
+		presets,
+		type BuildProfile,
+		type PresetId,
+		type SectionId,
+	} from '$lib/launcher-ui';
+	import AuthGate from '$lib/components/launcher/AuthGate.svelte';
+	import BootScreen from '$lib/components/launcher/BootScreen.svelte';
+	import HomeSection from '$lib/components/launcher/HomeSection.svelte';
+	import LauncherSettingsWindow from '$lib/components/launcher/LauncherSettingsWindow.svelte';
+	import MobileNav from '$lib/components/launcher/MobileNav.svelte';
+	import ProfileWindow from '$lib/components/launcher/ProfileWindow.svelte';
+	import SettingsWindow from '$lib/components/launcher/SettingsWindow.svelte';
+	import Sidebar from '$lib/components/launcher/Sidebar.svelte';
+	import StatsWindow from '$lib/components/launcher/StatsWindow.svelte';
+	import SupportWindow from '$lib/components/launcher/SupportWindow.svelte';
+	import TelegramHelpWindow from '$lib/components/launcher/TelegramHelpWindow.svelte';
+	import TitleBar from '$lib/components/launcher/TitleBar.svelte';
 
-	type ResizeDirection =
-		| 'East'
-		| 'North'
-		| 'NorthEast'
-		| 'NorthWest'
-		| 'South'
-		| 'SouthEast'
-		| 'SouthWest'
-		| 'West';
 	type BootPhase = 'boot' | 'expanding' | 'reveal' | 'ready';
+	type AuthState = 'checking' | 'signed-out' | 'waiting' | 'signed-in' | 'error';
 
-	let status = $state<LauncherStatus>({
-		appName: 'Fragment Launcher',
-		version: '1.0.0',
-		profile: 'singleplayer',
-		servicesConnected: false,
-		updaterReady: true
-	});
+	const FIXED_WINDOW_SIZE = new LogicalSize(1244, 764);
+
 	let bootProgress = $state(0.08);
 	let bootLabel = $state('Поднимаем оболочку');
 	let bootPhase = $state<BootPhase>('boot');
+	let activeSection = $state<SectionId>('home');
+	let selectedBuildId = $state('fragment-stable');
+	let nickname = $state('');
+	let nicknameSaveMessage = $state('');
+	let nicknameSaving = $state(false);
+	let supportTopic = $state('');
+	let supportDescription = $state('');
+	let attachCrashReport = $state(true);
+	let attachLastLog = $state(true);
+	let attachLastScreenshot = $state(false);
+	let settingsVisible = $state(false);
+	let launcherSettingsVisible = $state(false);
+	let supportVisible = $state(false);
+	let profileVisible = $state(false);
+	let statsVisible = $state(false);
+	let supportSent = $state(false);
+	let launcherVersion = $state('1.0.0');
+	let anonymizeAnalytics = $state(true);
+	let includeDiagnosticsInSupport = $state(false);
+	let appWindow = $state<ReturnType<typeof getCurrentWindow> | null>(null);
+	let authSnapshot = $state<AuthSnapshot | null>(null);
+	let authState = $state<AuthState>('checking');
+	let showTelegramHelpPill = $state(false);
+	let telegramHelpVisible = $state(false);
+	let tgWsProxyStatus = $state<TgWsProxyStatus | null>(null);
+	let tgWsProxyBusy = $state(false);
+	let tgWsProxyMessage = $state('');
+	let loginPollTimer: number | null = null;
+	let telegramHelpTimer: number | null = null;
+	let authProfileRefreshTimer: number | null = null;
+	let authProfileRefreshPending = false;
+	let buildStatusPollTimer: number | null = null;
+	let buildOperationCancelPending = $state(false);
+	let buildOperationStartPending = $state(false);
+	let buildInstallDirectorySelectionPending = $state(false);
+	const BUILD_INSPECTION_POLL_INTERVAL_MS = 500;
+	const BUILD_INSPECTION_POLL_LIMIT = 240;
+	const AUTH_PROFILE_REFRESH_INTERVAL_MS = 60_000;
+
+	let builds = $state<BuildProfile[]>(createBuildProfiles());
+	let buildStatusRequestGeneration = 0;
+	let activeBuildOperation = $state<{
+		operationId: string;
+		requestGeneration: number;
+		channel: BuildChannel;
+		preset: PresetId;
+		revision: number;
+	} | null>(null);
+	const observedBuildOperationRevisions = new Map<string, ObservedBuildOperationStatus>();
+	const terminalBuildOperations = new Map<string, number>();
+	let buildStatus = $state<BuildStatus>({
+		operationId: null,
+		revision: 0,
+		channel: 'stable',
+		preset: 'medium',
+		phase: 'checking',
+		primaryAction: 'busy',
+		installDirectory: null,
+		installedReleaseId: null,
+		availableReleaseId: null,
+		message: 'Проверяем состояние сборки…',
+		operationActive: false,
+		progress: {
+			currentFile: null,
+			downloadedBytes: 0,
+			totalBytes: 0,
+			speedBytesPerSecond: 0,
+			remainingBytes: 0,
+			diskFreeBytes: 0,
+			diskRequiredBytes: 0,
+		},
+	});
+
 	let bootVisible = $derived(bootPhase !== 'ready');
 	let launcherVisible = $derived(bootPhase === 'reveal' || bootPhase === 'ready');
+	let userIsSignedIn = $derived(
+		authState === 'signed-in' && authSnapshot?.authenticated === true && authSnapshot.profile !== null,
+	);
+	let appVisible = $derived(launcherVisible && userIsSignedIn);
+	let authGateVisible = $derived(launcherVisible && !userIsSignedIn);
+	let activeBuild = $derived(builds.find((build) => build.id === selectedBuildId) ?? builds[0]);
+	let activeChannel = $derived<BuildChannel>(activeBuild.channel);
+	let hasActiveSubscription = $derived(authSnapshot?.profile?.entitlement.active ?? false);
+	let subscriptionName = $derived(
+		({
+			none: 'Нет доступа',
+			novice: 'Новичок',
+			legend: 'Легенда',
+			spark: 'Искра',
+		})[authSnapshot?.profile?.entitlement.level ?? 'none'],
+	);
+	let hasDevAccess = $derived(
+		authSnapshot?.profile?.launcherPermissions?.includes('launcher.channel.dev') ?? false,
+	);
+	let visibleBuilds = $derived(builds.filter((build) => build.channel === 'stable' || hasDevAccess));
+	let availableBuildsCount = $derived(
+		builds.filter(
+			(build) =>
+				hasActiveSubscription && (build.channel === 'stable' || (build.channel === 'dev' && hasDevAccess)),
+		).length,
+	);
+	let telegramAccount = $derived(formatTelegramAccount(authSnapshot?.profile ?? undefined));
+	let telegramAvatarUrl = $derived(resolveTelegramAvatarUrl(authSnapshot?.profile ?? undefined));
+	let savedLauncherNick = $derived(authSnapshot?.profile?.launcherNick ?? '');
+	let nicknameDirty = $derived(normalizeLauncherNickname(nickname) !== savedLauncherNick);
+	let supportReady = $derived(
+		supportTopic.trim().length > 2 && supportDescription.trim().length > 12,
+	);
 
-	const appWindow = browser ? getCurrentWindow() : null;
-
-	onMount(async () => {
-		await runBootSequence();
+	$effect(() => {
+		if (!visibleBuilds.some((build) => build.id === selectedBuildId)) {
+			if (activeBuildOperation || buildOperationStartPending) return;
+			invalidateBuildStatusRequests();
+			stopBuildStatusPolling(true);
+			selectedBuildId = 'fragment-stable';
+			window.setTimeout(() => void refreshBuildStatus(), 0);
+		}
 	});
+
+	$effect(() => {
+		if (authState === 'signed-in') {
+			authSnapshot?.profile?.entitlement.active;
+			authSnapshot?.profile?.launcherPermissions;
+			void refreshBuildStatus();
+		}
+	});
+
+	const navigation = [
+		{ id: 'home', label: 'Главная', mobileLabel: 'Главная', icon: Gamepad2 },
+	] satisfies Array<{ id: SectionId; label: string; mobileLabel: string; icon: typeof Gamepad2 }>;
+
+	onMount(() => {
+		discardLegacyWebviewAuthSession();
+		if ('__TAURI_INTERNALS__' in window) {
+			appWindow = getCurrentWindow();
+			void configureFixedWindow();
+		}
+
+		void restoreAuthSession();
+		void refreshBuildStatus();
+		void runBootSequence();
+		window.addEventListener('focus', refreshProfileOnFocus);
+		document.addEventListener('visibilitychange', refreshProfileWhenVisible);
+		authProfileRefreshTimer = window.setInterval(() => {
+			void refreshSignedInProfile();
+		}, AUTH_PROFILE_REFRESH_INTERVAL_MS);
+
+		return () => {
+			stopLoginPolling();
+			stopTelegramHelpTimer();
+			invalidateBuildStatusRequests();
+			stopBuildStatusPolling(true);
+			window.removeEventListener('focus', refreshProfileOnFocus);
+			document.removeEventListener('visibilitychange', refreshProfileWhenVisible);
+			if (authProfileRefreshTimer !== null) {
+				window.clearInterval(authProfileRefreshTimer);
+				authProfileRefreshTimer = null;
+			}
+		};
+	});
+
+	async function configureFixedWindow() {
+		if (!appWindow) {
+			return;
+		}
+
+		const windowTasks = [
+			() => appWindow?.setSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setMinSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setMaxSize(FIXED_WINDOW_SIZE),
+			() => appWindow?.setResizable(false),
+			() => appWindow?.setMaximizable(false),
+			() => appWindow?.center(),
+		];
+
+		for (const task of windowTasks) {
+			try {
+				await task();
+			} catch (error) {
+				console.warn('Window configuration step failed', error);
+			}
+		}
+	}
 
 	function setBootStep(progress: number, label: string) {
 		bootProgress = progress;
@@ -49,18 +260,17 @@
 		setBootStep(0.18, 'Готовим интерфейс');
 		await delay(80);
 
-		setBootStep(0.46, 'Подключаем локальный бекенд');
-		status = await getLauncherStatus();
+		setBootStep(0.46, 'Подключаем локальный бэкенд');
+		const launcherStatus = await getLauncherStatus();
+		launcherVersion = launcherStatus.version;
 		await delay(80);
 
 		setBootStep(0.68, 'Проверяем профиль сборки');
-		await appWindow?.setMinSize(new LogicalSize(520, 320));
 		await delay(80);
 
 		setBootStep(0.84, 'Разворачиваем лаунчер');
 		bootPhase = 'expanding';
 		await delay(620);
-		await appWindow?.setMinSize(new LogicalSize(1100, 680));
 
 		setBootStep(1, 'Готово');
 		await delay(80);
@@ -69,12 +279,728 @@
 		bootPhase = 'ready';
 	}
 
-	async function minimize() {
-		await appWindow?.minimize();
+	async function restoreAuthSession() {
+		authState = 'checking';
+		try {
+			const restored = await restoreNativeAuth();
+			authSnapshot = restored;
+			if (restored.authenticated && restored.profile) {
+				syncNicknameFromProfile(restored.profile);
+				authState = 'signed-in';
+				resetTelegramHelpPill();
+				telegramHelpVisible = false;
+			} else {
+				authState = 'signed-out';
+			}
+		} catch (error) {
+			console.warn('Native auth restore failed', error);
+			authSnapshot = null;
+			authState = 'error';
+		}
 	}
 
-	async function toggleMaximize() {
-		await appWindow?.toggleMaximize();
+	function refreshProfileOnFocus() {
+		void refreshSignedInProfile();
+	}
+
+	function refreshProfileWhenVisible() {
+		if (document.visibilityState === 'visible') {
+			void refreshSignedInProfile();
+		}
+	}
+
+	async function refreshSignedInProfile() {
+		if (authState !== 'signed-in' || authProfileRefreshPending) return;
+		authProfileRefreshPending = true;
+		const preserveNicknameDraft = nicknameDirty;
+		try {
+			const refreshed = await refreshNativeProfile();
+			if (!refreshed.authenticated || !refreshed.profile) {
+				authSnapshot = null;
+				authState = 'signed-out';
+				invalidateBuildStatusRequests();
+				stopBuildStatusPolling(true);
+				return;
+			}
+			authSnapshot = refreshed;
+			if (!preserveNicknameDraft) {
+				syncNicknameFromProfile(refreshed.profile);
+			}
+		} catch (error) {
+			console.warn('Native profile refresh failed', error);
+		} finally {
+			authProfileRefreshPending = false;
+		}
+	}
+
+	async function loginWithTelegram() {
+		if (authState === 'checking' || authState === 'waiting') {
+			return;
+		}
+
+		stopLoginPolling();
+		showTelegramHelpPill = false;
+		authState = 'waiting';
+		scheduleTelegramHelpPill();
+
+		try {
+			const challenge = await beginNativeTelegramLogin();
+			void pollLoginChallenge(challenge.expiresAt);
+		} catch (error) {
+			console.warn('Telegram login failed', error);
+			stopTelegramHelpTimer();
+			showTelegramHelpPill = true;
+			authState = 'error';
+		}
+	}
+
+	async function pollLoginChallenge(expiresAt: string) {
+		if (authState !== 'waiting') {
+			return;
+		}
+
+		if (Date.now() > new Date(expiresAt).getTime()) {
+			authState = 'error';
+			return;
+		}
+
+		try {
+			const result = await pollNativeTelegramLogin();
+			if (result.status === 'confirmed') {
+				authSnapshot = result.auth;
+				if (!result.auth.authenticated || !result.auth.profile) {
+					authState = 'signed-out';
+					return;
+				}
+				syncNicknameFromProfile(result.auth.profile);
+				authState = 'signed-in';
+				resetTelegramHelpPill();
+				telegramHelpVisible = false;
+				return;
+			}
+
+			if (result.status === 'expired' || result.status === 'consumed') {
+				stopTelegramHelpTimer();
+				showTelegramHelpPill = true;
+				authState = 'error';
+				return;
+			}
+		} catch (error) {
+			console.warn('Telegram login poll failed', error);
+			stopTelegramHelpTimer();
+			showTelegramHelpPill = true;
+			authState = 'error';
+			return;
+		}
+
+		loginPollTimer = window.setTimeout(() => {
+			void pollLoginChallenge(expiresAt);
+		}, 1800);
+	}
+
+	async function logoutFromTelegram() {
+		stopLoginPolling();
+		nicknameSaveMessage = 'Завершаем сессию…';
+		try {
+			const signedOut = await logoutNativeAuth();
+			if (signedOut.authenticated) {
+				throw new Error('Native auth did not confirm logout');
+			}
+			authSnapshot = null;
+			authState = 'signed-out';
+			nickname = '';
+			nicknameSaveMessage = '';
+			resetTelegramHelpPill();
+			telegramHelpVisible = false;
+			settingsVisible = false;
+			launcherSettingsVisible = false;
+			supportVisible = false;
+			profileVisible = false;
+			statsVisible = false;
+			activeSection = 'home';
+			invalidateBuildStatusRequests();
+			stopBuildStatusPolling(true);
+		} catch (error) {
+			console.warn('Native logout was not completed', error);
+			nicknameSaveMessage = 'Не удалось безопасно выйти. Повторите попытку.';
+		}
+	}
+
+	function stopLoginPolling() {
+		if (loginPollTimer) {
+			window.clearTimeout(loginPollTimer);
+			loginPollTimer = null;
+		}
+	}
+
+	function scheduleTelegramHelpPill() {
+		stopTelegramHelpTimer();
+
+		telegramHelpTimer = window.setTimeout(() => {
+			if (authState === 'waiting') {
+				showTelegramHelpPill = true;
+			}
+
+			telegramHelpTimer = null;
+		}, 7000);
+	}
+
+	function stopTelegramHelpTimer() {
+		if (telegramHelpTimer) {
+			window.clearTimeout(telegramHelpTimer);
+			telegramHelpTimer = null;
+		}
+	}
+
+	function resetTelegramHelpPill() {
+		stopTelegramHelpTimer();
+		showTelegramHelpPill = false;
+	}
+
+	async function openTelegramHelp() {
+		telegramHelpVisible = true;
+		await refreshTgWsProxyStatus();
+	}
+
+	async function refreshTgWsProxyStatus() {
+		tgWsProxyStatus = await getTgWsProxyStatus();
+		tgWsProxyMessage = tgWsProxyStatus.running
+			? 'TG WS Proxy работает. Подтвердите прокси в Telegram и повторите вход.'
+			: tgWsProxyStatus.message;
+	}
+
+	async function installTelegramProxy() {
+		if (tgWsProxyBusy) {
+			return;
+		}
+
+		tgWsProxyBusy = true;
+		tgWsProxyMessage = 'Скачиваем TG WS Proxy';
+
+		try {
+			tgWsProxyStatus = await installTgWsProxy();
+			tgWsProxyMessage = tgWsProxyStatus.running
+				? 'TG WS Proxy работает. Подтвердите прокси в Telegram и повторите вход.'
+				: tgWsProxyStatus.message;
+		} catch (error) {
+			tgWsProxyMessage = error instanceof Error ? error.message : 'Не удалось установить TG WS Proxy';
+		} finally {
+			tgWsProxyBusy = false;
+		}
+	}
+
+	function syncNicknameFromProfile(profile: LauncherProfile) {
+		nickname = profile.launcherNick ?? '';
+		nicknameSaveMessage = '';
+	}
+
+	function normalizeLauncherNickname(value: string) {
+		return value.trim().replace(/[^a-zA-Z0-9_]/g, '').slice(0, 16);
+	}
+
+	async function saveLauncherNickname() {
+		const currentProfile = authSnapshot?.profile;
+		if (!currentProfile || nicknameSaving) {
+			return;
+		}
+
+		const nextNickname = normalizeLauncherNickname(nickname);
+		nickname = nextNickname;
+
+		if (nextNickname === (currentProfile.launcherNick ?? '')) {
+			nicknameSaveMessage = '';
+			return;
+		}
+
+		nicknameSaving = true;
+		nicknameSaveMessage = '';
+
+		try {
+			const updated = await updateNativeNickname(nextNickname || null);
+			authSnapshot = updated;
+			if (!updated.authenticated || !updated.profile) {
+				authState = 'signed-out';
+				return;
+			}
+			const profile = updated.profile;
+			syncNicknameFromProfile(profile);
+			nicknameSaveMessage = profile.launcherNick ? 'Ник сохранён' : 'Ник очищен';
+		} catch (error) {
+			nicknameSaveMessage = error instanceof Error ? error.message : 'Не удалось сохранить ник';
+		} finally {
+			nicknameSaving = false;
+		}
+	}
+
+	function selectBuild(buildId: string) {
+		const build = visibleBuilds.find((candidate) => candidate.id === buildId);
+		if (!build) return;
+		if (activeBuildOperation || buildOperationStartPending) return;
+		if (build.id === selectedBuildId) return;
+		invalidateBuildStatusRequests();
+		stopBuildStatusPolling(true);
+		selectedBuildId = buildId;
+		window.setTimeout(() => void refreshBuildStatus(), 0);
+	}
+
+	function openSection(section: SectionId) {
+		if (section === 'support') {
+			supportVisible = true;
+			return;
+		}
+
+		if (section === 'profile') {
+			profileVisible = true;
+			return;
+		}
+
+		activeSection = section;
+	}
+
+	function closeProfileWindow() {
+		profileVisible = false;
+		nicknameSaveMessage = '';
+	}
+
+	function setPreset(presetId: PresetId) {
+		if (activeBuildOperation || buildOperationStartPending) return;
+		if (activeBuild.preset === presetId) return;
+		invalidateBuildStatusRequests();
+		stopBuildStatusPolling(true);
+		activeBuild.preset = presetId;
+
+		void refreshBuildStatus();
+	}
+
+	async function refreshBuildStatus() {
+		if (!(typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window)) return;
+		if (buildOperationStartPending) return;
+		if (
+			activeBuildOperation?.channel === activeChannel &&
+			activeBuildOperation.preset === activeBuild.preset
+		) {
+			return;
+		}
+		const requestGeneration = ++buildStatusRequestGeneration;
+		const channel = activeChannel;
+		const preset = activeBuild.preset;
+		try {
+			const localStatus = await getBuildStatus(channel, preset);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return;
+			if (localStatus.operationActive && localStatus.operationId) {
+				scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+			} else if (isPendingBuildInspection(localStatus)) {
+				scheduleBuildInspectionPoll(requestGeneration, channel, preset, 0);
+			}
+		} catch (error) {
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				error instanceof Error ? error.message : 'Не удалось проверить сборку.',
+			);
+		}
+	}
+
+	async function chooseInstallDirectory(forBuildStart = false) {
+		if (
+			activeBuildOperation ||
+			(buildOperationStartPending && !forBuildStart) ||
+			buildInstallDirectorySelectionPending
+		) {
+			return false;
+		}
+		buildInstallDirectorySelectionPending = true;
+		const channel = activeChannel;
+		const preset = activeBuild.preset;
+		try {
+			const selected = await open({ directory: true, multiple: false, title: 'Папка Fragment' });
+			if (typeof selected !== 'string') return false;
+			if (forBuildStart && !buildOperationStartPending) return false;
+			if (channel !== activeChannel || preset !== activeBuild.preset) return false;
+			const requestGeneration = ++buildStatusRequestGeneration;
+			const localStatus = await setBuildInstallDirectory(selected, channel, preset);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return false;
+			return true;
+		} catch (error) {
+			if (channel !== activeChannel || preset !== activeBuild.preset) return false;
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				error instanceof Error ? error.message : 'Не удалось выбрать папку Fragment.',
+			);
+			return false;
+		} finally {
+			buildInstallDirectorySelectionPending = false;
+		}
+	}
+
+	function applyBuildStatus(
+		localStatus: BuildStatus,
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+		expectedOperationId?: string,
+	) {
+		if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return false;
+		if (localStatus.channel !== channel || localStatus.preset !== preset) return false;
+		if (!Number.isSafeInteger(localStatus.revision) || localStatus.revision < 0) return false;
+		if (localStatus.operationActive && !localStatus.operationId) return false;
+
+		const active = activeBuildOperation;
+		if (expectedOperationId && localStatus.operationId !== expectedOperationId) {
+			return false;
+		}
+		const correlatedOperationId = localStatus.operationId ?? undefined;
+		if (correlatedOperationId) {
+			const terminalRevision = terminalBuildOperations.get(correlatedOperationId);
+			if (terminalRevision !== undefined && localStatus.operationActive) return false;
+			const observed = observedBuildOperationRevisions.get(correlatedOperationId);
+			if (!acceptsObservedOperationStatus(localStatus, observed)) return false;
+		}
+
+		if (active) {
+			if (correlatedOperationId !== active.operationId) return false;
+			if (localStatus.revision < active.revision) return false;
+		}
+
+		buildStatus = localStatus;
+		if (correlatedOperationId) {
+			rememberObservedOperationStatus(correlatedOperationId, localStatus);
+			if (!localStatus.operationActive) {
+				rememberOperationRevision(
+					terminalBuildOperations,
+					correlatedOperationId,
+					localStatus.revision,
+				);
+			}
+		}
+		if (localStatus.operationActive && localStatus.operationId) {
+			activeBuildOperation = {
+				operationId: localStatus.operationId,
+				requestGeneration,
+				channel,
+				preset,
+				revision: localStatus.revision,
+			};
+		} else if (active && correlatedOperationId === active.operationId) {
+			stopBuildStatusPolling(true);
+		}
+		return true;
+	}
+
+	function rememberObservedOperationStatus(operationId: string, status: BuildStatus) {
+		observedBuildOperationRevisions.set(operationId, {
+			revision: status.revision,
+			fingerprint: buildOperationStatusFingerprint(status),
+		});
+		trimOperationMap(observedBuildOperationRevisions);
+	}
+
+	function rememberOperationRevision(target: Map<string, number>, operationId: string, revision: number) {
+		target.set(operationId, revision);
+		trimOperationMap(target);
+	}
+
+	function trimOperationMap<T>(target: Map<string, T>) {
+		if (target.size <= 32) return;
+		const oldestOperationId = target.keys().next().value;
+		if (typeof oldestOperationId === 'string') target.delete(oldestOperationId);
+	}
+
+	function invalidateBuildStatusRequests() {
+		buildStatusRequestGeneration += 1;
+	}
+
+	function clearBuildStatusPollTimer() {
+		if (buildStatusPollTimer !== null) {
+			window.clearTimeout(buildStatusPollTimer);
+			buildStatusPollTimer = null;
+		}
+	}
+
+	function stopBuildStatusPolling(clearOperation: boolean) {
+		clearBuildStatusPollTimer();
+		if (clearOperation) {
+			activeBuildOperation = null;
+			buildOperationCancelPending = false;
+			buildOperationStartPending = false;
+		}
+	}
+
+	function scheduleBuildInspectionPoll(
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+		attempt: number,
+	) {
+		clearBuildStatusPollTimer();
+		buildStatusPollTimer = window.setTimeout(() => {
+			buildStatusPollTimer = null;
+			void pollBuildInspection(requestGeneration, channel, preset, attempt);
+		}, BUILD_INSPECTION_POLL_INTERVAL_MS);
+	}
+
+	async function pollBuildInspection(
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+		attempt: number,
+	) {
+		if (!isCurrentBuildRequest(requestGeneration, channel, preset) || activeBuildOperation) return;
+		if (attempt >= BUILD_INSPECTION_POLL_LIMIT) {
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				'Проверка сборки не завершилась вовремя. Нажмите «Повторить проверку».',
+			);
+			return;
+		}
+
+		try {
+			const localStatus = await getBuildStatus(channel, preset);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return;
+			if (localStatus.operationActive && localStatus.operationId) {
+				scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+			} else if (isPendingBuildInspection(localStatus)) {
+				scheduleBuildInspectionPoll(requestGeneration, channel, preset, attempt + 1);
+			}
+		} catch (error) {
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			console.warn('Build inspection poll failed', error);
+			scheduleBuildInspectionPoll(requestGeneration, channel, preset, attempt + 1);
+		}
+	}
+
+	function scheduleBuildStatusPoll(
+		operationId: string,
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+	) {
+		clearBuildStatusPollTimer();
+		buildStatusPollTimer = window.setTimeout(() => {
+			buildStatusPollTimer = null;
+			void pollBuildStatus(operationId, requestGeneration, channel, preset);
+		}, 500);
+	}
+
+	async function pollBuildStatus(
+		operationId: string,
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+	) {
+		const active = activeBuildOperation;
+		if (
+			!active ||
+			active.operationId !== operationId ||
+			active.requestGeneration !== requestGeneration ||
+			!isCurrentBuildRequest(requestGeneration, channel, preset)
+		) {
+			return;
+		}
+
+		try {
+			const localStatus = await getBuildStatus(channel, preset, operationId);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset, operationId)) return;
+		} catch (error) {
+			console.warn('Build status poll failed', error);
+		}
+
+		if (
+			activeBuildOperation?.operationId === operationId &&
+			activeBuildOperation.requestGeneration === requestGeneration
+		) {
+			scheduleBuildStatusPoll(operationId, requestGeneration, channel, preset);
+		}
+	}
+
+	async function startCurrentBuildOperation() {
+		if (activeBuildOperation || !buildOperationStartPending) return;
+		const channel = activeChannel;
+		const preset = activeBuild.preset;
+		const requestGeneration = ++buildStatusRequestGeneration;
+		stopBuildStatusPolling(true);
+		buildOperationStartPending = true;
+		buildStatus = {
+			...buildStatus,
+			primaryAction: 'busy',
+			message: 'Подготавливаем операцию сборки…',
+			operationActive: false,
+		};
+
+		try {
+			const localStatus = await startBuildOperation(channel, preset);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) {
+				if (isCurrentBuildRequest(requestGeneration, channel, preset)) {
+					throw new Error('Лаунчер вернул состояние другой операции сборки.');
+				}
+				return;
+			}
+			if (localStatus.operationActive && localStatus.operationId) {
+				scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+			} else if (isPendingBuildInspection(localStatus)) {
+				scheduleBuildInspectionPoll(requestGeneration, channel, preset, 0);
+			}
+		} catch (error) {
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			stopBuildStatusPolling(true);
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				error instanceof Error ? error.message : 'Не удалось запустить операцию сборки.',
+			);
+		}
+	}
+
+	async function cancelCurrentBuildOperation() {
+		const active = activeBuildOperation;
+		if (!active || buildOperationCancelPending) return;
+		buildOperationCancelPending = true;
+		clearBuildStatusPollTimer();
+
+		try {
+			const localStatus = await cancelBuildOperation(active.operationId);
+			applyBuildStatus(
+				localStatus,
+				active.requestGeneration,
+				active.channel,
+				active.preset,
+				active.operationId,
+			);
+		} catch (error) {
+			console.warn('Build cancellation failed', error);
+		} finally {
+			buildOperationCancelPending = false;
+			if (
+				activeBuildOperation?.operationId === active.operationId &&
+				activeBuildOperation.requestGeneration === active.requestGeneration
+			) {
+				scheduleBuildStatusPoll(
+					active.operationId,
+					active.requestGeneration,
+					active.channel,
+					active.preset,
+				);
+			}
+		}
+	}
+
+	function errorBuildStatus(
+		channel: BuildChannel,
+		preset: PresetId,
+		message: string,
+		primaryAction: BuildStatus['primaryAction'] = 'retry',
+	): BuildStatus {
+		return {
+			operationId: null,
+			revision: buildStatus.revision + 1,
+			channel,
+			preset,
+			phase: 'error',
+			primaryAction,
+			installDirectory: buildStatus.installDirectory,
+			installedReleaseId: null,
+			availableReleaseId: null,
+			message,
+			operationActive: false,
+			progress: {
+				currentFile: null,
+				downloadedBytes: 0,
+				totalBytes: 0,
+				speedBytesPerSecond: 0,
+				remainingBytes: 0,
+				diskFreeBytes: 0,
+				diskRequiredBytes: 0,
+			},
+		};
+	}
+
+	function isCurrentBuildRequest(
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+	) {
+		return (
+			requestGeneration === buildStatusRequestGeneration &&
+			channel === activeChannel &&
+			preset === activeBuild.preset
+		);
+	}
+
+	async function handlePrimaryBuildAction() {
+		if (
+			buildStatus.primaryAction === 'download' ||
+			buildStatus.primaryAction === 'update' ||
+			buildStatus.primaryAction === 'repair' ||
+			buildStatus.primaryAction === 'retry'
+		) {
+			if (activeBuildOperation || buildOperationStartPending) return;
+			buildOperationStartPending = true;
+			try {
+				if (!buildStatus.installDirectory && !(await chooseInstallDirectory(true))) return;
+				await startCurrentBuildOperation();
+			} finally {
+				buildOperationStartPending = false;
+			}
+			return;
+		}
+		if (buildStatus.primaryAction === 'play') {
+			if (activeBuildOperation || buildOperationStartPending) return;
+			const requestGeneration = ++buildStatusRequestGeneration;
+			const channel = activeChannel;
+			const preset = activeBuild.preset;
+			stopBuildStatusPolling(true);
+			buildOperationStartPending = true;
+			buildStatus = {
+				...buildStatus,
+				phase: 'authorizing',
+				primaryAction: 'busy',
+				message: 'Передаём запуск нативному координатору…',
+				operationActive: false,
+			};
+			try {
+				const localStatus = await startGame(channel, preset);
+				if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return;
+				if (localStatus.operationActive && localStatus.operationId) {
+					scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+				} else if (isPendingBuildInspection(localStatus)) {
+					scheduleBuildInspectionPoll(requestGeneration, channel, preset, 0);
+				}
+			} catch (error) {
+				if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+				stopBuildStatusPolling(true);
+				buildStatus = errorBuildStatus(
+					channel,
+					preset,
+					error instanceof Error ? error.message : 'Не удалось запустить Minecraft.',
+				);
+			} finally {
+				buildOperationStartPending = false;
+			}
+			return;
+		}
+		buildStatus = errorBuildStatus(
+			activeChannel,
+			activeBuild.preset,
+			'Операция ещё не подключена в этой dev-ветке лаунчера.',
+			'blocked',
+		);
+	}
+
+	function submitSupportRequest(event: SubmitEvent) {
+		event.preventDefault();
+
+		if (!supportReady) {
+			return;
+		}
+
+		supportSent = true;
+	}
+
+	async function minimize() {
+		await appWindow?.minimize();
 	}
 
 	async function closeWindow() {
@@ -85,8 +1011,29 @@
 		await appWindow?.startDragging();
 	}
 
-	async function startResize(direction: ResizeDirection) {
-		await appWindow?.startResizeDragging(direction);
+	function formatTelegramAccount(profile: LauncherProfile | undefined) {
+		if (!profile) {
+			return 'Telegram не подключён';
+		}
+
+		if (profile.username) {
+			return `@${profile.username}`;
+		}
+
+		return profile.telegramId ? `ID ${profile.telegramId}` : 'Telegram подключён, имя не указано';
+	}
+
+	function resolveTelegramAvatarUrl(profile: LauncherProfile | undefined) {
+		if (!profile) {
+			return null;
+		}
+
+		return (
+			profile.avatarUrl ??
+			profile.telegramAvatarUrl ??
+			profile.photoUrl ??
+			null
+		);
 	}
 </script>
 
@@ -95,439 +1042,126 @@
 </svelte:head>
 
 <div class:expanded={bootPhase !== 'boot'} class="window-stage fixed inset-0 overflow-hidden">
-	<div class="window-shadow shadow-cast"></div>
-	<div class="window-shadow shadow-contact"></div>
+	<main
+		class="app-shell absolute overflow-hidden rounded-[30px] border border-border bg-background text-foreground"
+	>
+		{#if bootVisible}
+			<BootScreen {bootPhase} {bootProgress} {bootLabel} {startDrag} />
+		{/if}
 
-<main
-	class="app-shell absolute overflow-hidden rounded-[18px] border border-border bg-background text-foreground"
->
-	<button
-		class="resize-edge resize-n"
-		aria-label="Resize north"
-		onmousedown={() => startResize('North')}
-	></button>
-	<button
-		class="resize-edge resize-e"
-		aria-label="Resize east"
-		onmousedown={() => startResize('East')}
-	></button>
-	<button
-		class="resize-edge resize-s"
-		aria-label="Resize south"
-		onmousedown={() => startResize('South')}
-	></button>
-	<button
-		class="resize-edge resize-w"
-		aria-label="Resize west"
-		onmousedown={() => startResize('West')}
-	></button>
-	<button
-		class="resize-corner resize-ne"
-		aria-label="Resize northeast"
-		onmousedown={() => startResize('NorthEast')}
-	></button>
-	<button
-		class="resize-corner resize-nw"
-		aria-label="Resize northwest"
-		onmousedown={() => startResize('NorthWest')}
-	></button>
-	<button
-		class="resize-corner resize-se"
-		aria-label="Resize southeast"
-		onmousedown={() => startResize('SouthEast')}
-	></button>
-	<button
-		class="resize-corner resize-sw"
-		aria-label="Resize southwest"
-		onmousedown={() => startResize('SouthWest')}
-	></button>
+		{#if authGateVisible}
+			<AuthGate
+				{authState}
+				showTelegramHelp={showTelegramHelpPill}
+				{loginWithTelegram}
+				{openTelegramHelp}
+				{startDrag}
+				{minimize}
+				{closeWindow}
+			/>
+		{/if}
 
-	{#if bootVisible}
-		<div
-			class:leaving={bootPhase === 'reveal'}
-			class="boot-screen flex h-full min-h-0 flex-col justify-between bg-[radial-gradient(circle_at_70%_18%,#263243_0,#0c0f14_52%)] px-7 py-6"
-			role="toolbar"
-			aria-label="Boot window"
-			tabindex="-1"
-			onmousedown={startDrag}
-		>
-			<div class="flex items-center gap-3">
-				<div class="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
-					<Sparkles size={20} strokeWidth={2.2} />
-				</div>
-				<div>
-					<p class="text-sm font-medium text-muted">Fragment</p>
-					<h1 class="text-xl font-semibold leading-tight">Launcher</h1>
-				</div>
-			</div>
+		{#if telegramHelpVisible}
+			<TelegramHelpWindow
+				proxyStatus={tgWsProxyStatus}
+				proxyBusy={tgWsProxyBusy}
+				proxyMessage={tgWsProxyMessage}
+				closeTelegramHelp={() => (telegramHelpVisible = false)}
+				{installTelegramProxy}
+			/>
+		{/if}
 
-			<div>
-				<p class="text-xs uppercase tracking-[0.18em] text-accent">Запуск</p>
-				<p class="mt-3 text-2xl font-semibold">{bootLabel}</p>
-				<div class="mt-6 h-1.5 overflow-hidden rounded-full bg-panel-strong">
-					<div
-						class="h-full rounded-full bg-accent transition-[width] duration-300 ease-out"
-						style={`width: ${Math.round(bootProgress * 100)}%`}
-					></div>
-				</div>
-				<div class="mt-3 flex items-center justify-between text-xs text-muted">
-					<span>Локальный запуск</span>
-					<span>{Math.round(bootProgress * 100)}%</span>
-				</div>
-			</div>
-		</div>
-	{/if}
+		<div class:visible={appVisible} class="launcher-layout">
+			<Sidebar {navigation} setActiveSection={openSection} />
 
-	<div class:visible={launcherVisible} class="launcher-layout">
-	<aside class="launcher-surface flex min-h-0 flex-col border-r border-border bg-panel px-6 py-5">
-		<div class="flex items-center gap-3">
-			<div class="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
-				<Sparkles size={20} strokeWidth={2.2} />
-			</div>
-			<div>
-				<p class="text-sm font-medium text-muted">Fragment</p>
-				<h1 class="text-xl font-semibold leading-tight">Launcher</h1>
-			</div>
+			<section class="main-surface flex min-w-0 flex-col">
+				<TitleBar
+					{startDrag}
+					{minimize}
+					{closeWindow}
+					openSupport={() => (supportVisible = true)}
+					openProfile={() => (profileVisible = true)}
+					openStats={() => (statsVisible = true)}
+					openSettings={() => (launcherSettingsVisible = true)}
+				/>
+
+				<MobileNav {navigation} {activeSection} setActiveSection={openSection} />
+
+				<div class="workspace min-h-0 flex-1 overflow-y-auto px-6 py-6">
+					{#if activeSection === 'home'}
+						<HomeSection
+							builds={visibleBuilds}
+							{activeBuild}
+							{selectedBuildId}
+							{feedItems}
+							{feedImages}
+							{buildStatus}
+							operationCancelPending={buildOperationCancelPending}
+							{selectBuild}
+							openSettings={() => (settingsVisible = true)}
+							primaryAction={handlePrimaryBuildAction}
+							cancelAction={cancelCurrentBuildOperation}
+						/>
+					{/if}
+				</div>
+			</section>
 		</div>
 
-		<nav class="mt-8 grid gap-2">
-			<button class="flex h-10 items-center gap-3 rounded-md bg-panel-strong px-3 text-left text-sm font-medium">
-				<Play size={17} />
-				Играть
-			</button>
-			<button
-				class="flex h-10 items-center gap-3 rounded-md px-3 text-left text-sm text-muted transition hover:bg-panel-strong hover:text-foreground"
-			>
-				<Download size={17} />
-				Обновления
-			</button>
-			<button
-				class="flex h-10 items-center gap-3 rounded-md px-3 text-left text-sm text-muted transition hover:bg-panel-strong hover:text-foreground"
-			>
-				<Settings size={17} />
-				Настройки
-			</button>
-		</nav>
+		{#if settingsVisible}
+			<SettingsWindow
+				{activeBuild}
+				{presets}
+				installDirectory={buildStatus.installDirectory}
+				closeSettings={() => (settingsVisible = false)}
+				{setPreset}
+				{chooseInstallDirectory}
+			/>
+		{/if}
 
-		<div class="mt-auto rounded-md border border-border bg-background/45 p-4">
-			<p class="text-xs uppercase tracking-[0.18em] text-muted">Версия</p>
-			<p class="mt-2 text-lg font-semibold">{status.version}</p>
-		</div>
-	</aside>
+		{#if launcherSettingsVisible}
+			<LauncherSettingsWindow
+				{launcherVersion}
+				bind:anonymizeAnalytics
+				bind:includeDiagnosticsInSupport
+				closeLauncherSettings={() => (launcherSettingsVisible = false)}
+			/>
+		{/if}
 
-	<section class="launcher-surface flex min-w-0 flex-col bg-[radial-gradient(circle_at_68%_18%,#263243_0,#0c0f14_42%)]">
-		<header
-			class="flex h-14 select-none items-center justify-between border-b border-border px-5"
-			role="toolbar"
-			aria-label="Window title bar"
-			tabindex="-1"
-			onmousedown={startDrag}
-			ondblclick={toggleMaximize}
-		>
-			<div class="flex items-center gap-3">
-				<span class="size-2 rounded-full bg-success"></span>
-				<div>
-					<p class="text-xs text-muted">Профиль</p>
-					<p class="text-sm font-medium">Одиночная сборка</p>
-				</div>
-			</div>
+		{#if supportVisible}
+			<SupportWindow
+				bind:supportTopic
+				bind:supportDescription
+				bind:attachCrashReport
+				bind:attachLastLog
+				bind:attachLastScreenshot
+				{supportReady}
+				{supportSent}
+				closeSupport={() => (supportVisible = false)}
+				{submitSupportRequest}
+			/>
+		{/if}
 
-			<div class="flex items-center gap-1">
-				<button
-					class="window-control"
-					aria-label="Minimize window"
-					title="Свернуть"
-					onmousedown={(event) => event.stopPropagation()}
-					onclick={minimize}
-				>
-					<Minus size={15} />
-				</button>
-				<button
-					class="window-control"
-					aria-label="Maximize window"
-					title="Развернуть"
-					onmousedown={(event) => event.stopPropagation()}
-					onclick={toggleMaximize}
-				>
-					<Square size={13} />
-				</button>
-				<button
-					class="window-control close"
-					aria-label="Close window"
-					title="Закрыть"
-					onmousedown={(event) => event.stopPropagation()}
-					onclick={closeWindow}
-				>
-					<X size={16} />
-				</button>
-			</div>
-		</header>
+		{#if profileVisible}
+			<ProfileWindow
+				{builds}
+				bind:nickname
+				{telegramAccount}
+				{telegramAvatarUrl}
+				{nicknameDirty}
+				{nicknameSaving}
+				{nicknameSaveMessage}
+				{availableBuildsCount}
+				subscriptionActive={hasActiveSubscription}
+				{subscriptionName}
+				{hasDevAccess}
+				{saveLauncherNickname}
+				{logoutFromTelegram}
+				closeProfile={closeProfileWindow}
+			/>
+		{/if}
 
-		<div class="grid flex-1 content-between px-8 py-8">
-			<div class="max-w-3xl">
-				<p class="text-sm font-medium uppercase tracking-[0.18em] text-accent">Minecraft modpack</p>
-				<h2 class="mt-4 text-5xl font-semibold leading-[1.05]">Fragment Launcher</h2>
-				<p class="mt-5 max-w-2xl text-base leading-7 text-muted">
-					Каркас для одиночной сборки готов: локальный Tauri-бекенд, статический SvelteKit-фронтенд и
-					место под обновления без подключения внешних сервисов.
-				</p>
-			</div>
-
-			<div class="grid grid-cols-3 gap-4">
-				<div class="rounded-md border border-border bg-panel/90 p-5">
-					<p class="text-sm text-muted">Режим</p>
-					<p class="mt-3 text-xl font-semibold">Singleplayer</p>
-				</div>
-				<div class="rounded-md border border-border bg-panel/90 p-5">
-					<p class="text-sm text-muted">Сервисы</p>
-					<p class="mt-3 text-xl font-semibold">
-						{status.servicesConnected ? 'Подключены' : 'Отключены'}
-					</p>
-				</div>
-				<div class="rounded-md border border-border bg-panel/90 p-5">
-					<p class="text-sm text-muted">Updater</p>
-					<p class="mt-3 text-xl font-semibold">{status.updaterReady ? 'Tauri' : 'Не настроен'}</p>
-				</div>
-			</div>
-
-			<div class="flex items-center gap-3">
-				<button
-					class="inline-flex h-12 items-center gap-3 rounded-md bg-accent px-5 text-sm font-semibold text-accent-foreground transition hover:brightness-105"
-				>
-					<Play size={18} fill="currentColor" />
-					Играть
-				</button>
-				<button
-					class="inline-flex h-12 items-center gap-3 rounded-md border border-border bg-panel px-5 text-sm font-medium text-muted transition hover:text-foreground"
-				>
-					<Settings size={18} />
-					Настройки
-				</button>
-			</div>
-		</div>
-	</section>
-	</div>
-</main>
+		{#if statsVisible}
+			<StatsWindow {activeBuild} closeStats={() => (statsVisible = false)} />
+		{/if}
+	</main>
 </div>
-
-<style>
-	.window-stage {
-		--shell-height: 292px;
-		--shell-width: 512px;
-		pointer-events: none;
-	}
-
-	.window-stage.expanded {
-		--shell-height: calc(100% - 64px);
-		--shell-width: calc(100% - 64px);
-	}
-
-	.app-shell {
-		top: 50%;
-		left: 50%;
-		width: var(--shell-width);
-		height: var(--shell-height);
-		pointer-events: auto;
-		transform: translate(-50%, -50%);
-		transition:
-			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
-			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
-		filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.24));
-	}
-
-	.boot-screen {
-		position: absolute;
-		inset: 0;
-		z-index: 12;
-		opacity: 1;
-		transform: scale(1);
-		transition:
-			opacity 260ms ease,
-			transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
-	}
-
-	.boot-screen.leaving {
-		opacity: 0;
-		transform: scale(1.025);
-		pointer-events: none;
-	}
-
-	.launcher-layout {
-		position: absolute;
-		inset: 0;
-		display: grid;
-		grid-template-columns: 320px 1fr;
-		opacity: 0;
-		pointer-events: none;
-		transform: scale(0.985) translateY(8px);
-		transition:
-			opacity 320ms ease,
-			transform 440ms cubic-bezier(0.22, 1, 0.36, 1);
-	}
-
-	.launcher-layout.visible {
-		opacity: 1;
-		pointer-events: auto;
-		transform: scale(1) translateY(0);
-	}
-
-	.launcher-surface {
-		animation: launcher-surface-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
-	}
-
-	.launcher-surface:nth-of-type(2) {
-		animation-delay: 70ms;
-	}
-
-	@keyframes launcher-surface-in {
-		from {
-			opacity: 0;
-			transform: translateY(10px);
-		}
-
-		to {
-			opacity: 1;
-			transform: translateY(0);
-		}
-	}
-
-	.window-shadow {
-		position: absolute;
-		pointer-events: none;
-		border-radius: 20px;
-	}
-
-	.shadow-cast {
-		top: 50%;
-		left: 50%;
-		width: var(--shell-width);
-		height: var(--shell-height);
-		background: transparent;
-		box-shadow: 14px 16px 26px 6px rgba(0, 0, 0, 0.42);
-		opacity: 0.9;
-		transform: translate(calc(-50% + 2px), calc(-50% + 2px));
-		transition:
-			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
-			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
-		mask-image: linear-gradient(
-			135deg,
-			rgba(0, 0, 0, 0.08) 0%,
-			rgba(0, 0, 0, 0.55) 38%,
-			#000 100%
-		);
-		-webkit-mask-image: linear-gradient(
-			135deg,
-			rgba(0, 0, 0, 0.08) 0%,
-			rgba(0, 0, 0, 0.55) 38%,
-			#000 100%
-		);
-	}
-
-	.shadow-contact {
-		top: 50%;
-		left: 50%;
-		width: var(--shell-width);
-		height: var(--shell-height);
-		background: transparent;
-		box-shadow: 9px 15px 18px -12px rgba(0, 0, 0, 0.34);
-		opacity: 0.78;
-		transform: translate(-50%, -50%);
-		transition:
-			width 620ms cubic-bezier(0.65, 0, 0.35, 1),
-			height 620ms cubic-bezier(0.65, 0, 0.35, 1);
-	}
-
-	.window-control {
-		display: grid;
-		width: 34px;
-		height: 30px;
-		place-items: center;
-		border-radius: 6px;
-		color: var(--color-muted);
-		transition:
-			background-color 140ms ease,
-			color 140ms ease;
-	}
-
-	.window-control:hover {
-		background: var(--color-panel-strong);
-		color: var(--color-foreground);
-	}
-
-	.window-control.close:hover {
-		background: #c94d4d;
-		color: white;
-	}
-
-	.resize-edge,
-	.resize-corner {
-		position: absolute;
-		z-index: 30;
-		border: 0;
-		background: transparent;
-		padding: 0;
-	}
-
-	.resize-n,
-	.resize-s {
-		left: 10px;
-		right: 10px;
-		height: 6px;
-	}
-
-	.resize-n {
-		top: 0;
-		cursor: ns-resize;
-	}
-
-	.resize-s {
-		bottom: 0;
-		cursor: ns-resize;
-	}
-
-	.resize-e,
-	.resize-w {
-		top: 10px;
-		bottom: 10px;
-		width: 6px;
-	}
-
-	.resize-e {
-		right: 0;
-		cursor: ew-resize;
-	}
-
-	.resize-w {
-		left: 0;
-		cursor: ew-resize;
-	}
-
-	.resize-corner {
-		width: 12px;
-		height: 12px;
-	}
-
-	.resize-ne {
-		top: 0;
-		right: 0;
-		cursor: nesw-resize;
-	}
-
-	.resize-nw {
-		top: 0;
-		left: 0;
-		cursor: nwse-resize;
-	}
-
-	.resize-se {
-		right: 0;
-		bottom: 0;
-		cursor: nwse-resize;
-	}
-
-	.resize-sw {
-		bottom: 0;
-		left: 0;
-		cursor: nesw-resize;
-	}
-</style>
