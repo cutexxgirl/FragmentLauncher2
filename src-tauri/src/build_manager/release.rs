@@ -3,6 +3,11 @@ use super::{
         is_sha256, valid_java25_version, valid_setting_id, validate_manifest_path, GameRuntimeLock,
         MutableSettingsFile, RuntimeLock, JAVA_DISTRIBUTION, JAVA_IMAGE_TYPE, JAVA_MAJOR, JAVA_VM,
     },
+    managed_fs::{
+        validate_materializable_manifest_path, MAX_MANAGED_FILE_BYTES, MAX_MANAGED_RELEASE_BYTES,
+        MAX_MANIFEST_PATH_BYTES, MAX_MANIFEST_PATH_COMPONENTS, MAX_RECONCILE_MUTATIONS,
+        MAX_RELEASE_MANAGED_PATHS, MAX_RELEASE_PATH_COMPONENTS,
+    },
     neoforge::{
         MINECRAFT_VERSION, NEOFORGE_INSTALLER_SHA256, NEOFORGE_INSTALLER_URL, NEOFORGE_VERSION,
     },
@@ -15,7 +20,22 @@ use url::Url;
 
 const REQUIRED_STRICT_ROOTS: [&str; 4] = ["mods", "resourcepacks", "shaderpacks", "config"];
 const REQUIRED_LAUNCH_GUARD: &str = "mods/fragment-launch-guard.jar";
-const MAX_FILES_PER_PRESET: usize = 200_000;
+pub(super) const MAX_FILES_PER_PRESET: usize = 200_000;
+pub(super) const MAX_RECONCILE_PLAN_BYTES: u64 = 64 * 1024 * 1024;
+// `strictRoots` and `preservedPaths` can each contain 4,096 paths of 1,024 UTF-8 bytes:
+// their two compact JSON arrays need at most 8,413,186 bytes. The remaining almost two MiB
+// cover the two bounded active markers, disk budget, identities and every envelope key/comma.
+// Variable desired-file and mutation records are projected independently below.
+const RECONCILE_PLAN_ENVELOPE_RESERVE_BYTES: u64 = 10 * 1024 * 1024;
+
+// Compact serde_json record sizes excluding the UTF-8 path and decimal values. These constants
+// are schema contracts, not estimates; journal tests compare them to the real serialized types.
+const PLANNED_FILE_JSON_BASE_BYTES: u64 = 244;
+const QUARANTINE_JSON_BASE_BYTES: u64 = 51;
+const ENSURE_DIRECTORY_JSON_BASE_BYTES: u64 = 47;
+const INSTALL_FILE_JSON_BASE_BYTES: u64 = 160;
+const FALSE_JSON_DELTA_BYTES: u64 = 1;
+const VALIDATED_MUTABLE_JSON_DELTA_BYTES: u64 = 12;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -374,6 +394,8 @@ impl ReleaseManifest {
         let mut mutable_paths = HashSet::new();
         let mut setting_ids = HashSet::new();
         for settings in &integrity.mutable_settings {
+            validate_materializable_manifest_path(&settings.path)
+                .map_err(|error| error.to_string())?;
             settings.validate()?;
             let path = path_key(&settings.path);
             if !mutable_paths.insert(path.clone())
@@ -428,7 +450,7 @@ impl ReleaseManifest {
                     return Err(format!("Forbidden preset JVM argument: {argument}"));
                 }
             }
-            validate_file_list(&preset.files)?;
+            validate_file_list(&preset.files, &self.integrity.strict_roots)?;
         }
         if ![PresetId::Low, PresetId::Medium, PresetId::High]
             .into_iter()
@@ -451,11 +473,11 @@ impl ReleaseManifest {
                     .collect()
             })
             .collect();
-        let mutable_paths: HashSet<String> = self
+        let mutable_policies: HashMap<String, &MutableSettingsFile> = self
             .integrity
             .mutable_settings
             .iter()
-            .map(|settings| path_key(&settings.path))
+            .map(|settings| (path_key(&settings.path), settings))
             .collect();
 
         for locked in &self.integrity.locked_paths {
@@ -488,7 +510,8 @@ impl ReleaseManifest {
             {
                 return Err(format!("Managed file overlaps preserved data: {path}"));
             }
-            let expected_policy = if mutable_paths.contains(&path) {
+            let mutable_policy = mutable_policies.get(&path).copied();
+            let expected_policy = if mutable_policy.is_some() {
                 FilePolicy::ValidatedMutable
             } else {
                 FilePolicy::Exact
@@ -505,6 +528,20 @@ impl ReleaseManifest {
                 return Err(format!(
                     "Manifest file policy does not match integrity rules: {path}"
                 ));
+            }
+            if let Some(policy) = mutable_policy {
+                let max_bytes = u64::try_from(policy.max_bytes)
+                    .map_err(|_| format!("Mutable maxBytes does not fit u64: {}", policy.path))?;
+                if files
+                    .iter()
+                    .flatten()
+                    .any(|file| file.path != policy.path || file.size > max_bytes)
+                {
+                    return Err(format!(
+                        "Mutable default does not match its exact policy path or maxBytes: {}",
+                        policy.path
+                    ));
+                }
             }
             let may_differ = self
                 .integrity
@@ -525,10 +562,10 @@ impl ReleaseManifest {
                 }
             }
         }
-        for mutable_path in mutable_paths {
+        for mutable_path in mutable_policies.keys() {
             if preset_files
                 .iter()
-                .any(|preset| !preset.contains_key(&mutable_path))
+                .any(|preset| !preset.contains_key(mutable_path))
             {
                 return Err(format!(
                     "Mutable settings default is missing from a preset: {mutable_path}"
@@ -539,11 +576,197 @@ impl ReleaseManifest {
     }
 }
 
-fn validate_file_list(files: &[ManifestFile]) -> Result<(), String> {
+fn decimal_json_digits(mut value: u64) -> u64 {
+    let mut digits = 1_u64;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn checked_projection_sum(values: impl IntoIterator<Item = u64>) -> Result<u64, String> {
+    values
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add)
+        .ok_or_else(|| "Reconcile journal byte projection overflowed".to_string())
+}
+
+pub(super) fn projected_planned_file_json_bytes(
+    path: &str,
+    signed_size: u64,
+    installed_size: u64,
+    executable: bool,
+    policy: FilePolicy,
+) -> Result<u64, String> {
+    checked_projection_sum([
+        PLANNED_FILE_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Desired path length does not fit u64".to_string())?,
+        decimal_json_digits(signed_size),
+        decimal_json_digits(installed_size),
+        u64::from(!executable) * FALSE_JSON_DELTA_BYTES,
+        u64::from(policy == FilePolicy::ValidatedMutable) * VALIDATED_MUTABLE_JSON_DELTA_BYTES,
+    ])
+}
+
+pub(super) fn projected_quarantine_json_bytes(path: &str, backup_slot: u64) -> Result<u64, String> {
+    checked_projection_sum([
+        QUARANTINE_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Quarantine path length does not fit u64".to_string())?,
+        decimal_json_digits(backup_slot),
+    ])
+}
+
+pub(super) fn projected_ensure_directory_json_bytes(path: &str) -> Result<u64, String> {
+    checked_projection_sum([
+        ENSURE_DIRECTORY_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Directory path length does not fit u64".to_string())?,
+    ])
+}
+
+pub(super) fn projected_install_file_json_bytes(
+    path: &str,
+    staging_slot: u64,
+    size: u64,
+    executable: bool,
+) -> Result<u64, String> {
+    checked_projection_sum([
+        INSTALL_FILE_JSON_BASE_BYTES,
+        u64::try_from(path.len())
+            .map_err(|_| "Install path length does not fit u64".to_string())?,
+        decimal_json_digits(staging_slot),
+        decimal_json_digits(size),
+        u64::from(!executable) * FALSE_JSON_DELTA_BYTES,
+    ])
+}
+
+fn projected_json_array_bytes(record_bytes: u64, count: usize) -> Result<u64, String> {
+    let count = u64::try_from(count)
+        .map_err(|_| "Reconcile journal record count does not fit u64".to_string())?;
+    checked_projection_sum([2, record_bytes, count.saturating_sub(1)])
+}
+
+pub(super) fn projected_worst_case_reconcile_plan_bytes(
+    files: &[ManifestFile],
+    parent_directories: &HashMap<String, String>,
+) -> Result<u64, String> {
+    let maximum_slot = u64::try_from(
+        MAX_RECONCILE_MUTATIONS
+            .checked_sub(1)
+            .ok_or_else(|| "Reconcile mutation limit is empty".to_string())?,
+    )
+    .map_err(|_| "Reconcile mutation slot limit does not fit u64".to_string())?;
+    let mut desired_record_bytes = 0_u64;
+    let mut mutation_record_bytes = 0_u64;
+    for file in files {
+        // Signed and installed sizes are independently represented in PlannedFileV2. Project the
+        // longest u64 representation, `false`, and the longer policy token so future processor
+        // outputs or policy changes cannot make this admission optimistic.
+        desired_record_bytes = checked_projection_sum([
+            desired_record_bytes,
+            projected_planned_file_json_bytes(
+                &file.path,
+                u64::MAX,
+                u64::MAX,
+                false,
+                FilePolicy::ValidatedMutable,
+            )?,
+        ])?;
+        // Worst repair can quarantine and reinstall every selected-preset file. The real planner
+        // may collapse overlapping quarantines, but admission never relies on that optimization.
+        mutation_record_bytes = checked_projection_sum([
+            mutation_record_bytes,
+            projected_quarantine_json_bytes(&file.path, maximum_slot)?,
+            projected_install_file_json_bytes(&file.path, maximum_slot, u64::MAX, false)?,
+        ])?;
+    }
+    for parent in parent_directories.values() {
+        mutation_record_bytes = checked_projection_sum([
+            mutation_record_bytes,
+            projected_ensure_directory_json_bytes(parent)?,
+        ])?;
+    }
+    let mutation_count = files
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(parent_directories.len()))
+        .ok_or_else(|| "Reconcile journal mutation projection overflowed".to_string())?;
+    checked_projection_sum([
+        RECONCILE_PLAN_ENVELOPE_RESERVE_BYTES,
+        projected_json_array_bytes(desired_record_bytes, files.len())?,
+        projected_json_array_bytes(mutation_record_bytes, mutation_count)?,
+    ])
+}
+
+fn validate_projected_reconcile_plan_bytes(
+    projected_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<(), String> {
+    if projected_bytes > maximum_bytes {
+        return Err(
+            "Release preset worst-case reconcile journal exceeds the 64 MiB launcher limit".into(),
+        );
+    }
+    Ok(())
+}
+
+fn retain_longest_parent_spelling(
+    parent_directories: &mut HashMap<String, String>,
+    parent_key: String,
+    original_parent: String,
+) {
+    parent_directories
+        .entry(parent_key)
+        .and_modify(|existing| {
+            if existing.len() < original_parent.len() {
+                existing.clone_from(&original_parent);
+            }
+        })
+        .or_insert(original_parent);
+}
+
+pub(super) fn projected_reconcile_directories(
+    files: &[ManifestFile],
+    strict_roots: &[String],
+) -> HashMap<String, String> {
+    let mut directories = HashMap::new();
+    for (path, inclusive) in files
+        .iter()
+        .map(|file| (file.path.as_str(), false))
+        .chain(strict_roots.iter().map(|root| (root.as_str(), true)))
+    {
+        let components = path.split('/').collect::<Vec<_>>();
+        let upper_exclusive = components.len() + usize::from(inclusive);
+        for length in 1..upper_exclusive {
+            let directory = components[..length].join("/");
+            retain_longest_parent_spelling(&mut directories, path_key(&directory), directory);
+        }
+    }
+    directories
+}
+
+fn validate_file_list(files: &[ManifestFile], strict_roots: &[String]) -> Result<(), String> {
     let mut seen = BTreeMap::new();
+    let mut path_components = 0_usize;
+    let mut total_file_bytes = 0_u64;
     for file in files {
         validate_manifest_path(&file.path)?;
-        if !is_sha256(&file.sha256) {
+        validate_materializable_manifest_path(&file.path).map_err(|error| error.to_string())?;
+        let component_count = file.path.split('/').count();
+        if file.path.len() > MAX_MANIFEST_PATH_BYTES
+            || component_count > MAX_MANIFEST_PATH_COMPONENTS
+        {
+            return Err(format!(
+                "Manifest path exceeds the materializable path bound: {}",
+                file.path
+            ));
+        }
+        path_components = checked_release_path_component_total(path_components, component_count)?;
+        total_file_bytes = checked_managed_release_file_bytes(total_file_bytes, file.size)?;
+        if file.size > MAX_MANAGED_FILE_BYTES || !is_sha256(&file.sha256) {
             return Err(format!(
                 "Manifest file has an invalid SHA-256: {}",
                 file.path
@@ -553,13 +776,25 @@ fn validate_file_list(files: &[ManifestFile]) -> Result<(), String> {
         if seen.insert(key.clone(), file.path.clone()).is_some() {
             return Err(format!("Duplicate manifest path: {}", file.path));
         }
-        let segments: Vec<_> = key.split('/').collect();
-        for index in 1..segments.len() {
-            if seen.contains_key(&segments[..index].join("/")) {
+        let key_segments: Vec<_> = key.split('/').collect();
+        for index in 1..key_segments.len() {
+            let parent_key = key_segments[..index].join("/");
+            if seen.contains_key(&parent_key) {
                 return Err(format!("Manifest file/directory collision: {}", file.path));
             }
         }
     }
+    // Planner de-duplicates required directories by lowercase key but serializes one
+    // original-cased path. This set includes file parents plus every strict root and its parents,
+    // exactly matching DesiredTree's clean-install `missing_directories` surface. Unicode
+    // lowercase can shrink UTF-8 (`ẞ` -> `ß`), so the helper retains the longest original spelling
+    // for every key and remains conservative regardless of which representative planner picks.
+    let parent_directories = projected_reconcile_directories(files, strict_roots);
+    checked_projected_reconcile_mutations(files.len(), parent_directories.len())?;
+    validate_projected_reconcile_plan_bytes(
+        projected_worst_case_reconcile_plan_bytes(files, &parent_directories)?,
+        MAX_RECONCILE_PLAN_BYTES,
+    )?;
     for key in seen.keys() {
         let segments: Vec<_> = key.split('/').collect();
         for index in 1..segments.len() {
@@ -571,10 +806,42 @@ fn validate_file_list(files: &[ManifestFile]) -> Result<(), String> {
     Ok(())
 }
 
+fn checked_release_path_component_total(
+    current: usize,
+    additional: usize,
+) -> Result<usize, String> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= MAX_RELEASE_PATH_COMPONENTS)
+        .ok_or_else(|| "Manifest file topology exceeds its component budget".to_string())
+}
+
+fn checked_managed_release_file_bytes(current: u64, additional: u64) -> Result<u64, String> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= MAX_MANAGED_RELEASE_BYTES)
+        .ok_or_else(|| "Manifest file bytes exceed the managed release budget".to_string())
+}
+
+fn checked_projected_reconcile_mutations(
+    files: usize,
+    parent_directories: usize,
+) -> Result<usize, String> {
+    files
+        .checked_mul(2)
+        .and_then(|mutations| mutations.checked_add(parent_directories))
+        .filter(|mutations| *mutations <= MAX_RECONCILE_MUTATIONS)
+        .ok_or_else(|| "Manifest topology exceeds the reconcile mutation budget".to_string())
+}
+
 fn validate_path_list(paths: &[String]) -> Result<(), String> {
+    if paths.len() > MAX_RELEASE_MANAGED_PATHS {
+        return Err("Release managed path list exceeds its launcher bound".into());
+    }
     let mut seen = HashSet::new();
     for path in paths {
         validate_manifest_path(path)?;
+        validate_materializable_manifest_path(path).map_err(|error| error.to_string())?;
         if !seen.insert(path_key(path)) {
             return Err(format!("Duplicate integrity path: {path}"));
         }
@@ -755,6 +1022,201 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn release_file_topology_matches_materialization_and_aggregate_bounds() {
+        fn path_with_segments(count: usize) -> String {
+            let mut segments = (0..count - 1)
+                .map(|index| format!("d{index}"))
+                .collect::<Vec<_>>();
+            segments.push("file.jar".into());
+            segments.join("/")
+        }
+        let file = |segments| ManifestFile {
+            path: path_with_segments(segments),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+
+        assert!(validate_file_list(&[file(MAX_MANIFEST_PATH_COMPONENTS)], &[]).is_ok());
+        assert!(validate_file_list(&[file(MAX_MANIFEST_PATH_COMPONENTS + 1)], &[]).is_err());
+        let oversized_path = ManifestFile {
+            path: std::iter::repeat_n("a".repeat(220), 5)
+                .collect::<Vec<_>>()
+                .join("/"),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+        assert!(oversized_path.path.len() > MAX_MANIFEST_PATH_BYTES);
+        assert!(validate_file_list(&[oversized_path], &[]).is_err());
+        let oversized_component = ManifestFile {
+            path: "a".repeat(256),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+        assert!(validate_file_list(&[oversized_component], &[]).is_err());
+        let oversized_utf16_component = ManifestFile {
+            path: "😀".repeat(128),
+            size: 1,
+            sha256: "a".repeat(64),
+            executable: false,
+            policy: FilePolicy::Exact,
+        };
+        assert_eq!(oversized_utf16_component.path.encode_utf16().count(), 256);
+        assert!(validate_file_list(&[oversized_utf16_component], &[]).is_err());
+        assert_eq!(
+            checked_release_path_component_total(
+                MAX_RELEASE_PATH_COMPONENTS - MAX_MANIFEST_PATH_COMPONENTS,
+                MAX_MANIFEST_PATH_COMPONENTS,
+            )
+            .unwrap(),
+            MAX_RELEASE_PATH_COMPONENTS
+        );
+        assert!(checked_release_path_component_total(MAX_RELEASE_PATH_COMPONENTS, 1).is_err());
+        assert!(checked_release_path_component_total(usize::MAX, 1).is_err());
+        assert_eq!(
+            checked_managed_release_file_bytes(
+                MAX_MANAGED_RELEASE_BYTES - MAX_MANAGED_FILE_BYTES,
+                MAX_MANAGED_FILE_BYTES,
+            )
+            .unwrap(),
+            MAX_MANAGED_RELEASE_BYTES
+        );
+        assert!(checked_managed_release_file_bytes(MAX_MANAGED_RELEASE_BYTES, 1).is_err());
+        let aggregate_oversized = (0..33)
+            .map(|index| ManifestFile {
+                path: format!("large/{index}.bin"),
+                size: MAX_MANAGED_FILE_BYTES,
+                sha256: "a".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_file_list(&aggregate_oversized, &[]).is_err());
+        assert!(validate_file_list(
+            &[ManifestFile {
+                path: "large.bin".into(),
+                size: MAX_MANAGED_FILE_BYTES + 1,
+                sha256: "a".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            }],
+            &[],
+        )
+        .is_err());
+        assert_eq!(
+            checked_projected_reconcile_mutations(MAX_FILES_PER_PRESET, 0).unwrap(),
+            MAX_RECONCILE_MUTATIONS
+        );
+        assert!(checked_projected_reconcile_mutations(MAX_FILES_PER_PRESET, 1).is_err());
+        assert!(checked_projected_reconcile_mutations(usize::MAX, usize::MAX).is_err());
+
+        assert!(validate_path_list(&["a".repeat(256)]).is_err());
+        let too_many_paths = (0..=MAX_RELEASE_MANAGED_PATHS)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>();
+        assert!(validate_path_list(&too_many_paths).is_err());
+    }
+
+    #[test]
+    fn reconcile_journal_projection_is_boundary_exact_and_unicode_conservative() {
+        fn file(path: String) -> ManifestFile {
+            ManifestFile {
+                path,
+                size: 1,
+                sha256: "a".repeat(64),
+                executable: false,
+                policy: FilePolicy::Exact,
+            }
+        }
+
+        let shallow_files = vec![file("root/file.jar".into())];
+        let shallow_parents = projected_reconcile_directories(&shallow_files, &[]);
+        let shallow_projection =
+            projected_worst_case_reconcile_plan_bytes(&shallow_files, &shallow_parents).unwrap();
+        assert!(
+            validate_projected_reconcile_plan_bytes(shallow_projection, shallow_projection).is_ok()
+        );
+        assert_eq!(
+            validate_projected_reconcile_plan_bytes(shallow_projection, shallow_projection - 1)
+                .unwrap_err(),
+            "Release preset worst-case reconcile journal exceeds the 64 MiB launcher limit"
+        );
+
+        let deep_path = (0..MAX_MANIFEST_PATH_COMPONENTS - 1)
+            .map(|index| format!("d{index}"))
+            .chain(std::iter::once("file.jar".into()))
+            .collect::<Vec<_>>()
+            .join("/");
+        let deep_files = vec![file(deep_path)];
+        let deep_parents = projected_reconcile_directories(&deep_files, &[]);
+        let deep_projection =
+            projected_worst_case_reconcile_plan_bytes(&deep_files, &deep_parents).unwrap();
+        assert!(deep_projection > shallow_projection);
+        assert_eq!(
+            validate_projected_reconcile_plan_bytes(deep_projection, deep_projection - 1)
+                .unwrap_err(),
+            "Release preset worst-case reconcile journal exceeds the 64 MiB launcher limit"
+        );
+
+        let uppercase_sharp_s = "\u{1e9e}".to_string();
+        let lowercase_sharp_s = "\u{00df}".to_string();
+        assert_eq!(path_key(&uppercase_sharp_s), lowercase_sharp_s);
+        assert!(uppercase_sharp_s.len() > lowercase_sharp_s.len());
+        let unicode_files = vec![
+            file(format!("{lowercase_sharp_s}/first.jar")),
+            file(format!("{uppercase_sharp_s}/second.jar")),
+        ];
+        let unicode_parents = projected_reconcile_directories(&unicode_files, &[]);
+        assert_eq!(
+            unicode_parents.get(&lowercase_sharp_s),
+            Some(&uppercase_sharp_s)
+        );
+
+        let strict_roots = (0..MAX_RELEASE_MANAGED_PATHS)
+            .map(|index| {
+                let first = format!("r{index:04}_{}", "a".repeat(214));
+                format!(
+                    "{first}/{}/{}/{}",
+                    "b".repeat(220),
+                    "c".repeat(220),
+                    "d".repeat(220)
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_path_list(&strict_roots).unwrap();
+        let strict_directories = projected_reconcile_directories(&shallow_files, &strict_roots);
+        assert_eq!(
+            strict_directories.len(),
+            MAX_RELEASE_MANAGED_PATHS * 4 + shallow_parents.len()
+        );
+        let strict_projection =
+            projected_worst_case_reconcile_plan_bytes(&shallow_files, &strict_directories).unwrap();
+        let added_ensure_bytes = strict_directories
+            .iter()
+            .filter(|(key, _)| !shallow_parents.contains_key(*key))
+            .map(|(_, path)| projected_ensure_directory_json_bytes(path).unwrap())
+            .sum::<u64>();
+        let added_directory_count =
+            u64::try_from(strict_directories.len() - shallow_parents.len()).unwrap();
+        assert_eq!(
+            strict_projection - shallow_projection,
+            added_ensure_bytes + added_directory_count
+        );
+        assert!(validate_file_list(&shallow_files, &strict_roots).is_ok());
+
+        let maximum_path_array_bytes = 2_u64
+            + u64::try_from(MAX_RELEASE_MANAGED_PATHS).unwrap()
+                * u64::try_from(MAX_MANIFEST_PATH_BYTES + 2).unwrap()
+            + u64::try_from(MAX_RELEASE_MANAGED_PATHS - 1).unwrap();
+        assert!(maximum_path_array_bytes * 2 < RECONCILE_PLAN_ENVELOPE_RESERVE_BYTES);
+    }
+
+    #[test]
     fn rejects_case_folded_integrity_bypasses_and_mutable_mods() {
         let mut strict_preserved = manifest();
         strict_preserved["integrity"]["preservedPaths"] = serde_json::json!(["Config/custom"]);
@@ -769,6 +1231,33 @@ pub(crate) mod tests {
         assert!(
             ReleaseManifest::parse_and_validate(&serde_json::to_vec(&mutable_guard).unwrap())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn binds_mutable_defaults_to_exact_policy_path_and_max_bytes() {
+        let mut at_limit = manifest();
+        for preset in at_limit["presets"].as_array_mut().unwrap() {
+            preset["files"][1]["size"] = serde_json::json!(4096);
+        }
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&at_limit).unwrap()).is_ok()
+        );
+
+        let mut oversized = manifest();
+        for preset in oversized["presets"].as_array_mut().unwrap() {
+            preset["files"][1]["size"] = serde_json::json!(4097);
+        }
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&oversized).unwrap()).is_err()
+        );
+
+        let mut wrong_case = manifest();
+        for preset in wrong_case["presets"].as_array_mut().unwrap() {
+            preset["files"][1]["path"] = serde_json::json!("OPTIONS.TXT");
+        }
+        assert!(
+            ReleaseManifest::parse_and_validate(&serde_json::to_vec(&wrong_case).unwrap()).is_err()
         );
     }
 

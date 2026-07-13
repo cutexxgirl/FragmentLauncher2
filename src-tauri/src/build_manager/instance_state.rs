@@ -1,7 +1,9 @@
 use super::{
     managed_fs::{
-        atomic_write_small, ensure_directory_chain, open_or_create_lock_file, ImmutableManagedFile,
-        ManagedFsError, ManagedLockFile, RelativeManagedPath,
+        atomic_write_small, ensure_directory_chain, open_or_create_lock_file,
+        quarantine_node_if_identity, remove_verified_managed_file, ExclusiveManagedFile,
+        FileDigests, ImmutableManagedFile, ManagedFsError, ManagedLockFile, ManagedNodeKind,
+        RelativeManagedPath,
     },
     tuf::TrustedReleaseEvidence,
     types::{BuildChannel, PresetId},
@@ -12,10 +14,12 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Number, Value};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::{
     collections::HashSet,
     fmt,
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -32,11 +36,6 @@ pub(super) type InstanceStateResult<T> = Result<T, InstanceStateError>;
 #[derive(Debug)]
 pub(super) enum InstanceStateError {
     Invalid(String),
-    RecoveryRequired {
-        channel: BuildChannel,
-        backup: Box<ActiveInstanceV2>,
-        detail: String,
-    },
     AppliedButDurabilityUnconfirmed {
         destination: PathBuf,
         detail: String,
@@ -67,16 +66,6 @@ impl fmt::Display for InstanceStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
-            Self::RecoveryRequired {
-                channel,
-                backup,
-                detail,
-            } => write!(
-                formatter,
-                "instance_recovery_required: {} channel backup generation {} is available, but is not committed: {detail}",
-                channel.as_str(),
-                backup.generation
-            ),
             Self::AppliedButDurabilityUnconfirmed {
                 destination,
                 detail,
@@ -275,7 +264,7 @@ impl InstanceStateStore {
     ) -> InstanceStateResult<Option<ActiveInstanceV2>> {
         self.validate_lock(lock)?;
         Ok(self
-            .load_record_locked(lock.channel)?
+            .load_or_recover_record_locked(lock)?
             .map(|record| record.marker))
     }
 
@@ -299,7 +288,7 @@ impl InstanceStateStore {
         let paths = self.paths(lock.channel);
         paths.prepare(&self.install_root)?;
 
-        let current = self.load_record_locked(lock.channel)?;
+        let current = self.load_or_recover_record_locked(lock)?;
         match current.as_ref() {
             Some(record) if record.marker == *marker => return Ok(()),
             Some(record) => {
@@ -417,30 +406,40 @@ impl InstanceStateStore {
         }
     }
 
-    fn load_record_locked(
+    /// Loads the exact channel commit point and repairs a crash-damaged primary from its last
+    /// verified backup. Recovery is deliberately part of the locked load path: exposing backup
+    /// bytes to an unlocked caller would create a second, racy commit protocol.
+    fn load_or_recover_record_locked(
         &self,
-        channel: BuildChannel,
+        lock: &InstanceOperationLock,
     ) -> InstanceStateResult<Option<MarkerRecord>> {
+        self.validate_lock(lock)?;
+        let channel = lock.channel;
         let paths = self.paths(channel);
         paths.prepare(&self.install_root)?;
         let primary = read_record(&self.install_root, &paths.primary, self.install_id, channel);
         match primary {
-            Ok(record) => Ok(Some(record)),
+            Ok(record) => {
+                self.validate_primary_backup_relation(channel, &paths, &record)?;
+                Ok(Some(record))
+            }
             Err(LoadFailure::Future(version)) => Err(InstanceStateError::Invalid(format!(
                 "launcher_update_required: active instance schema {version}"
             ))),
             Err(primary_failure @ (LoadFailure::Missing | LoadFailure::Corrupt(_))) => {
-                match read_record(
+                match read_record_leased(
                     &self.install_root,
                     &paths.backup,
                     self.install_id,
                     channel,
                 ) {
-                    Ok(backup) => Err(InstanceStateError::RecoveryRequired {
-                        channel,
-                        backup: Box::new(backup.marker),
-                        detail: primary_failure.to_string(),
-                    }),
+                    Ok((backup, lease)) => self.restore_backup_locked(
+                        lock,
+                        &paths,
+                        primary_failure,
+                        backup,
+                        lease,
+                    ),
                     Err(LoadFailure::Future(version)) => {
                         Err(InstanceStateError::Invalid(format!(
                             "launcher_update_required: active instance schema {version}"
@@ -457,6 +456,264 @@ impl InstanceStateStore {
         }
     }
 
+    fn validate_primary_backup_relation(
+        &self,
+        channel: BuildChannel,
+        paths: &InstanceStatePaths,
+        primary: &MarkerRecord,
+    ) -> InstanceStateResult<()> {
+        match read_record(
+            &self.install_root,
+            &paths.backup,
+            self.install_id,
+            channel,
+        ) {
+            Ok(backup)
+                if backup.marker == primary.marker && backup.bytes == primary.bytes =>
+            {
+                // A completed recovery intentionally leaves an exact backup copy in place.
+                Ok(())
+            }
+            Ok(backup)
+                if backup.marker.generation.checked_add(1) == Some(primary.marker.generation) =>
+            {
+                // The normal committed topology is primary N plus its exact predecessor N-1.
+                Ok(())
+            }
+            Ok(backup) => Err(InstanceStateError::Invalid(format!(
+                "Ambiguous valid active instance state: primary generation {} and backup generation {} do not form an exact recovery pair",
+                primary.marker.generation, backup.marker.generation
+            ))),
+            Err(LoadFailure::Future(version)) => Err(InstanceStateError::Invalid(format!(
+                "launcher_update_required: active instance backup schema {version}"
+            ))),
+            // A valid primary is the commit point. A missing or corrupt recovery-only copy cannot
+            // make that committed state ambiguous and will be replaced on the next save.
+            Err(LoadFailure::Missing | LoadFailure::Corrupt(_)) => Ok(()),
+        }
+    }
+
+    fn restore_backup_locked(
+        &self,
+        lock: &InstanceOperationLock,
+        paths: &InstanceStatePaths,
+        original_primary_failure: LoadFailure,
+        backup: MarkerRecord,
+        backup_lease: ImmutableManagedFile,
+    ) -> InstanceStateResult<Option<MarkerRecord>> {
+        // Repeat both authority and source proofs at the recovery commit boundary. The immutable
+        // lease denies backup writes/deletes on Windows and revalidates identity on every target.
+        self.validate_lock(lock)?;
+        backup_lease.revalidate()?;
+        let current_backup_bytes =
+            backup_lease.read_bounded_shared(ACTIVE_INSTANCE_LIMIT as u64)?;
+        if current_backup_bytes != backup.bytes {
+            return Err(InstanceStateError::Invalid(
+                "Active instance backup changed before recovery commit".into(),
+            ));
+        }
+
+        let quarantine = match &original_primary_failure {
+            LoadFailure::Missing => None,
+            LoadFailure::Corrupt(_) => {
+                match self.prepare_corrupt_primary_locked(lock, paths, &backup)? {
+                    CorruptPrimaryPreparation::Missing => None,
+                    CorruptPrimaryPreparation::AlreadyRestored(current) => {
+                        return Ok(Some(*current));
+                    }
+                    CorruptPrimaryPreparation::Quarantined(quarantine) => Some(quarantine),
+                }
+            }
+            LoadFailure::Future(_) => {
+                return Err(InstanceStateError::Invalid(
+                    "Future-schema primary cannot enter backup recovery".into(),
+                ));
+            }
+        };
+
+        self.validate_lock(lock)?;
+        backup_lease.revalidate()?;
+        let backup_digests = digests_for_bytes(&backup.bytes);
+        let recovered =
+            self.publish_recovery_no_replace(lock, paths, &backup, &backup_digests, &backup_lease)?;
+
+        if let Some(quarantine) = quarantine {
+            remove_verified_managed_file(
+                &self.install_root,
+                &quarantine.relative,
+                &quarantine.digests,
+            )
+            .map_err(|error| InstanceStateError::AppliedButVerificationUnconfirmed {
+                destination: paths.primary.join_to(&self.install_root),
+                detail: format!(
+                    "recovered marker is verified, but exact corrupt-primary quarantine cleanup failed: {error}"
+                ),
+            })?;
+        }
+        self.validate_lock(lock).map_err(|error| {
+            InstanceStateError::AppliedButVerificationUnconfirmed {
+                destination: paths.primary.join_to(&self.install_root),
+                detail: format!(
+                    "operation lock could not be revalidated after recovering from {original_primary_failure}: {error}"
+                ),
+            }
+        })?;
+        Ok(Some(recovered))
+    }
+
+    fn prepare_corrupt_primary_locked(
+        &self,
+        lock: &InstanceOperationLock,
+        paths: &InstanceStatePaths,
+        backup: &MarkerRecord,
+    ) -> InstanceStateResult<CorruptPrimaryPreparation> {
+        self.validate_lock(lock)?;
+        let mut primary = match ImmutableManagedFile::open(&self.install_root, &paths.primary) {
+            Ok(primary) => primary,
+            Err(error) if managed_error_is_missing(&error) => {
+                return Ok(CorruptPrimaryPreparation::Missing);
+            }
+            Err(error) => {
+                return Err(InstanceStateError::Invalid(format!(
+                    "Corrupt active instance primary cannot be acquired by exact identity for recovery: {error}"
+                )));
+            }
+        };
+        let bytes = primary.read_bounded_shared(ACTIVE_INSTANCE_LIMIT as u64)?;
+        primary.revalidate()?;
+        match parse_record_bytes(bytes, self.install_id, lock.channel) {
+            Ok(current) if current.marker == backup.marker && current.bytes == backup.bytes => {
+                return Ok(CorruptPrimaryPreparation::AlreadyRestored(Box::new(
+                    current,
+                )));
+            }
+            Ok(current) => {
+                return Err(InstanceStateError::Invalid(format!(
+                    "Active instance recovery refused to replace valid divergent primary generation {} with backup generation {}",
+                    current.marker.generation, backup.marker.generation
+                )));
+            }
+            Err(LoadFailure::Future(version)) => {
+                return Err(InstanceStateError::Invalid(format!(
+                    "launcher_update_required: active instance schema {version}"
+                )));
+            }
+            Err(LoadFailure::Corrupt(_)) => {}
+            Err(LoadFailure::Missing) => {
+                return Err(InstanceStateError::Invalid(
+                    "Opened active instance primary unexpectedly parsed as missing".into(),
+                ));
+            }
+        }
+
+        let expected_identity = primary.info().identity.clone();
+        let digests = primary.sha1_sha256(ACTIVE_INSTANCE_LIMIT as u64)?;
+        primary.revalidate()?;
+        drop(primary);
+
+        self.validate_lock(lock)?;
+        paths.prepare_recovery_quarantine(&self.install_root)?;
+        let quarantined = quarantine_node_if_identity(
+            &self.install_root,
+            paths.primary.clone(),
+            &paths.recovery_quarantine,
+            &expected_identity,
+            ManagedNodeKind::File,
+        )?;
+        Ok(CorruptPrimaryPreparation::Quarantined(RecoveryQuarantine {
+            relative: quarantined.destination,
+            digests,
+        }))
+    }
+
+    fn publish_recovery_no_replace(
+        &self,
+        lock: &InstanceOperationLock,
+        paths: &InstanceStatePaths,
+        backup: &MarkerRecord,
+        backup_digests: &FileDigests,
+        backup_lease: &ImmutableManagedFile,
+    ) -> InstanceStateResult<MarkerRecord> {
+        let staging_relative = paths
+            .directory
+            .join_component(&format!(".active.recovery-{}.tmp", Uuid::new_v4()))?;
+        let mut staging =
+            ExclusiveManagedFile::create(&self.install_root, staging_relative.clone())?;
+        staging
+            .file_mut()
+            .write_all(&backup.bytes)
+            .map_err(|error| ManagedFsError::Io {
+                operation: "Cannot write active instance recovery staging file",
+                path: staging_relative.join_to(&self.install_root),
+                source: error,
+            })?;
+        let staging = staging.sync()?;
+
+        // This is the last trust boundary before a no-replace namespace commit. A primary that
+        // appears after any earlier read can only cause DestinationExists; it is never replaced.
+        self.validate_lock(lock)?;
+        backup_lease.revalidate()?;
+        let recovered = match staging.rename_no_replace(paths.primary.clone()) {
+            Ok(committed) => {
+                if committed.size != backup.bytes.len() as u64 {
+                    return Err(InstanceStateError::AppliedButVerificationUnconfirmed {
+                        destination: paths.primary.join_to(&self.install_root),
+                        detail: "no-replace recovery committed an unexpected byte length".into(),
+                    });
+                }
+                MarkerRecord {
+                    marker: backup.marker.clone(),
+                    bytes: backup.bytes.clone(),
+                }
+            }
+            Err(ManagedFsError::Conflict(_)) => {
+                remove_verified_managed_file(
+                    &self.install_root,
+                    &staging_relative,
+                    backup_digests,
+                )?;
+                match read_record(
+                    &self.install_root,
+                    &paths.primary,
+                    self.install_id,
+                    lock.channel,
+                ) {
+                    Ok(current)
+                        if current.marker == backup.marker && current.bytes == backup.bytes =>
+                    {
+                        current
+                    }
+                    Ok(current) => {
+                        return Err(InstanceStateError::Invalid(format!(
+                            "Active instance recovery collision preserved valid divergent primary generation {} instead of backup generation {}",
+                            current.marker.generation, backup.marker.generation
+                        )));
+                    }
+                    Err(LoadFailure::Future(version)) => {
+                        return Err(InstanceStateError::Invalid(format!(
+                            "launcher_update_required: active instance schema {version}"
+                        )));
+                    }
+                    Err(failure) => {
+                        return Err(InstanceStateError::Invalid(format!(
+                            "Active instance recovery collision left no exact committed primary: {failure}"
+                        )));
+                    }
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        verify_committed_record(
+            &self.install_root,
+            &paths.primary,
+            self.install_id,
+            lock.channel,
+            &recovered,
+            "recovered active instance marker",
+        )?;
+        Ok(recovered)
+    }
+
     fn validate_lock(&self, lock: &InstanceOperationLock) -> InstanceStateResult<()> {
         lock.validate_scope(&self.install_root, self.install_id, lock.channel)
     }
@@ -470,6 +727,7 @@ struct InstanceStatePaths {
     directory: RelativeManagedPath,
     primary: RelativeManagedPath,
     backup: RelativeManagedPath,
+    recovery_quarantine: RelativeManagedPath,
     lock: RelativeManagedPath,
 }
 
@@ -484,6 +742,9 @@ impl InstanceStatePaths {
             backup: directory
                 .join_component("active.json.bak")
                 .expect("constant active backup name must be valid"),
+            recovery_quarantine: directory
+                .join_component("recovery-quarantine")
+                .expect("constant active recovery quarantine name must be valid"),
             lock: directory
                 .join_component(".operation.lock")
                 .expect("constant operation lock name must be valid"),
@@ -495,12 +756,31 @@ impl InstanceStatePaths {
         drop(ensure_directory_chain(install_root, &self.directory)?);
         Ok(())
     }
+
+    fn prepare_recovery_quarantine(&self, install_root: &Path) -> InstanceStateResult<()> {
+        drop(ensure_directory_chain(
+            install_root,
+            &self.recovery_quarantine,
+        )?);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 struct MarkerRecord {
     marker: ActiveInstanceV2,
     bytes: Vec<u8>,
+}
+
+struct RecoveryQuarantine {
+    relative: RelativeManagedPath,
+    digests: FileDigests,
+}
+
+enum CorruptPrimaryPreparation {
+    Missing,
+    AlreadyRestored(Box<MarkerRecord>),
+    Quarantined(RecoveryQuarantine),
 }
 
 #[derive(Debug)]
@@ -531,14 +811,34 @@ fn read_record(
     install_id: Uuid,
     channel: BuildChannel,
 ) -> Result<MarkerRecord, LoadFailure> {
-    let mut file = match ImmutableManagedFile::open(install_root, path) {
+    read_record_leased(install_root, path, install_id, channel).map(|(record, _lease)| record)
+}
+
+fn read_record_leased(
+    install_root: &Path,
+    path: &RelativeManagedPath,
+    install_id: Uuid,
+    channel: BuildChannel,
+) -> Result<(MarkerRecord, ImmutableManagedFile), LoadFailure> {
+    let file = match ImmutableManagedFile::open(install_root, path) {
         Ok(file) => file,
         Err(error) if managed_error_is_missing(&error) => return Err(LoadFailure::Missing),
         Err(error) => return Err(LoadFailure::Corrupt(error.to_string())),
     };
     let bytes = file
-        .read_bounded(ACTIVE_INSTANCE_LIMIT as u64)
+        .read_bounded_shared(ACTIVE_INSTANCE_LIMIT as u64)
         .map_err(|error| LoadFailure::Corrupt(error.to_string()))?;
+    file.revalidate()
+        .map_err(|error| LoadFailure::Corrupt(error.to_string()))?;
+    let record = parse_record_bytes(bytes, install_id, channel)?;
+    Ok((record, file))
+}
+
+fn parse_record_bytes(
+    bytes: Vec<u8>,
+    install_id: Uuid,
+    channel: BuildChannel,
+) -> Result<MarkerRecord, LoadFailure> {
     if bytes.is_empty() {
         return Err(LoadFailure::Corrupt("marker is empty".into()));
     }
@@ -590,6 +890,18 @@ fn serialize_marker(marker: &ActiveInstanceV2) -> Result<Vec<u8>, String> {
         return Err("Serialized active instance marker exceeds its size limit".into());
     }
     Ok(bytes)
+}
+
+fn digests_for_bytes(bytes: &[u8]) -> FileDigests {
+    let mut sha1 = Sha1::new();
+    sha1.update(bytes);
+    let mut sha256 = Sha256::new();
+    sha256.update(bytes);
+    FileDigests {
+        size: bytes.len() as u64,
+        sha1: format!("{:x}", sha1.finalize()),
+        sha256: format!("{:x}", sha256.finalize()),
+    }
 }
 
 fn managed_error_is_missing(error: &ManagedFsError) -> bool {
@@ -885,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_backup_as_recovery_only_when_primary_is_corrupt() {
+    fn recovers_exact_backup_after_primary_is_corrupt() {
         let root = TestRoot::new("backup");
         let install_id = Uuid::new_v4();
         let store = InstanceStateStore::new(&root.0, install_id);
@@ -895,14 +1207,187 @@ mod tests {
         store.save(&second).unwrap();
         let primary = store.paths(BuildChannel::Stable).primary;
         let primary_path = primary.join_to(&root.0);
+        let backup_path = store.paths(BuildChannel::Stable).backup.join_to(&root.0);
+        let expected_bytes = fs::read(&backup_path).unwrap();
         fs::write(&primary_path, b"truncated").unwrap();
 
+        let lock = store.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        assert_eq!(store.load_locked(&lock).unwrap(), Some(first));
+        assert_eq!(fs::read(primary_path).unwrap(), expected_bytes);
+        assert_eq!(fs::read(backup_path).unwrap(), expected_bytes);
+        assert_eq!(
+            fs::read_dir(
+                store
+                    .paths(BuildChannel::Stable)
+                    .recovery_quarantine
+                    .join_to(&root.0)
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+        store
+            .save_locked(&lock, &second)
+            .expect("recovered generation remains advanceable");
+        assert_eq!(store.load_locked(&lock).unwrap(), Some(second));
+    }
+
+    #[test]
+    fn recovers_exact_backup_after_crash_leaves_primary_missing() {
+        let root = TestRoot::new("crash-missing-primary");
+        let install_id = Uuid::new_v4();
+        let store = InstanceStateStore::new(&root.0, install_id);
+        let first = marker(install_id, BuildChannel::Stable, 1, 'a');
+        let second = marker(install_id, BuildChannel::Stable, 2, 'b');
+        store.save(&first).unwrap();
+        store.save(&second).unwrap();
+        let paths = store.paths(BuildChannel::Stable);
+        let primary_path = paths.primary.join_to(&root.0);
+        let backup_path = paths.backup.join_to(&root.0);
+        let expected_bytes = fs::read(&backup_path).unwrap();
+        fs::remove_file(&primary_path).unwrap();
+        fs::write(
+            primary_path.parent().unwrap().join(".fragment-crash.tmp"),
+            b"partial-uncommitted-state",
+        )
+        .unwrap();
+
+        assert_eq!(store.load(BuildChannel::Stable).unwrap(), Some(first));
+        assert_eq!(fs::read(primary_path).unwrap(), expected_bytes);
+    }
+
+    #[test]
+    fn missing_primary_and_backup_is_an_empty_instance() {
+        let root = TestRoot::new("missing-state");
+        let install_id = Uuid::new_v4();
+        let store = InstanceStateStore::new(&root.0, install_id);
+
+        assert_eq!(store.load(BuildChannel::Stable).unwrap(), None);
+    }
+
+    #[test]
+    fn future_primary_is_never_replaced_by_valid_backup() {
+        let root = TestRoot::new("future-primary");
+        let install_id = Uuid::new_v4();
+        let store = InstanceStateStore::new(&root.0, install_id);
+        store
+            .save(&marker(install_id, BuildChannel::Stable, 1, 'a'))
+            .unwrap();
+        store
+            .save(&marker(install_id, BuildChannel::Stable, 2, 'b'))
+            .unwrap();
+        let paths = store.paths(BuildChannel::Stable);
+        let primary_path = paths.primary.join_to(&root.0);
+        let mut future =
+            serde_json::to_value(marker(install_id, BuildChannel::Stable, 3, 'c')).unwrap();
+        future["schemaVersion"] = Value::Number(Number::from(3));
+        let future_bytes = serde_json::to_vec(&future).unwrap();
+        fs::write(&primary_path, &future_bytes).unwrap();
+
         let error = store.load(BuildChannel::Stable).unwrap_err();
-        assert!(matches!(
-            error,
-            InstanceStateError::RecoveryRequired { backup, .. } if *backup == first
-        ));
-        assert_eq!(fs::read(primary_path).unwrap(), b"truncated");
+        assert!(error.to_string().contains("launcher_update_required"));
+        assert_eq!(fs::read(primary_path).unwrap(), future_bytes);
+    }
+
+    #[test]
+    fn commit_boundary_future_collision_is_preserved_by_no_replace_publish() {
+        let root = TestRoot::new("future-commit-collision");
+        let install_id = Uuid::new_v4();
+        let store = InstanceStateStore::new(&root.0, install_id);
+        store
+            .save(&marker(install_id, BuildChannel::Stable, 1, 'a'))
+            .unwrap();
+        store
+            .save(&marker(install_id, BuildChannel::Stable, 2, 'b'))
+            .unwrap();
+        let paths = store.paths(BuildChannel::Stable);
+        let (backup, backup_lease) =
+            read_record_leased(&root.0, &paths.backup, install_id, BuildChannel::Stable).unwrap();
+        fs::remove_file(paths.primary.join_to(&root.0)).unwrap();
+        let lock = store.acquire_operation_lock(BuildChannel::Stable).unwrap();
+
+        // Inject a future-schema primary after the backup has already been leased, immediately
+        // before invoking the exact no-replace commit primitive.
+        let mut future =
+            serde_json::to_value(marker(install_id, BuildChannel::Stable, 3, 'c')).unwrap();
+        future["schemaVersion"] = Value::Number(Number::from(3));
+        let future_bytes = serde_json::to_vec(&future).unwrap();
+        let primary_path = paths.primary.join_to(&root.0);
+        fs::write(&primary_path, &future_bytes).unwrap();
+
+        let error = store
+            .publish_recovery_no_replace(
+                &lock,
+                &paths,
+                &backup,
+                &digests_for_bytes(&backup.bytes),
+                &backup_lease,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("launcher_update_required"));
+        assert_eq!(fs::read(primary_path).unwrap(), future_bytes);
+        assert!(!fs::read_dir(paths.directory.join_to(&root.0))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".active.recovery-")));
+    }
+
+    #[test]
+    fn valid_same_generation_divergence_is_ambiguous_and_never_overwritten() {
+        let root = TestRoot::new("divergent-primary");
+        let install_id = Uuid::new_v4();
+        let store = InstanceStateStore::new(&root.0, install_id);
+        let primary = marker(install_id, BuildChannel::Stable, 1, 'a');
+        let divergent = marker(install_id, BuildChannel::Stable, 1, 'b');
+        store.save(&primary).unwrap();
+        let paths = store.paths(BuildChannel::Stable);
+        let primary_path = paths.primary.join_to(&root.0);
+        let primary_bytes = fs::read(&primary_path).unwrap();
+        fs::write(
+            paths.backup.join_to(&root.0),
+            serialize_marker(&divergent).unwrap(),
+        )
+        .unwrap();
+
+        let error = store.load(BuildChannel::Stable).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Ambiguous valid active instance"));
+        assert_eq!(fs::read(primary_path).unwrap(), primary_bytes);
+    }
+
+    #[test]
+    fn recovery_rejects_a_lock_with_the_wrong_filesystem_identity() {
+        let root = TestRoot::new("lock-identity");
+        let install_id = Uuid::new_v4();
+        let store = InstanceStateStore::new(&root.0, install_id);
+        store
+            .save(&marker(install_id, BuildChannel::Stable, 1, 'a'))
+            .unwrap();
+        store
+            .save(&marker(install_id, BuildChannel::Stable, 2, 'b'))
+            .unwrap();
+        let stable_paths = store.paths(BuildChannel::Stable);
+        let primary_path = stable_paths.primary.join_to(&root.0);
+        fs::remove_file(&primary_path).unwrap();
+
+        let dev_paths = store.paths(BuildChannel::Dev);
+        dev_paths.prepare(&root.0).unwrap();
+        let wrong_file = open_or_create_lock_file(&root.0, &dev_paths.lock).unwrap();
+        wrong_file.file().try_lock_exclusive().unwrap();
+        let forged_lock = InstanceOperationLock {
+            file: wrong_file,
+            install_root: root.0.clone(),
+            install_id,
+            channel: BuildChannel::Stable,
+        };
+
+        let error = store.load_locked(&forged_lock).unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        assert!(!primary_path.exists());
     }
 
     #[test]

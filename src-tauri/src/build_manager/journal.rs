@@ -2,34 +2,62 @@ use super::{
     contracts::{is_sha256, validate_manifest_path},
     instance_state::{ActiveInstanceV2, InstanceOperationLock, InstanceStateStore},
     managed_fs::{
-        atomic_write_small, ensure_directory_chain, ExclusiveManagedFile, ImmutableManagedFile,
-        ManagedFsError, RelativeManagedPath,
+        atomic_write_small, ensure_directory_chain, inspect_managed_garbage_node_nofollow,
+        remove_bounded_managed_garbage_tree, validate_materializable_manifest_path,
+        ExclusiveManagedFile, ImmutableManagedFile, ManagedDirectoryRemovalLimits, ManagedFsError,
+        RelativeManagedPath, MAX_MANAGED_FILE_BYTES, MAX_MANAGED_RELEASE_BYTES,
+        MAX_MANIFEST_PATH_COMPONENTS, MAX_RECONCILE_MUTATIONS, MAX_RELEASE_MANAGED_PATHS,
+        MAX_RELEASE_PATH_COMPONENTS,
     },
-    planner::{FinalizeCommitAuthorizationV2, RepairSupersedeAuthorizationV2},
-    reconcile_executor::RollbackCompletionAuthorizationV2,
-    release::FilePolicy,
+    planner::{
+        CurrentPlanSupersedeAuthorizationV2, CurrentReadyAbandonAuthorizationV2,
+        FinalizeCommitAuthorizationV2, RepairSupersedeAuthorizationV2,
+    },
+    reconcile_executor::{
+        ReconcileStagingFilesV2, RollbackCompletionAuthorizationV2,
+        TrustedReconcileStagingAuthorityV2,
+    },
+    release::{FilePolicy, MAX_FILES_PER_PRESET, MAX_RECONCILE_PLAN_BYTES as MAX_PLAN_BYTES},
+    storage::OwnedCasRoot,
     types::BuildChannel,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    io::Write,
+    fs,
+    io::{self, Write},
     path::Path,
 };
 use uuid::{Uuid, Version};
 
 const JOURNAL_SCHEMA_VERSION: u8 = 2;
 const MAX_POINTER_BYTES: u64 = 4 * 1024;
-const MAX_PLAN_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_PRESERVED_PATHS: usize = 4_096;
-const MAX_MUTATIONS: usize = 400_000;
-const MAX_RELATIVE_PATH_BYTES: usize = 1_024;
-const MAX_RELATIVE_PATH_SEGMENTS: usize = 128;
-const MAX_MANAGED_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const MAX_PLAN_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
+const MAX_PRESERVED_PATHS: usize = MAX_RELEASE_MANAGED_PATHS;
+const MAX_MUTATIONS: usize = MAX_RECONCILE_MUTATIONS;
+// Executor materialization prefixes every manifest path with `instances/<channel>`.
+const MAX_RELATIVE_PATH_SEGMENTS: usize = MAX_MANIFEST_PATH_COMPONENTS;
+const MAX_PLAN_FILE_BYTES: u64 = MAX_MANAGED_RELEASE_BYTES;
+const MAX_RECONCILE_MAINTENANCE_ENTRIES: usize = 4_096;
+// Every mutation can conservatively own two flat crash slots; every installed file can own two
+// additional staging/temporary slots. Quarantined signed topology is charged separately through
+// the aggregate release component budget, so deep paths do not multiply the file bound.
+const MAX_OPERATION_BASE_ENTRIES_PER_MUTATION: usize = 2;
+const MAX_OPERATION_EXTRA_ENTRIES_PER_INSTALL: usize = 2;
+// Fixed entries are the operation root and its five launcher-owned child directories.
+const MAX_OPERATION_FIXED_ENTRIES: usize = 6;
+// A relocated signed path is nested below the operation root and one slot-directory level; the
+// slot node itself replaces the original path's first component, adding one net level.
+const MAX_OPERATION_RELOCATED_PATH_DEPTH_OVERHEAD: usize = 1;
+// Staging, an in-flight destination copy, and the previous rollback/quarantine copy can each
+// coexist at a crash boundary. Per-entry slack covers directory indices and allocation rounding;
+// it is deliberately policy overhead, not a claim about bytes which deletion will reclaim.
+const MAX_OPERATION_PLAN_BYTE_COPIES: u64 = 3;
+const MAX_OPERATION_ALLOCATION_OVERHEAD_PER_ENTRY: u64 = MAX_SUPPORTED_ALLOCATION_UNIT_BYTES;
 pub(super) const JOURNAL_RESERVE_BYTES: u64 = 64 * 1024 * 1024 + 64 * 1024;
 pub(super) const MINIMUM_SAFETY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_SUPPORTED_ALLOCATION_UNIT_BYTES: u64 = 16 * 1024 * 1024;
+const JOURNAL_NAMESPACE_ENTRY_RESERVE: u64 = 16;
 
 /// The only mutable commit point in the reconcile journal.
 ///
@@ -55,6 +83,8 @@ struct JournalTombstoneV2 {
     completed_pointer_sha256: String,
     outcome: JournalCompletionOutcomeV2,
     continuation: Option<ActiveInstanceV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor: Option<JournalPointerV2>,
 }
 
 /// The durable outcome of one reconcile operation.
@@ -69,6 +99,8 @@ enum JournalCompletionOutcomeV2 {
     CommittedTarget,
     RolledBackToBase,
     SupersededForRepair,
+    SupersededForCurrentPlan,
+    AbandonedForCurrentReady,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -120,14 +152,22 @@ pub struct PlannedFileV2 {
     pub policy: FilePolicy,
 }
 
+/// A serialized crash-recovery record of the budget computed by the planner.
+///
+/// Structural validation and reconcile-copy totals are independently checked here, but dynamic
+/// availability reserves cannot be reconstructed from a journal alone. Consequently this record
+/// is never disk-allocation authority; only the non-serializable capability returned by a fresh
+/// `plan_build` may authorize a free-space check before mutation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiskBudgetV2 {
+    pub allocation_unit_bytes: u64,
     pub missing_download_bytes: u64,
     pub java_extracted_bytes: u64,
     pub game_extracted_bytes: u64,
     pub processor_workspace_bytes: u64,
     pub staging_bytes: u64,
+    pub reconcile_destination_bytes: u64,
     pub journal_reserve_bytes: u64,
     pub safety_margin_bytes: u64,
     pub required_bytes: u64,
@@ -140,11 +180,12 @@ impl DiskBudgetV2 {
         game_extracted_bytes: u64,
         staging_bytes: u64,
     ) -> Result<Self, String> {
-        Self::new_with_processor_workspace(
+        Self::new_with_allocation_unit(
             missing_download_bytes,
             java_extracted_bytes,
             game_extracted_bytes,
             0,
+            1,
             staging_bytes,
         )
     }
@@ -156,41 +197,82 @@ impl DiskBudgetV2 {
         processor_workspace_bytes: u64,
         staging_bytes: u64,
     ) -> Result<Self, String> {
+        Self::new_with_allocation_unit(
+            missing_download_bytes,
+            java_extracted_bytes,
+            game_extracted_bytes,
+            processor_workspace_bytes,
+            1,
+            staging_bytes,
+        )
+    }
+
+    pub(super) fn new_with_allocation_unit(
+        missing_download_bytes: u64,
+        java_extracted_bytes: u64,
+        game_extracted_bytes: u64,
+        processor_workspace_bytes: u64,
+        allocation_unit_bytes: u64,
+        staging_bytes: u64,
+    ) -> Result<Self, String> {
+        Self::new_with_physical_layout(
+            missing_download_bytes,
+            java_extracted_bytes,
+            game_extracted_bytes,
+            processor_workspace_bytes,
+            allocation_unit_bytes,
+            staging_bytes,
+            staging_bytes,
+        )
+    }
+
+    pub(super) fn new_with_physical_layout(
+        missing_download_bytes: u64,
+        java_extracted_bytes: u64,
+        game_extracted_bytes: u64,
+        processor_workspace_bytes: u64,
+        allocation_unit_bytes: u64,
+        staging_bytes: u64,
+        reconcile_destination_bytes: u64,
+    ) -> Result<Self, String> {
+        validate_allocation_unit(allocation_unit_bytes)?;
+        let journal_reserve_bytes = journal_reserve_for_allocation_unit(allocation_unit_bytes)?;
         let subtotal = [
             missing_download_bytes,
             java_extracted_bytes,
             game_extracted_bytes,
             processor_workspace_bytes,
             staging_bytes,
-            JOURNAL_RESERVE_BYTES,
+            reconcile_destination_bytes,
+            journal_reserve_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, |total, value| total.checked_add(value))
         .ok_or_else(|| "Disk budget subtotal overflowed".to_string())?;
-        let five_percent = subtotal / 20 + u64::from(subtotal % 20 != 0);
-        let safety_margin_bytes = five_percent.max(MINIMUM_SAFETY_MARGIN_BYTES);
-        let required_bytes = subtotal
-            .checked_add(safety_margin_bytes)
-            .ok_or_else(|| "Disk budget total overflowed".to_string())?;
+        let (safety_margin_bytes, required_bytes) = required_with_safety_margin(subtotal)?;
         Ok(Self {
+            allocation_unit_bytes,
             missing_download_bytes,
             java_extracted_bytes,
             game_extracted_bytes,
             processor_workspace_bytes,
             staging_bytes,
-            journal_reserve_bytes: JOURNAL_RESERVE_BYTES,
+            reconcile_destination_bytes,
+            journal_reserve_bytes,
             safety_margin_bytes,
             required_bytes,
         })
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        let expected = Self::new_with_processor_workspace(
+        let expected = Self::new_with_physical_layout(
             self.missing_download_bytes,
             self.java_extracted_bytes,
             self.game_extracted_bytes,
             self.processor_workspace_bytes,
+            self.allocation_unit_bytes,
             self.staging_bytes,
+            self.reconcile_destination_bytes,
         )?;
         if *self != expected {
             return Err("Reconcile disk budget is not canonical".into());
@@ -198,8 +280,85 @@ impl DiskBudgetV2 {
         Ok(())
     }
 
-    pub fn fits(&self, available_bytes: u64) -> bool {
-        available_bytes >= self.required_bytes
+    /// Recomputes the current physical admission after a non-serializable, root-bound auditor has
+    /// proved that every deterministic reconcile staging slot is complete and exact. The caller
+    /// supplies only the independently measured remaining destination/namespace allocation; this
+    /// method never treats the serialized staging total as live availability evidence.
+    ///
+    /// The fresh dynamic download/runtime/processor reserves remain charged, as do the bounded
+    /// journal/marker commit reserve and canonical safety margin. This helper is arithmetic only:
+    /// it grants no staging credit unless wrapped by the sealed resume authority and exact staging
+    /// capability in the reconcile executor.
+    pub(super) fn required_after_exact_staging(
+        &self,
+        remaining_destination_bytes: u64,
+    ) -> Result<u64, String> {
+        self.validate()?;
+        let subtotal = [
+            self.missing_download_bytes,
+            self.java_extracted_bytes,
+            self.game_extracted_bytes,
+            self.processor_workspace_bytes,
+            remaining_destination_bytes,
+            self.journal_reserve_bytes,
+            self.safety_margin_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| total.checked_add(value))
+        .ok_or_else(|| "Resume disk budget subtotal overflowed".to_string())?;
+        Ok(subtotal)
+    }
+}
+
+fn journal_reserve_for_allocation_unit(allocation_unit: u64) -> Result<u64, String> {
+    let namespace = if allocation_unit == 1 {
+        0
+    } else {
+        allocation_unit
+            .checked_mul(JOURNAL_NAMESPACE_ENTRY_RESERVE)
+            .ok_or_else(|| "Journal namespace reserve overflowed".to_string())?
+    };
+    JOURNAL_RESERVE_BYTES
+        .checked_add(namespace)
+        .ok_or_else(|| "Journal reserve overflowed".to_string())
+}
+
+fn required_with_safety_margin(subtotal: u64) -> Result<(u64, u64), String> {
+    let five_percent = subtotal / 20 + u64::from(!subtotal.is_multiple_of(20));
+    let safety_margin_bytes = five_percent.max(MINIMUM_SAFETY_MARGIN_BYTES);
+    let required_bytes = subtotal
+        .checked_add(safety_margin_bytes)
+        .ok_or_else(|| "Disk budget total overflowed".to_string())?;
+    Ok((safety_margin_bytes, required_bytes))
+}
+
+/// Canonical admission for non-journaled download/bootstrap phases. The caller supplies an exact
+/// physical content+namespace subtotal; this adds the same bounded headroom as a full build
+/// without charging reconcile journal storage which the phase cannot create.
+pub(super) fn required_phase_bytes(subtotal: u64) -> Result<u64, String> {
+    required_with_safety_margin(subtotal).map(|(_, required)| required)
+}
+
+fn validate_allocation_unit(value: u64) -> Result<(), String> {
+    if value == 1
+        || (value.is_power_of_two() && (512..=MAX_SUPPORTED_ALLOCATION_UNIT_BYTES).contains(&value))
+    {
+        Ok(())
+    } else {
+        Err("Disk budget allocation unit is invalid".into())
+    }
+}
+
+fn round_up_disk_allocation(size: u64, allocation_unit: u64) -> Result<u64, String> {
+    if size == 0 || allocation_unit == 1 {
+        return Ok(size);
+    }
+    let remainder = size % allocation_unit;
+    if remainder == 0 {
+        Ok(size)
+    } else {
+        size.checked_add(allocation_unit - remainder)
+            .ok_or_else(|| "Disk allocation rounding overflowed".into())
     }
 }
 
@@ -234,6 +393,19 @@ pub enum JournalMutation {
 pub struct PendingJournalV2 {
     pub pointer: JournalPointerV2,
     pub plan: ReconcilePlanV2,
+}
+
+pub(super) struct PendingJournalTransitionV2 {
+    pub(super) pending: PendingJournalV2,
+    pub(super) durable_successor: Option<PendingJournalV2>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ReconcileMaintenanceReportV2 {
+    pub(super) operation_roots_removed: usize,
+    pub(super) completion_histories_removed: usize,
+    pub(super) orphan_plans_removed: usize,
+    pub(super) temporary_files_removed: usize,
 }
 
 impl JournalPointerV2 {
@@ -339,10 +511,89 @@ impl ReconcilePlanV2 {
             }
         }
         let desired = self.validate_desired_files(&preserved)?;
-        let staging_bytes = self.validate_mutations(&preserved, &desired)?;
+        self.validate_mutations(&preserved, &desired)?;
+        // Establish budget self-consistency before deriving any plan-bound reserve from its
+        // fields. A canonical budget may still disagree with the mutation set; the exact staging
+        // and destination checks below report those independent invariants deterministically.
         self.disk_budget.validate()?;
-        if self.disk_budget.staging_bytes != staging_bytes {
+        let (allocated_file_bytes, install_count, quarantine_count, directory_count) =
+            self.mutations.iter().try_fold(
+                (0_u64, 0_u64, 0_u64, 0_u64),
+                |(bytes, installs, quarantines, directories), mutation| match mutation {
+                    JournalMutation::InstallFile { size, .. } => {
+                        Ok::<(u64, u64, u64, u64), String>((
+                            bytes
+                                .checked_add(round_up_disk_allocation(
+                                    *size,
+                                    self.disk_budget.allocation_unit_bytes,
+                                )?)
+                                .ok_or_else(|| {
+                                    "Allocated reconcile byte total overflowed".to_string()
+                                })?,
+                            installs
+                                .checked_add(1)
+                                .ok_or_else(|| "Reconcile install count overflowed".to_string())?,
+                            quarantines,
+                            directories,
+                        ))
+                    }
+                    JournalMutation::Quarantine { .. } => Ok((
+                        bytes,
+                        installs,
+                        quarantines
+                            .checked_add(1)
+                            .ok_or_else(|| "Reconcile quarantine count overflowed".to_string())?,
+                        directories,
+                    )),
+                    JournalMutation::EnsureDirectory { .. } => Ok((
+                        bytes,
+                        installs,
+                        quarantines,
+                        directories
+                            .checked_add(1)
+                            .ok_or_else(|| "Reconcile directory count overflowed".to_string())?,
+                    )),
+                },
+            )?;
+        let (expected_staging_bytes, expected_destination_bytes) = if self
+            .disk_budget
+            .allocation_unit_bytes
+            == 1
+        {
+            (allocated_file_bytes, allocated_file_bytes)
+        } else {
+            let staging_entries = install_count
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(5))
+                .ok_or_else(|| "Reconcile staging namespace count overflowed".to_string())?;
+            let destination_entries = install_count
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(quarantine_count))
+                .and_then(|count| count.checked_add(directory_count))
+                .and_then(|count| count.checked_add(5))
+                .ok_or_else(|| "Reconcile destination namespace count overflowed".to_string())?;
+            let staging_namespace = staging_entries
+                .checked_mul(self.disk_budget.allocation_unit_bytes)
+                .ok_or_else(|| "Reconcile staging namespace reserve overflowed".to_string())?;
+            let destination_namespace = destination_entries
+                .checked_mul(self.disk_budget.allocation_unit_bytes)
+                .ok_or_else(|| "Reconcile destination namespace reserve overflowed".to_string())?;
+            (
+                allocated_file_bytes
+                    .checked_add(staging_namespace)
+                    .ok_or_else(|| "Reconcile staging reserve overflowed".to_string())?,
+                allocated_file_bytes
+                    .checked_add(destination_namespace)
+                    .ok_or_else(|| "Reconcile destination reserve overflowed".to_string())?,
+            )
+        };
+        if self.disk_budget.staging_bytes != expected_staging_bytes {
             return Err("Disk budget staging bytes do not match install mutations".into());
+        }
+        if self.disk_budget.reconcile_destination_bytes != expected_destination_bytes {
+            return Err(
+                "Disk budget reconcile destination bytes do not match install mutations".into(),
+            );
         }
         Ok(())
     }
@@ -355,13 +606,18 @@ impl ReconcilePlanV2 {
         &self,
         preserved: &PathBoundaryIndex,
     ) -> Result<BTreeMap<String, &PlannedFileV2>, String> {
-        if self.desired_files.is_empty() || self.desired_files.len() > MAX_MUTATIONS {
-            return Err("Reconcile plan desired-file set is empty or oversized".into());
-        }
+        validate_desired_file_policy_count(self.desired_files.len())?;
         let mut previous: Option<String> = None;
         let mut desired = BTreeMap::new();
+        let mut path_components = 0_usize;
+        let mut signed_bytes = 0_u64;
+        let mut installed_bytes = 0_u64;
         for file in &self.desired_files {
             validate_mutation_path(&file.path, preserved)?;
+            path_components = checked_reconcile_path_component_total(
+                path_components,
+                file.path.split('/').count(),
+            )?;
             let key = path_key(&file.path);
             require_sorted_unique(&previous, &key, "desired file")?;
             if file.signed_size > MAX_MANAGED_FILE_BYTES
@@ -374,6 +630,8 @@ impl ReconcilePlanV2 {
             {
                 return Err(format!("Desired file binding is invalid: {}", file.path));
             }
+            signed_bytes = checked_desired_file_bytes(signed_bytes, file.signed_size)?;
+            installed_bytes = checked_desired_file_bytes(installed_bytes, file.installed_size)?;
             desired.insert(key.clone(), file);
             previous = Some(key);
         }
@@ -509,6 +767,30 @@ impl ReconcilePlanV2 {
     }
 }
 
+fn validate_desired_file_policy_count(count: usize) -> Result<(), String> {
+    if count == 0 || count > MAX_FILES_PER_PRESET {
+        return Err("Reconcile plan desired-file set is empty or oversized".into());
+    }
+    Ok(())
+}
+
+fn checked_reconcile_path_component_total(
+    current: usize,
+    additional: usize,
+) -> Result<usize, String> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= MAX_RELEASE_PATH_COMPONENTS)
+        .ok_or_else(|| "Reconcile desired-file topology exceeds its component budget".to_string())
+}
+
+fn checked_desired_file_bytes(current: u64, additional: u64) -> Result<u64, String> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= MAX_MANAGED_RELEASE_BYTES)
+        .ok_or_else(|| "Reconcile desired-file bytes exceed the managed release budget".into())
+}
+
 fn same_release_content(base: &ActiveInstanceV2, target: &ActiveInstanceV2) -> bool {
     base.release_id == target.release_id
         && base.release_manifest_sha256 == target.release_manifest_sha256
@@ -516,7 +798,7 @@ fn same_release_content(base: &ActiveInstanceV2, target: &ActiveInstanceV2) -> b
         && base.game_runtime_lock_sha256 == target.game_runtime_lock_sha256
         && base
             .trusted_release
-            .is_monotonic_to(&target.trusted_release)
+            .targets_match_and_roles_are_monotonic_to(&target.trusted_release)
 }
 
 /// Serialize and publish the immutable, content-addressed plan file. This does not publish the
@@ -686,6 +968,219 @@ pub fn detect_pending(
     }
 }
 
+/// Detects the crash boundary where a stale pending pointer still names the old operation while
+/// its exact current-plan supersede history and immutable successor plan are already durable.
+/// This is structural recovery evidence only; the coordinator must rebuild fresh non-serializable
+/// planner/staging authority and require the resulting plan to equal `durable_successor` byte for
+/// byte before retrying the atomic pointer swap.
+pub(super) fn detect_pending_transition(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+) -> Result<Option<PendingJournalTransitionV2>, String> {
+    let Some(pending) = detect_pending(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+    )?
+    else {
+        return Ok(None);
+    };
+    let durable_successor = load_durable_successor_for_pending(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        &pending,
+    )?;
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Pending transition lock changed: {error}"))?;
+    Ok(Some(PendingJournalTransitionV2 {
+        pending,
+        durable_successor,
+    }))
+}
+
+fn load_durable_successor_for_pending(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    pending: &PendingJournalV2,
+) -> Result<Option<PendingJournalV2>, String> {
+    let paths = JournalPaths::new(expected_channel, &pending.pointer)?;
+    let Some(history_bytes) = read_optional_bounded(
+        install_root,
+        &paths.completion,
+        MAX_POINTER_BYTES,
+        "pending transition completion history",
+    )?
+    else {
+        return Ok(None);
+    };
+    let tombstone: JournalTombstoneV2 =
+        parse_without_duplicate_keys(&history_bytes, "pending transition completion history")?;
+    let canonical = serialize_bounded(
+        &tombstone,
+        MAX_POINTER_BYTES as usize,
+        "pending transition completion history",
+    )?;
+    if canonical != history_bytes || tombstone.completed_pointer != pending.pointer {
+        return Err("Pending transition completion history is not exact for its pointer".into());
+    }
+    let validated_plan = validate_completion_history(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        &tombstone,
+        &history_bytes,
+    )?;
+    if validated_plan != pending.plan {
+        return Err("Pending transition history loaded another immutable plan".into());
+    }
+    if tombstone.outcome != JournalCompletionOutcomeV2::SupersededForCurrentPlan {
+        return Ok(None);
+    }
+    let successor = tombstone
+        .successor
+        .as_ref()
+        .ok_or_else(|| "Current-plan transition history has no successor".to_string())?;
+    let successor_paths = JournalPaths::new(expected_channel, successor)?;
+    let successor_plan = load_plan(
+        install_root,
+        &successor_paths.plan,
+        successor,
+        expected_install_id,
+        expected_channel,
+    )?;
+    if successor_plan.operation_id != successor.operation_id {
+        return Err("Pending transition successor plan does not match its pointer".into());
+    }
+    validate_superseding_current_plan(
+        &pending.plan,
+        tombstone.continuation.as_ref(),
+        &successor_plan,
+    )?;
+    Ok(Some(PendingJournalV2 {
+        pointer: successor.clone(),
+        plan: successor_plan,
+    }))
+}
+
+/// Completes only the bookkeeping half of a previously authorized current-plan supersede.
+///
+/// The immutable old completion history and exact successor plan must already be durable. This
+/// function never executes either plan, never touches staging/instance files and never grants
+/// roll-forward or rollback authority; it only converges `pending.json` from the recorded old
+/// pointer to the recorded successor pointer. The successor is then classified normally against
+/// fresh TUF state by the coordinator.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn advance_pending_to_recorded_successor(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    expected_pending: &JournalPointerV2,
+    expected_successor: &JournalPointerV2,
+) -> Result<PendingJournalV2, String> {
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Invalid reconcile operation lock: {error}"))?;
+    expected_pending.validate(expected_install_id, expected_channel)?;
+    expected_successor.validate(expected_install_id, expected_channel)?;
+    if expected_pending.operation_id == expected_successor.operation_id {
+        return Err("Recorded successor reuses the pending operation ID".into());
+    }
+
+    let old_paths = JournalPaths::new(expected_channel, expected_pending)?;
+    let old_plan = load_plan(
+        install_root,
+        &old_paths.plan,
+        expected_pending,
+        expected_install_id,
+        expected_channel,
+    )?;
+    let old_pending = PendingJournalV2 {
+        pointer: expected_pending.clone(),
+        plan: old_plan,
+    };
+    let recorded = load_durable_successor_for_pending(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        &old_pending,
+    )?
+    .ok_or_else(|| "Pending operation has no durable current-plan successor".to_string())?;
+    if recorded.pointer != *expected_successor {
+        return Err("Durable transition records another successor pointer".into());
+    }
+
+    let state = InstanceStateStore::new(install_root, expected_install_id);
+    let active = state
+        .load_locked(operation_lock)
+        .map_err(|error| format!("Cannot verify active state for pointer handoff: {error}"))?;
+    if active != recorded.plan.base {
+        return Err("Recorded successor base is not the exact active marker".into());
+    }
+
+    let pending_path = journal_pending_path(expected_channel)?;
+    let current_bytes = read_bounded(
+        install_root,
+        &pending_path,
+        MAX_POINTER_BYTES,
+        "pending pointer handoff slot",
+    )?;
+    let current_pointer =
+        match parse_journal_slot(&current_bytes, expected_install_id, expected_channel)? {
+            JournalSlotV2::Pending(pointer) => pointer,
+            JournalSlotV2::Cleared(_) => {
+                return Err("Pending pointer handoff found a completed journal slot".into())
+            }
+        };
+    let old_bytes = serialize_bounded(
+        expected_pending,
+        MAX_POINTER_BYTES as usize,
+        "expected pending pointer",
+    )?;
+    let successor_bytes = serialize_bounded(
+        expected_successor,
+        MAX_POINTER_BYTES as usize,
+        "recorded successor pointer",
+    )?;
+    if current_pointer == *expected_pending && current_bytes == old_bytes {
+        atomic_write_small(
+            install_root,
+            pending_path.clone(),
+            &successor_bytes,
+            MAX_POINTER_BYTES as usize,
+        )
+        .map_err(|error| format!("Cannot atomically advance pending pointer: {error}"))?;
+    } else if current_pointer != *expected_successor || current_bytes != successor_bytes {
+        return Err("Pending pointer changed outside the recorded transition".into());
+    }
+
+    let persisted = read_bounded(
+        install_root,
+        &pending_path,
+        MAX_POINTER_BYTES,
+        "advanced successor pointer",
+    )?;
+    if persisted != successor_bytes {
+        return Err("Advanced successor pointer changed during verification".into());
+    }
+    let active_after = state
+        .load_locked(operation_lock)
+        .map_err(|error| format!("Cannot reverify active state after pointer handoff: {error}"))?;
+    if active_after != recorded.plan.base {
+        return Err("Active marker changed during recorded pointer handoff".into());
+    }
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Recorded pointer handoff lock changed: {error}"))?;
+    Ok(recorded)
+}
+
 /// Completes an operation only after the caller has observed its exact committed target.
 pub fn complete_pending_committed(
     install_root: &Path,
@@ -710,6 +1205,41 @@ pub fn complete_pending_committed(
         operation_lock,
         expected,
         JournalCompletionOutcomeV2::CommittedTarget,
+    )
+}
+
+/// Durably abandons a stale pointer only after the fresh signed planner independently classified
+/// the exact active continuation as Ready. Callers must repeat the fresh audit after this tombstone
+/// is published before exposing Ready or launching.
+pub fn abandon_stale_pending_for_current_ready(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    expected: &JournalPointerV2,
+    authorization: CurrentReadyAbandonAuthorizationV2,
+) -> Result<bool, String> {
+    let stale_plan = load_authorized_plan(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        expected,
+    )?;
+    authorization.validate_for(expected, &stale_plan)?;
+    let active = InstanceStateStore::new(install_root, expected_install_id)
+        .load_locked(operation_lock)
+        .map_err(|error| format!("Cannot verify active state for fresh-ready abandon: {error}"))?;
+    if active.as_ref() != Some(authorization.continuation()) {
+        return Err("Fresh-ready active marker changed before stale journal abandon".into());
+    }
+    complete_pending(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        expected,
+        JournalCompletionOutcomeV2::AbandonedForCurrentReady,
     )
 }
 
@@ -818,6 +1348,7 @@ pub fn supersede_pending_with_repair(
         completed_pointer_sha256: format!("{:x}", Sha256::digest(&failed_pointer_bytes)),
         outcome: JournalCompletionOutcomeV2::SupersededForRepair,
         continuation: Some(failed_plan.target.clone()),
+        successor: None,
     };
     completion.validate(expected_install_id, expected_channel)?;
     validate_completion_binding(
@@ -898,6 +1429,163 @@ pub fn supersede_pending_with_repair(
     Ok(repair_pointer)
 }
 
+/// Atomically replaces a failed committed historical operation with one completely prepared
+/// update derived from the freshly trusted TUF release. The new plan and every staging slot are
+/// revalidated through non-serializable planner/staging authorities before durable supersede
+/// history is written; `pending.json` then changes directly from old to new with no idle gap.
+#[allow(clippy::too_many_arguments)]
+pub fn supersede_stale_pending_with_current_plan(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    cas_root: &OwnedCasRoot,
+    failed_pointer: &JournalPointerV2,
+    authorization: CurrentPlanSupersedeAuthorizationV2,
+    update_authority: &TrustedReconcileStagingAuthorityV2<'_, '_>,
+    staged_update: &ReconcileStagingFilesV2,
+) -> Result<JournalPointerV2, String> {
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Invalid reconcile operation lock: {error}"))?;
+    failed_pointer.validate(expected_install_id, expected_channel)?;
+    let failed_paths = JournalPaths::new(expected_channel, failed_pointer)?;
+    let failed_plan = load_plan(
+        install_root,
+        &failed_paths.plan,
+        failed_pointer,
+        expected_install_id,
+        expected_channel,
+    )?;
+    let current_plan = update_authority.plan();
+    authorization.validate_for(failed_pointer, &failed_plan, current_plan)?;
+    let active = InstanceStateStore::new(install_root, expected_install_id)
+        .load_locked(operation_lock)
+        .map_err(|error| {
+            format!("Cannot verify active state for current-plan supersede: {error}")
+        })?;
+    if active.as_ref() != authorization.continuation() {
+        return Err("Current-plan supersede active marker changed after planning".into());
+    }
+    validate_superseding_current_plan(&failed_plan, active.as_ref(), current_plan)?;
+    staged_update
+        .proofs_for(update_authority, operation_lock, cas_root)
+        .map_err(|error| format!("Prepared current-update staging is invalid: {error}"))?;
+
+    let update_pointer = write_immutable_plan(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        current_plan,
+    )?;
+    let failed_pointer_bytes = serialize_bounded(
+        failed_pointer,
+        MAX_POINTER_BYTES as usize,
+        "failed journal pointer",
+    )?;
+    let completion = JournalTombstoneV2 {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        install_id: expected_install_id,
+        channel: expected_channel,
+        completed_pointer: failed_pointer.clone(),
+        completed_pointer_sha256: format!("{:x}", Sha256::digest(&failed_pointer_bytes)),
+        outcome: JournalCompletionOutcomeV2::SupersededForCurrentPlan,
+        continuation: active.clone(),
+        successor: Some(update_pointer.clone()),
+    };
+    completion.validate(expected_install_id, expected_channel)?;
+    validate_completion_binding(
+        &failed_plan,
+        completion.outcome,
+        completion.continuation.as_ref(),
+    )?;
+    let completion_bytes = serialize_bounded(
+        &completion,
+        MAX_POINTER_BYTES as usize,
+        "journal completion",
+    )?;
+    let update_pointer_bytes = serialize_bounded(
+        &update_pointer,
+        MAX_POINTER_BYTES as usize,
+        "current-update journal pointer",
+    )?;
+    let current = read_bounded(
+        install_root,
+        &failed_paths.pending,
+        MAX_POINTER_BYTES,
+        "journal slot",
+    )?;
+    match parse_journal_slot(&current, expected_install_id, expected_channel)? {
+        JournalSlotV2::Pending(pointer)
+            if pointer == *failed_pointer && current == failed_pointer_bytes => {}
+        JournalSlotV2::Pending(pointer)
+            if pointer == update_pointer && current == update_pointer_bytes =>
+        {
+            validate_completion_history(
+                install_root,
+                expected_install_id,
+                expected_channel,
+                &completion,
+                &completion_bytes,
+            )?;
+            return Ok(update_pointer);
+        }
+        _ => return Err(
+            "Pending journal is neither the failed operation nor its exact signed-current update"
+                .into(),
+        ),
+    }
+
+    failed_paths.prepare(install_root)?;
+    publish_immutable_file(
+        install_root,
+        &failed_paths.temporary,
+        &failed_paths.completion,
+        &completion_bytes,
+        true,
+    )?;
+    validate_completion_history(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        &completion,
+        &completion_bytes,
+    )?;
+    atomic_write_small(
+        install_root,
+        failed_paths.pending.clone(),
+        &update_pointer_bytes,
+        MAX_POINTER_BYTES as usize,
+    )
+    .map_err(|error| format!("Cannot atomically supersede journal with current update: {error}"))?;
+    let persisted = read_bounded(
+        install_root,
+        &failed_paths.pending,
+        MAX_POINTER_BYTES,
+        "current-update journal pointer",
+    )?;
+    if persisted != update_pointer_bytes {
+        return Err("Superseding current-update pointer changed during verification".into());
+    }
+    Ok(update_pointer)
+}
+
+fn validate_superseding_current_plan(
+    failed: &ReconcilePlanV2,
+    active: Option<&ActiveInstanceV2>,
+    update: &ReconcilePlanV2,
+) -> Result<(), String> {
+    update.validate(failed.install_id, failed.channel)?;
+    if update.operation_id == failed.operation_id || update.base.as_ref() != active {
+        return Err(
+            "Superseding operation is not the authorized signed-current plan for the observed state"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_superseding_repair(
     failed: &ReconcilePlanV2,
     repair: &ReconcilePlanV2,
@@ -942,8 +1630,12 @@ fn complete_pending(
         expected_install_id,
         expected_channel,
     )?;
-    if outcome == JournalCompletionOutcomeV2::SupersededForRepair {
-        return Err("A repair supersede cannot be published as an idle tombstone".into());
+    if matches!(
+        outcome,
+        JournalCompletionOutcomeV2::SupersededForRepair
+            | JournalCompletionOutcomeV2::SupersededForCurrentPlan
+    ) {
+        return Err("A supersede cannot be published as an idle tombstone".into());
     }
     let active = InstanceStateStore::new(install_root, expected_install_id)
         .load_locked(operation_lock)
@@ -961,7 +1653,9 @@ fn complete_pending(
             }
             active
         }
-        JournalCompletionOutcomeV2::SupersededForRepair => unreachable!("rejected above"),
+        JournalCompletionOutcomeV2::AbandonedForCurrentReady => active,
+        JournalCompletionOutcomeV2::SupersededForRepair
+        | JournalCompletionOutcomeV2::SupersededForCurrentPlan => unreachable!("rejected above"),
     };
     validate_completion_binding(&cleared_plan, outcome, continuation.as_ref())?;
     let pending = journal_pending_path(expected_channel)?;
@@ -975,6 +1669,7 @@ fn complete_pending(
         completed_pointer_sha256: format!("{:x}", Sha256::digest(&expected_bytes)),
         outcome,
         continuation,
+        successor: None,
     };
     tombstone.validate(expected_install_id, expected_channel)?;
     let tombstone_bytes =
@@ -1109,8 +1804,29 @@ impl JournalTombstoneV2 {
                 .validate(expected_install_id, expected_channel)
                 .map_err(|error| format!("Invalid completed reconcile continuation: {error}"))?;
         }
-        if self.outcome != JournalCompletionOutcomeV2::RolledBackToBase
-            && self.continuation.is_none()
+        if let Some(successor) = &self.successor {
+            successor.validate(expected_install_id, expected_channel)?;
+            if successor.operation_id == self.completed_pointer.operation_id {
+                return Err(
+                    "Reconcile supersede successor reuses the completed operation ID".into(),
+                );
+            }
+        }
+        match self.outcome {
+            JournalCompletionOutcomeV2::SupersededForCurrentPlan if self.successor.is_none() => {
+                return Err("Current-plan supersede history requires its exact successor".into())
+            }
+            JournalCompletionOutcomeV2::SupersededForCurrentPlan => {}
+            _ if self.successor.is_some() => {
+                return Err("Only current-plan supersede history may contain a successor".into())
+            }
+            _ => {}
+        }
+        if !matches!(
+            self.outcome,
+            JournalCompletionOutcomeV2::RolledBackToBase
+                | JournalCompletionOutcomeV2::SupersededForCurrentPlan
+        ) && self.continuation.is_none()
         {
             return Err("Committed and superseded operations require a continuation target".into());
         }
@@ -1123,10 +1839,21 @@ fn validate_completion_binding(
     outcome: JournalCompletionOutcomeV2,
     continuation: Option<&ActiveInstanceV2>,
 ) -> Result<(), String> {
+    if outcome == JournalCompletionOutcomeV2::SupersededForCurrentPlan {
+        // This outcome deliberately abandons every stale-plan mutation. The continuation is the
+        // exact live marker bound by the non-serializable fresh-plan authorization at publication.
+        return Ok(());
+    }
+    if outcome == JournalCompletionOutcomeV2::AbandonedForCurrentReady {
+        // Bound to the exact active marker by the fresh-ready authorization before publication.
+        return Ok(());
+    }
     let expected = match outcome {
         JournalCompletionOutcomeV2::CommittedTarget
         | JournalCompletionOutcomeV2::SupersededForRepair => Some(&plan.target),
         JournalCompletionOutcomeV2::RolledBackToBase => plan.base.as_ref(),
+        JournalCompletionOutcomeV2::SupersededForCurrentPlan => unreachable!("handled above"),
+        JournalCompletionOutcomeV2::AbandonedForCurrentReady => unreachable!("handled above"),
     };
     if continuation != expected {
         return Err(match outcome {
@@ -1139,6 +1866,8 @@ fn validate_completion_binding(
             JournalCompletionOutcomeV2::SupersededForRepair => {
                 "Superseded journal outcome does not match the exact active plan target"
             }
+            JournalCompletionOutcomeV2::SupersededForCurrentPlan => unreachable!("handled above"),
+            JournalCompletionOutcomeV2::AbandonedForCurrentReady => unreachable!("handled above"),
         }
         .into());
     }
@@ -1153,8 +1882,12 @@ fn validate_persisted_completion(
     tombstone: &JournalTombstoneV2,
     pending_bytes: &[u8],
 ) -> Result<ReconcilePlanV2, String> {
-    if tombstone.outcome == JournalCompletionOutcomeV2::SupersededForRepair {
-        return Err("A repair supersede completion cannot occupy the pending journal slot".into());
+    if matches!(
+        tombstone.outcome,
+        JournalCompletionOutcomeV2::SupersededForRepair
+            | JournalCompletionOutcomeV2::SupersededForCurrentPlan
+    ) {
+        return Err("A supersede completion cannot occupy the pending journal slot".into());
     }
     let plan = validate_completion_history(
         install_root,
@@ -1193,6 +1926,23 @@ fn validate_completion_history(
         expected_channel,
     )?;
     validate_completion_binding(&plan, tombstone.outcome, tombstone.continuation.as_ref())?;
+    if let Some(successor) = &tombstone.successor {
+        let successor_paths = JournalPaths::new(expected_channel, successor)?;
+        let successor_plan = load_plan(
+            install_root,
+            &successor_paths.plan,
+            successor,
+            expected_install_id,
+            expected_channel,
+        )?;
+        if successor_plan.operation_id == plan.operation_id
+            || successor_plan.base.as_ref() != tombstone.continuation.as_ref()
+        {
+            return Err(
+                "Journal supersede history successor is not bound to its exact continuation".into(),
+            );
+        }
+    }
     let history = read_bounded(
         install_root,
         &paths.completion,
@@ -1229,12 +1979,8 @@ fn parse_journal_slot(
 
 fn validate_relative_path(path: &str) -> Result<(), String> {
     validate_manifest_path(path)?;
-    RelativeManagedPath::new(path)
+    validate_materializable_manifest_path(path)
         .map_err(|error| format!("Reconcile path cannot be materialized safely: {error}"))?;
-    if path.len() > MAX_RELATIVE_PATH_BYTES || path.split('/').count() > MAX_RELATIVE_PATH_SEGMENTS
-    {
-        return Err(format!("Reconcile path exceeds launcher bounds: {path}"));
-    }
     Ok(())
 }
 
@@ -1355,12 +2101,88 @@ fn serialize_bounded<T: Serialize>(
     maximum: usize,
     label: &str,
 ) -> Result<Vec<u8>, String> {
-    let bytes =
-        serde_json::to_vec(value).map_err(|error| format!("Cannot serialize {label}: {error}"))?;
-    if bytes.is_empty() || bytes.len() > maximum {
+    let mut counter = BoundedJsonCounter {
+        length: 0,
+        maximum,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if counter.exceeded {
+            return Err(format!("Serialized {label} exceeds its launcher limit"));
+        }
+        return Err(format!("Cannot serialize {label}: {error}"));
+    }
+    if counter.length == 0 {
         return Err(format!("Serialized {label} exceeds its launcher limit"));
     }
-    Ok(bytes)
+
+    let mut buffer = BoundedJsonBuffer {
+        bytes: Vec::with_capacity(counter.length),
+        maximum,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        if buffer.exceeded {
+            return Err(format!("Serialized {label} exceeds its launcher limit"));
+        }
+        return Err(format!("Cannot serialize {label}: {error}"));
+    }
+    if buffer.bytes.len() != counter.length {
+        return Err(format!(
+            "Cannot serialize {label}: serialized size changed across bounded passes"
+        ));
+    }
+    Ok(buffer.bytes)
+}
+
+struct BoundedJsonCounter {
+    length: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedJsonCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.length.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON limit exceeded"));
+        };
+        if next > self.maximum {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON limit exceeded"));
+        }
+        self.length = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.len().checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON limit exceeded"));
+        };
+        if next > self.maximum {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn parse_without_duplicate_keys<T: DeserializeOwned>(
@@ -1480,6 +2302,419 @@ fn journal_pending_path(channel: BuildChannel) -> Result<RelativeManagedPath, St
         .map_err(|error| format!("Cannot derive journal pointer path: {error}"))
 }
 
+struct ReconcileMaintenanceSlot {
+    bytes: Option<Vec<u8>>,
+    protected_operation_ids: BTreeSet<Uuid>,
+    protected_plans: BTreeSet<String>,
+    protected_completions: BTreeSet<String>,
+    _lease: Option<ImmutableManagedFile>,
+}
+
+/// Removes every operation-owned reconcile namespace which is not the exact current pending
+/// operation, then bounds immutable journal state to the plan/history required by the current
+/// slot. This must run under the channel operation lock after the caller has classified the exact
+/// pending transition and before another operation starts staging. It is intentionally safe while
+/// an old pending operation exists: that operation and any history-only durable successor remain
+/// protected, while unrelated roots from failed pre-supersede retries are reclaimed. A
+/// completion-history-only crash window never grants cleanup authority because the still-pending
+/// operation ID remains protected by the leased slot.
+pub(super) fn maintain_completed_reconcile_state(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+) -> Result<ReconcileMaintenanceReportV2, String> {
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Invalid reconcile maintenance lock: {error}"))?;
+    let slot = load_reconcile_maintenance_slot(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+    )?;
+    let mut report = ReconcileMaintenanceReportV2::default();
+    let operations = RelativeManagedPath::new(&format!(
+        "state/reconcile/{}/operations",
+        expected_channel.as_str()
+    ))
+    .map_err(|error| format!("Cannot derive reconcile operations directory: {error}"))?;
+    let operation_names = bounded_managed_namespace_names(install_root, &operations)?;
+    for name in &operation_names {
+        let operation_id = parse_canonical_operation_id(name)?;
+        if slot.protected_operation_ids.contains(&operation_id) {
+            continue;
+        }
+        revalidate_maintenance_slot(
+            install_root,
+            expected_install_id,
+            expected_channel,
+            operation_lock,
+            &slot,
+        )?;
+        let relative = operations
+            .join_component(name)
+            .map_err(|error| format!("Cannot derive stale operation root: {error}"))?;
+        if remove_reconcile_garbage_path(install_root, &relative, operation_garbage_limits()?)? {
+            report.operation_roots_removed += 1;
+        }
+        revalidate_maintenance_slot(
+            install_root,
+            expected_install_id,
+            expected_channel,
+            operation_lock,
+            &slot,
+        )?;
+    }
+    let remaining_operations = bounded_managed_namespace_names(install_root, &operations)?;
+    for name in remaining_operations {
+        let operation_id = parse_canonical_operation_id(&name)?;
+        if !slot.protected_operation_ids.contains(&operation_id) {
+            return Err("Completed reconcile operation cleanup made no bounded progress".into());
+        }
+    }
+
+    let journal_root =
+        RelativeManagedPath::new(&format!("state/journals/{}", expected_channel.as_str()))
+            .map_err(|error| format!("Cannot derive reconcile journal directory: {error}"))?;
+    let completions = journal_root
+        .join_component("completions")
+        .map_err(|error| format!("Cannot derive completion history directory: {error}"))?;
+    for name in bounded_managed_namespace_names(install_root, &completions)? {
+        parse_canonical_journal_artifact_name(&name)?;
+        if slot.protected_completions.contains(&name) {
+            continue;
+        }
+        revalidate_maintenance_slot(
+            install_root,
+            expected_install_id,
+            expected_channel,
+            operation_lock,
+            &slot,
+        )?;
+        let relative = completions
+            .join_component(&name)
+            .map_err(|error| format!("Cannot derive obsolete completion path: {error}"))?;
+        if remove_reconcile_garbage_path(install_root, &relative, journal_file_garbage_limits())? {
+            report.completion_histories_removed += 1;
+        }
+    }
+
+    let plans = journal_root
+        .join_component("plans")
+        .map_err(|error| format!("Cannot derive immutable plan directory: {error}"))?;
+    for name in bounded_managed_namespace_names(install_root, &plans)? {
+        parse_canonical_journal_artifact_name(&name)?;
+        if slot.protected_plans.contains(&name) {
+            continue;
+        }
+        revalidate_maintenance_slot(
+            install_root,
+            expected_install_id,
+            expected_channel,
+            operation_lock,
+            &slot,
+        )?;
+        let relative = plans
+            .join_component(&name)
+            .map_err(|error| format!("Cannot derive orphan plan path: {error}"))?;
+        if remove_reconcile_garbage_path(install_root, &relative, journal_file_garbage_limits())? {
+            report.orphan_plans_removed += 1;
+        }
+    }
+
+    let temporary = journal_root
+        .join_component("temporary")
+        .map_err(|error| format!("Cannot derive journal temporary directory: {error}"))?;
+    for name in bounded_managed_namespace_names(install_root, &temporary)? {
+        parse_canonical_journal_temporary_name(&name)?;
+        revalidate_maintenance_slot(
+            install_root,
+            expected_install_id,
+            expected_channel,
+            operation_lock,
+            &slot,
+        )?;
+        let relative = temporary
+            .join_component(&name)
+            .map_err(|error| format!("Cannot derive stale journal temporary path: {error}"))?;
+        if remove_reconcile_garbage_path(install_root, &relative, journal_file_garbage_limits())? {
+            report.temporary_files_removed += 1;
+        }
+    }
+    revalidate_maintenance_slot(
+        install_root,
+        expected_install_id,
+        expected_channel,
+        operation_lock,
+        &slot,
+    )?;
+    Ok(report)
+}
+
+fn load_reconcile_maintenance_slot(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+) -> Result<ReconcileMaintenanceSlot, String> {
+    let pending = journal_pending_path(expected_channel)?;
+    let mut lease = match ImmutableManagedFile::open(install_root, &pending) {
+        Ok(lease) => Some(lease),
+        Err(ManagedFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            None
+        }
+        Err(error) => return Err(format!("Cannot lease reconcile journal slot: {error}")),
+    };
+    let Some(file) = lease.as_mut() else {
+        return Ok(ReconcileMaintenanceSlot {
+            bytes: None,
+            protected_operation_ids: BTreeSet::new(),
+            protected_plans: BTreeSet::new(),
+            protected_completions: BTreeSet::new(),
+            _lease: None,
+        });
+    };
+    let bytes = file
+        .read_bounded(MAX_POINTER_BYTES)
+        .map_err(|error| format!("Cannot read leased reconcile journal slot: {error}"))?;
+    let parsed = parse_journal_slot(&bytes, expected_install_id, expected_channel)?;
+    let (pointer, pending_journal) = match &parsed {
+        JournalSlotV2::Pending(pointer) => {
+            let paths = JournalPaths::new(expected_channel, pointer)?;
+            let plan = load_plan(
+                install_root,
+                &paths.plan,
+                pointer,
+                expected_install_id,
+                expected_channel,
+            )?;
+            (
+                pointer,
+                Some(PendingJournalV2 {
+                    pointer: pointer.clone(),
+                    plan,
+                }),
+            )
+        }
+        JournalSlotV2::Cleared(tombstone) => {
+            validate_persisted_completion(
+                install_root,
+                expected_install_id,
+                expected_channel,
+                operation_lock,
+                tombstone,
+                &bytes,
+            )?;
+            (&tombstone.completed_pointer, None)
+        }
+    };
+    let artifact_name = format!("{}-{}.json", pointer.operation_id, pointer.plan_sha256);
+    let mut protected_operation_ids = BTreeSet::new();
+    let mut protected_plans = BTreeSet::from([artifact_name.clone()]);
+    let protected_completions = BTreeSet::from([artifact_name]);
+    if let Some(pending) = &pending_journal {
+        protected_operation_ids.insert(pending.pointer.operation_id);
+        if let Some(successor) = load_durable_successor_for_pending(
+            install_root,
+            expected_install_id,
+            expected_channel,
+            pending,
+        )? {
+            protected_operation_ids.insert(successor.pointer.operation_id);
+            protected_plans.insert(format!(
+                "{}-{}.json",
+                successor.pointer.operation_id, successor.pointer.plan_sha256
+            ));
+        }
+    }
+    Ok(ReconcileMaintenanceSlot {
+        bytes: Some(bytes),
+        protected_operation_ids,
+        protected_plans,
+        // Completion history may already be durable while the old pending pointer is still
+        // visible. Retain that exact same-operation history so completion/supersede can retry.
+        protected_completions,
+        _lease: lease,
+    })
+}
+
+fn revalidate_maintenance_slot(
+    install_root: &Path,
+    expected_install_id: Uuid,
+    expected_channel: BuildChannel,
+    operation_lock: &InstanceOperationLock,
+    slot: &ReconcileMaintenanceSlot,
+) -> Result<(), String> {
+    operation_lock
+        .validate_scope(install_root, expected_install_id, expected_channel)
+        .map_err(|error| format!("Reconcile maintenance lock changed: {error}"))?;
+    match (&slot._lease, &slot.bytes) {
+        (Some(lease), Some(expected)) => {
+            lease.revalidate().map_err(|error| {
+                format!("Reconcile journal slot changed during cleanup: {error}")
+            })?;
+            if lease
+                .read_bounded_shared(MAX_POINTER_BYTES)
+                .map_err(|error| format!("Cannot re-read reconcile journal slot: {error}"))?
+                != *expected
+            {
+                return Err("Reconcile journal slot bytes changed during cleanup".into());
+            }
+        }
+        (None, None) => {
+            if read_optional_bounded(
+                install_root,
+                &journal_pending_path(expected_channel)?,
+                MAX_POINTER_BYTES,
+                "journal slot",
+            )?
+            .is_some()
+            {
+                return Err("A reconcile journal slot appeared during cleanup".into());
+            }
+        }
+        _ => return Err("Reconcile maintenance slot lease is internally inconsistent".into()),
+    }
+    Ok(())
+}
+
+fn bounded_managed_namespace_names(
+    install_root: &Path,
+    relative: &RelativeManagedPath,
+) -> Result<Vec<String>, String> {
+    let guard = ensure_directory_chain(install_root, relative)
+        .map_err(|error| format!("Cannot prepare reconcile maintenance namespace: {error}"))?;
+    let mut names = Vec::new();
+    let mut collision_keys = BTreeSet::new();
+    for entry in fs::read_dir(guard.leaf().path())
+        .map_err(|error| format!("Cannot enumerate reconcile maintenance namespace: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("Cannot inspect reconcile maintenance entry: {error}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "Reconcile maintenance entry name is not Unicode".to_string())?;
+        if !collision_keys.insert(name.to_lowercase()) {
+            return Err("Reconcile maintenance namespace contains a Windows collision".into());
+        }
+        names.push(name);
+        if names.len() > MAX_RECONCILE_MAINTENANCE_ENTRIES {
+            return Err("Reconcile maintenance namespace exceeds its entry limit".into());
+        }
+    }
+    names.sort_unstable();
+    guard
+        .revalidate()
+        .map_err(|error| format!("Reconcile maintenance namespace changed: {error}"))?;
+    Ok(names)
+}
+
+fn parse_canonical_operation_id(name: &str) -> Result<Uuid, String> {
+    let operation_id = Uuid::parse_str(name)
+        .map_err(|_| "Reconcile operation root name is not a UUID".to_string())?;
+    if operation_id.is_nil()
+        || operation_id.get_version() != Some(Version::Random)
+        || operation_id.to_string() != name
+    {
+        return Err("Reconcile operation root name is not a canonical UUIDv4".into());
+    }
+    Ok(operation_id)
+}
+
+fn parse_canonical_journal_artifact_name(name: &str) -> Result<(Uuid, String), String> {
+    if name.len() != 106 || name.as_bytes().get(36) != Some(&b'-') || !name.ends_with(".json") {
+        return Err("Immutable reconcile journal filename is not canonical".into());
+    }
+    let operation_id = parse_canonical_operation_id(&name[..36])?;
+    let sha256 = &name[37..101];
+    if !is_sha256(sha256) {
+        return Err("Immutable reconcile journal filename has an invalid SHA-256".into());
+    }
+    Ok((operation_id, sha256.to_owned()))
+}
+
+fn parse_canonical_journal_temporary_name(name: &str) -> Result<Uuid, String> {
+    let operation = name
+        .strip_prefix("journal-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+        .ok_or_else(|| "Journal temporary filename is not canonical".to_string())?;
+    parse_canonical_operation_id(operation)
+}
+
+fn remove_reconcile_garbage_path(
+    install_root: &Path,
+    relative: &RelativeManagedPath,
+    limits: ManagedDirectoryRemovalLimits,
+) -> Result<bool, String> {
+    let identity = match inspect_managed_garbage_node_nofollow(install_root, relative) {
+        Ok(identity) => identity,
+        Err(ManagedFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false)
+        }
+        Err(error) => return Err(format!("Cannot lease reconcile garbage: {error}")),
+    };
+    remove_bounded_managed_garbage_tree(install_root, relative, &identity, limits)
+        .map_err(|error| format!("Cannot remove bounded reconcile garbage: {error}"))?;
+    Ok(true)
+}
+
+/// Hard ceiling shared by pre-move quarantine admission and completed-operation cleanup.
+/// Signed release topology fits this ceiling; unknown or modified subtrees must be audited and
+/// cumulatively admitted before their first whole-tree rename. It is not permission to move an
+/// unaudited subtree and it is never increased from observed filesystem contents.
+pub(super) fn operation_garbage_limits() -> Result<ManagedDirectoryRemovalLimits, String> {
+    operation_garbage_limits_for_release_policy(MAX_FILES_PER_PRESET, MAX_RELEASE_PATH_COMPONENTS)
+}
+
+fn operation_garbage_limits_for_release_policy(
+    max_release_files: usize,
+    max_release_path_components: usize,
+) -> Result<ManagedDirectoryRemovalLimits, String> {
+    if max_release_files > MAX_FILES_PER_PRESET {
+        return Err("Reconcile garbage policy exceeds the signed release file bound".into());
+    }
+    if max_release_path_components > MAX_RELEASE_PATH_COMPONENTS {
+        return Err("Reconcile garbage policy exceeds the signed path topology bound".into());
+    }
+    let mutation_entries = MAX_MUTATIONS
+        .checked_mul(MAX_OPERATION_BASE_ENTRIES_PER_MUTATION)
+        .ok_or_else(|| "Reconcile garbage mutation-entry policy overflowed".to_string())?;
+    let install_entries = max_release_files
+        .checked_mul(MAX_OPERATION_EXTRA_ENTRIES_PER_INSTALL)
+        .ok_or_else(|| "Reconcile garbage install-entry policy overflowed".to_string())?;
+    let max_entries = mutation_entries
+        .checked_add(install_entries)
+        .and_then(|entries| entries.checked_add(max_release_path_components))
+        .and_then(|entries| entries.checked_add(MAX_OPERATION_FIXED_ENTRIES))
+        .ok_or_else(|| "Reconcile garbage entry policy overflowed".to_string())?;
+    let allocation_overhead = u64::try_from(max_entries)
+        .ok()
+        .and_then(|entries| entries.checked_mul(MAX_OPERATION_ALLOCATION_OVERHEAD_PER_ENTRY))
+        .ok_or_else(|| "Reconcile garbage allocation-overhead policy overflowed".to_string())?;
+    let max_allocated_bytes = MAX_PLAN_FILE_BYTES
+        .checked_mul(MAX_OPERATION_PLAN_BYTE_COPIES)
+        .and_then(|bytes| bytes.checked_add(allocation_overhead))
+        .ok_or_else(|| "Reconcile garbage allocated-byte policy overflowed".to_string())?;
+    let max_depth = MAX_RELATIVE_PATH_SEGMENTS
+        .checked_add(MAX_OPERATION_RELOCATED_PATH_DEPTH_OVERHEAD)
+        .ok_or_else(|| "Reconcile garbage depth policy overflowed".to_string())?;
+    Ok(ManagedDirectoryRemovalLimits {
+        max_entries,
+        max_allocated_bytes,
+        max_depth,
+    })
+}
+
+fn journal_file_garbage_limits() -> ManagedDirectoryRemovalLimits {
+    ManagedDirectoryRemovalLimits {
+        max_entries: 1,
+        max_allocated_bytes: MAX_PLAN_BYTES + JOURNAL_RESERVE_BYTES,
+        max_depth: 0,
+    }
+}
+
 struct JournalPaths {
     channel_root: RelativeManagedPath,
     plans: RelativeManagedPath,
@@ -1547,7 +2782,16 @@ impl JournalPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_manager::{instance_state::InstanceStateStore, types::PresetId};
+    use crate::build_manager::{
+        instance_state::InstanceStateStore,
+        release::{
+            projected_ensure_directory_json_bytes, projected_install_file_json_bytes,
+            projected_planned_file_json_bytes, projected_quarantine_json_bytes,
+            projected_reconcile_directories, projected_worst_case_reconcile_plan_bytes,
+            ManifestFile,
+        },
+        types::PresetId,
+    };
     use serde_json::Value;
     use std::{
         fs,
@@ -1662,22 +2906,243 @@ mod tests {
     }
 
     #[test]
+    fn bounded_serializer_accepts_the_exact_limit_and_rejects_one_byte_less() {
+        let value = "x".repeat(4_096);
+        let expected = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            serialize_bounded(&value, expected.len(), "test value").unwrap(),
+            expected
+        );
+        assert_eq!(
+            serialize_bounded(&value, expected.len() - 1, "test value").unwrap_err(),
+            "Serialized test value exceeds its launcher limit"
+        );
+    }
+
+    #[test]
+    fn release_projection_matches_canonical_journal_records_and_unicode_plan() {
+        let path = "config/\u{1e9e}.toml".to_string();
+        let planned = PlannedFileV2 {
+            path: path.clone(),
+            signed_size: 12_345,
+            signed_sha256: HASH_A.into(),
+            installed_size: 987_654_321,
+            installed_sha256: HASH_B.into(),
+            executable: false,
+            policy: FilePolicy::ValidatedMutable,
+        };
+        assert_eq!(
+            serde_json::to_vec(&planned).unwrap().len() as u64,
+            projected_planned_file_json_bytes(
+                &path,
+                planned.signed_size,
+                planned.installed_size,
+                planned.executable,
+                planned.policy,
+            )
+            .unwrap()
+        );
+
+        let quarantine = JournalMutation::Quarantine {
+            source_path: path.clone(),
+            backup_slot: 399_999,
+        };
+        assert_eq!(
+            serde_json::to_vec(&quarantine).unwrap().len() as u64,
+            projected_quarantine_json_bytes(&path, 399_999).unwrap()
+        );
+        let ensure = JournalMutation::EnsureDirectory {
+            destination_path: "\u{1e9e}".into(),
+        };
+        assert_eq!(
+            serde_json::to_vec(&ensure).unwrap().len() as u64,
+            projected_ensure_directory_json_bytes("\u{1e9e}").unwrap()
+        );
+        let install = JournalMutation::InstallFile {
+            destination_path: path.clone(),
+            staging_slot: 399_999,
+            size: u64::MAX,
+            sha256: HASH_C.into(),
+            executable: false,
+        };
+        assert_eq!(
+            serde_json::to_vec(&install).unwrap().len() as u64,
+            projected_install_file_json_bytes(&path, 399_999, u64::MAX, false).unwrap()
+        );
+
+        let install_id = Uuid::new_v4();
+        let mut plan = install_plan(install_id, BuildChannel::Stable);
+        plan.desired_files = vec![PlannedFileV2 {
+            path: path.clone(),
+            signed_size: u64::MAX,
+            signed_sha256: HASH_A.into(),
+            installed_size: u64::MAX,
+            installed_sha256: HASH_B.into(),
+            executable: false,
+            policy: FilePolicy::ValidatedMutable,
+        }];
+        plan.mutations = vec![quarantine, ensure, install];
+        let files = vec![ManifestFile {
+            path: path.clone(),
+            size: u64::MAX,
+            sha256: HASH_A.into(),
+            executable: false,
+            policy: FilePolicy::ValidatedMutable,
+        }];
+        let uppercase_parent = "\u{1e9e}".to_string();
+        let lowercase_parent = uppercase_parent.to_lowercase();
+        assert!(uppercase_parent.len() > lowercase_parent.len());
+        assert!(
+            projected_ensure_directory_json_bytes(&uppercase_parent).unwrap()
+                > projected_ensure_directory_json_bytes(&lowercase_parent).unwrap()
+        );
+        let parents =
+            projected_reconcile_directories(&files, std::slice::from_ref(&uppercase_parent));
+        assert_eq!(parents.get(&lowercase_parent), Some(&uppercase_parent));
+        let projected = projected_worst_case_reconcile_plan_bytes(&files, &parents).unwrap();
+        let canonical =
+            serialize_bounded(&plan, MAX_PLAN_BYTES as usize, "reconcile plan").unwrap();
+        assert!(projected >= canonical.len() as u64);
+    }
+
+    #[test]
     fn disk_budget_serializes_and_validates_processor_workspace_reserve_canonically() {
         let budget = DiskBudgetV2::new_with_processor_workspace(1, 2, 3, 4, 5).unwrap();
+        assert_eq!(budget.allocation_unit_bytes, 1);
         assert_eq!(budget.processor_workspace_bytes, 4);
+        assert_eq!(budget.reconcile_destination_bytes, 5);
+        let expected_subtotal = 1 + 2 + 3 + 4 + 5 + 5 + JOURNAL_RESERVE_BYTES;
+        assert_eq!(budget.safety_margin_bytes, MINIMUM_SAFETY_MARGIN_BYTES);
+        assert_eq!(
+            budget.required_bytes,
+            expected_subtotal + MINIMUM_SAFETY_MARGIN_BYTES
+        );
         budget.validate().unwrap();
 
         let mut value = serde_json::to_value(&budget).unwrap();
         assert_eq!(value["processorWorkspaceBytes"], 4);
+        assert_eq!(value["allocationUnitBytes"], 1);
+        assert_eq!(value["reconcileDestinationBytes"], 5);
         value
             .as_object_mut()
             .unwrap()
             .remove("processorWorkspaceBytes");
         assert!(serde_json::from_value::<DiskBudgetV2>(value).is_err());
 
+        let mut value = serde_json::to_value(&budget).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("reconcileDestinationBytes");
+        assert!(serde_json::from_value::<DiskBudgetV2>(value).is_err());
+
         let mut forged = budget;
         forged.processor_workspace_bytes += 1;
         assert!(forged.validate().is_err());
+    }
+
+    #[test]
+    fn plan_binds_reconcile_destination_reserve_to_install_mutations() {
+        let install_id = Uuid::new_v4();
+        let mut plan = install_plan(install_id, BuildChannel::Stable);
+        plan.disk_budget = DiskBudgetV2::new_with_physical_layout(
+            plan.disk_budget.missing_download_bytes,
+            plan.disk_budget.java_extracted_bytes,
+            plan.disk_budget.game_extracted_bytes,
+            plan.disk_budget.processor_workspace_bytes,
+            plan.disk_budget.allocation_unit_bytes,
+            plan.disk_budget.staging_bytes,
+            plan.disk_budget.reconcile_destination_bytes + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.validate(install_id, BuildChannel::Stable).unwrap_err(),
+            "Disk budget reconcile destination bytes do not match install mutations"
+        );
+
+        let mut noncanonical = install_plan(install_id, BuildChannel::Stable);
+        noncanonical.disk_budget.reconcile_destination_bytes += 1;
+        assert_eq!(
+            noncanonical
+                .validate(install_id, BuildChannel::Stable)
+                .unwrap_err(),
+            "Reconcile disk budget is not canonical"
+        );
+    }
+
+    #[test]
+    fn plan_binds_reconcile_files_to_its_physical_allocation_unit() {
+        let install_id = Uuid::new_v4();
+        let mut plan = install_plan(install_id, BuildChannel::Stable);
+        plan.disk_budget =
+            DiskBudgetV2::new_with_physical_layout(0, 0, 0, 0, 4096, 8 * 4096, 10 * 4096).unwrap();
+        plan.validate(install_id, BuildChannel::Stable).unwrap();
+
+        plan.disk_budget = DiskBudgetV2::new_with_physical_layout(
+            0,
+            0,
+            0,
+            0,
+            64 * 1024,
+            8 * 64 * 1024,
+            10 * 64 * 1024,
+        )
+        .unwrap();
+        plan.validate(install_id, BuildChannel::Stable).unwrap();
+
+        assert!(DiskBudgetV2::new_with_allocation_unit(0, 0, 0, 0, 0, 0).is_err());
+        assert!(DiskBudgetV2::new_with_allocation_unit(0, 0, 0, 0, 3, 0).is_err());
+    }
+
+    #[test]
+    fn namespace_reserve_covers_two_hundred_thousand_zero_byte_replacements() {
+        for allocation_unit in [4096_u64, 64 * 1024] {
+            let installs = 200_000_u64;
+            let quarantines = 200_000_u64;
+            let staging_entries = installs * 2 + 5;
+            let destination_entries = 5 + quarantines + installs * 2;
+            let staging = staging_entries * allocation_unit;
+            let destination = destination_entries * allocation_unit;
+            let budget = DiskBudgetV2::new_with_physical_layout(
+                0,
+                0,
+                0,
+                0,
+                allocation_unit,
+                staging,
+                destination,
+            )
+            .unwrap();
+            assert_eq!(budget.staging_bytes, staging);
+            assert_eq!(budget.reconcile_destination_bytes, destination);
+            assert!(budget.staging_bytes > MINIMUM_SAFETY_MARGIN_BYTES);
+            budget.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn exact_staging_resume_keeps_dynamic_commit_and_safety_reserves() {
+        let budget = DiskBudgetV2::new_with_processor_workspace(11, 13, 17, 19, 1_000_000).unwrap();
+        let remaining_destination = 23;
+        let expected_subtotal = 11 + 13 + 17 + 19 + remaining_destination + JOURNAL_RESERVE_BYTES;
+        assert_eq!(
+            budget
+                .required_after_exact_staging(remaining_destination)
+                .unwrap(),
+            expected_subtotal + MINIMUM_SAFETY_MARGIN_BYTES
+        );
+        assert!(budget.required_after_exact_staging(u64::MAX).is_err());
+
+        let large = DiskBudgetV2::new(0, 0, 0, 16 * 1024 * 1024 * 1024).unwrap();
+        assert!(large.safety_margin_bytes > MINIMUM_SAFETY_MARGIN_BYTES);
+        assert_eq!(
+            large.required_after_exact_staging(31).unwrap(),
+            31 + large.journal_reserve_bytes + large.safety_margin_bytes
+        );
+
+        let mut forged = budget;
+        forged.reconcile_destination_bytes += 1;
+        assert!(forged.required_after_exact_staging(0).is_err());
     }
 
     fn repair_after(plan: &ReconcilePlanV2) -> ReconcilePlanV2 {
@@ -2316,6 +3781,7 @@ mod tests {
             completed_pointer_sha256: format!("{:x}", Sha256::digest(&failed_pointer_bytes)),
             outcome: JournalCompletionOutcomeV2::SupersededForRepair,
             continuation: Some(failed.target.clone()),
+            successor: None,
         };
         let prewritten_bytes = serialize_bounded(
             &prewritten,
@@ -2385,6 +3851,48 @@ mod tests {
     }
 
     #[test]
+    fn fresh_ready_authorization_abandons_stale_pointer_with_exact_active_continuation() {
+        let root = temp_root("fresh-ready-abandon");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        let stale = install_plan(install_id, BuildChannel::Stable);
+        let pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &stale).unwrap();
+        publish_pending(&root, install_id, BuildChannel::Stable, &lock, &pointer).unwrap();
+        state.save_locked(&lock, &stale.target).unwrap();
+        let authorization = CurrentReadyAbandonAuthorizationV2::for_test(&stale, &stale.target);
+        assert!(abandon_stale_pending_for_current_ready(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &pointer,
+            authorization,
+        )
+        .unwrap());
+        assert!(
+            detect_pending(&root, install_id, BuildChannel::Stable, &lock)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!abandon_stale_pending_for_current_ready(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &pointer,
+            CurrentReadyAbandonAuthorizationV2::for_test(&stale, &stale.target),
+        )
+        .unwrap());
+
+        drop(lock);
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn forged_completion_outcome_cannot_override_the_active_marker() {
         let root = temp_root("forged-outcome");
         let install_id = Uuid::new_v4();
@@ -2420,6 +3928,461 @@ mod tests {
         drop(lock);
         drop(state);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_removes_unpublished_root_and_orphan_journal_files() {
+        let root = temp_root("maintenance-orphans");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        let orphan = Uuid::new_v4();
+        let operation_root = root.join(format!("state/reconcile/stable/operations/{orphan}"));
+        fs::create_dir_all(operation_root.join("staging")).unwrap();
+        fs::write(operation_root.join("staging/00000000.bin"), b"stale").unwrap();
+        let journal_root = root.join("state/journals/stable");
+        fs::create_dir_all(journal_root.join("plans")).unwrap();
+        fs::create_dir_all(journal_root.join("completions")).unwrap();
+        fs::create_dir_all(journal_root.join("temporary")).unwrap();
+        let artifact = format!("{orphan}-{HASH_A}.json");
+        let orphan_plan = journal_root.join("plans").join(&artifact);
+        fs::write(&orphan_plan, b"orphan plan").unwrap();
+        fs::write(
+            journal_root.join("completions").join(&artifact),
+            b"orphan completion",
+        )
+        .unwrap();
+        fs::write(
+            journal_root
+                .join("temporary")
+                .join(format!("journal-{orphan}.tmp")),
+            b"temporary",
+        )
+        .unwrap();
+
+        let report =
+            maintain_completed_reconcile_state(&root, install_id, BuildChannel::Stable, &lock)
+                .unwrap();
+        assert_eq!(report.operation_roots_removed, 1);
+        assert_eq!(report.completion_histories_removed, 1);
+        assert_eq!(report.orphan_plans_removed, 1);
+        assert_eq!(report.temporary_files_removed, 1);
+        assert!(!operation_root.exists());
+        assert!(fs::read_dir(journal_root.join("plans"))
+            .unwrap()
+            .next()
+            .is_none());
+
+        drop(lock);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maintenance_protects_pending_bundle_and_removes_failed_replacement_staging() {
+        let root = temp_root("maintenance-pending-window");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        let plan = install_plan(install_id, BuildChannel::Stable);
+        let pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &plan).unwrap();
+        publish_pending(&root, install_id, BuildChannel::Stable, &lock, &pointer).unwrap();
+        let paths = JournalPaths::new(BuildChannel::Stable, &pointer).unwrap();
+        let pointer_bytes =
+            serialize_bounded(&pointer, MAX_POINTER_BYTES as usize, "test pointer").unwrap();
+        let completion = JournalTombstoneV2 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            install_id,
+            channel: BuildChannel::Stable,
+            completed_pointer: pointer.clone(),
+            completed_pointer_sha256: format!("{:x}", Sha256::digest(pointer_bytes)),
+            outcome: JournalCompletionOutcomeV2::CommittedTarget,
+            continuation: Some(plan.target.clone()),
+            successor: None,
+        };
+        let completion_bytes =
+            serialize_bounded(&completion, MAX_POINTER_BYTES as usize, "test completion").unwrap();
+        publish_immutable_file(
+            &root,
+            &paths.temporary,
+            &paths.completion,
+            &completion_bytes,
+            true,
+        )
+        .unwrap();
+        let current_root = root.join(format!(
+            "state/reconcile/stable/operations/{}",
+            plan.operation_id
+        ));
+        fs::create_dir_all(current_root.join("staging")).unwrap();
+        fs::write(current_root.join("staging/current.bin"), b"current").unwrap();
+
+        let stale = Uuid::new_v4();
+        let stale_root = root.join(format!("state/reconcile/stable/operations/{stale}"));
+        fs::create_dir_all(stale_root.join("staging")).unwrap();
+        fs::write(stale_root.join("staging/00000000.bin"), b"stale").unwrap();
+        let stale_plan = root.join(format!("state/journals/stable/plans/{stale}-{HASH_A}.json"));
+        fs::write(&stale_plan, b"unpublished replacement plan").unwrap();
+        let report =
+            maintain_completed_reconcile_state(&root, install_id, BuildChannel::Stable, &lock)
+                .unwrap();
+        assert_eq!(report.operation_roots_removed, 1);
+        assert_eq!(report.orphan_plans_removed, 1);
+        assert!(current_root.is_dir());
+        assert!(!stale_root.exists());
+        assert!(!stale_plan.exists());
+        assert!(paths.plan.join_to(&root).is_file());
+        assert!(paths.completion.join_to(&root).is_file());
+        assert_eq!(
+            fs::read(paths.pending.join_to(&root)).unwrap(),
+            serialize_bounded(&pointer, MAX_POINTER_BYTES as usize, "test pointer").unwrap()
+        );
+
+        drop(lock);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_garbage_policy_covers_max_release_shape_and_rejects_expansion() {
+        let limits = operation_garbage_limits_for_release_policy(
+            MAX_FILES_PER_PRESET,
+            MAX_RELEASE_PATH_COMPONENTS,
+        )
+        .unwrap();
+        let expected_mutation_entries = MAX_MUTATIONS
+            .checked_mul(MAX_OPERATION_BASE_ENTRIES_PER_MUTATION)
+            .unwrap();
+        let expected_entries = MAX_FILES_PER_PRESET
+            .checked_mul(MAX_OPERATION_EXTRA_ENTRIES_PER_INSTALL)
+            .and_then(|entries| entries.checked_add(expected_mutation_entries))
+            .and_then(|entries| entries.checked_add(MAX_RELEASE_PATH_COMPONENTS))
+            .and_then(|entries| entries.checked_add(MAX_OPERATION_FIXED_ENTRIES))
+            .unwrap();
+        let expected_overhead = u64::try_from(expected_entries)
+            .unwrap()
+            .checked_mul(MAX_OPERATION_ALLOCATION_OVERHEAD_PER_ENTRY)
+            .unwrap();
+        let expected_bytes = MAX_PLAN_FILE_BYTES
+            .checked_mul(MAX_OPERATION_PLAN_BYTE_COPIES)
+            .and_then(|bytes| bytes.checked_add(expected_overhead))
+            .unwrap();
+
+        assert_eq!(limits.max_entries, expected_entries);
+        assert_eq!(limits.max_allocated_bytes, expected_bytes);
+        assert_eq!(
+            limits.max_depth,
+            MAX_RELATIVE_PATH_SEGMENTS + MAX_OPERATION_RELOCATED_PATH_DEPTH_OVERHEAD
+        );
+        assert_eq!(limits, operation_garbage_limits().unwrap());
+        assert!(operation_garbage_limits_for_release_policy(
+            MAX_FILES_PER_PRESET + 1,
+            MAX_RELEASE_PATH_COMPONENTS,
+        )
+        .is_err());
+        assert!(operation_garbage_limits_for_release_policy(
+            MAX_FILES_PER_PRESET,
+            MAX_RELEASE_PATH_COMPONENTS + 1,
+        )
+        .is_err());
+        assert!(operation_garbage_limits_for_release_policy(usize::MAX, usize::MAX).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn operation_garbage_policy_accepts_exact_relocated_depth_and_rejects_one_more() {
+        fn create_depth(root: &Path, relative: &RelativeManagedPath, deepest: usize) -> PathBuf {
+            let mut current = relative.join_to(root);
+            fs::create_dir_all(&current).unwrap();
+            for _ in 1..deepest {
+                current.push("d");
+                fs::create_dir(&current).unwrap();
+            }
+            current.push("leaf.bin");
+            fs::write(&current, b"leaf").unwrap();
+            current
+        }
+
+        let root = temp_root("operation-garbage-depth");
+        fs::create_dir_all(&root).unwrap();
+        let limits = operation_garbage_limits().unwrap();
+        let exact = RelativeManagedPath::new(&format!(
+            "state/reconcile/stable/operations/{}",
+            Uuid::new_v4()
+        ))
+        .unwrap();
+        create_depth(&root, &exact, limits.max_depth);
+        let exact_identity = inspect_managed_garbage_node_nofollow(&root, &exact).unwrap();
+        remove_bounded_managed_garbage_tree(&root, &exact, &exact_identity, limits).unwrap();
+        assert!(!exact.join_to(&root).exists());
+
+        let over = RelativeManagedPath::new(&format!(
+            "state/reconcile/stable/operations/{}",
+            Uuid::new_v4()
+        ))
+        .unwrap();
+        let over_leaf = create_depth(&root, &over, limits.max_depth + 1);
+        let over_identity = inspect_managed_garbage_node_nofollow(&root, &over).unwrap();
+        assert!(remove_bounded_managed_garbage_tree(&root, &over, &over_identity, limits).is_err());
+        assert!(over_leaf.is_file());
+        assert!(over.join_to(&root).is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plan_path_segment_bound_matches_prefixed_executor_materialization() {
+        fn path_with_segments(count: usize) -> String {
+            assert!(count >= 2);
+            let mut segments = Vec::with_capacity(count);
+            segments.push("mods".to_string());
+            for index in 1..count - 1 {
+                segments.push(format!("d{index}"));
+            }
+            segments.push("fragment.jar".to_string());
+            segments.join("/")
+        }
+
+        let install_id = Uuid::new_v4();
+        let mut accepted = install_plan(install_id, BuildChannel::Stable);
+        let accepted_path = path_with_segments(MAX_RELATIVE_PATH_SEGMENTS);
+        accepted.desired_files[0].path = accepted_path.clone();
+        let JournalMutation::InstallFile {
+            destination_path, ..
+        } = accepted.mutations.last_mut().unwrap()
+        else {
+            panic!("fixture must end with install")
+        };
+        *destination_path = accepted_path;
+        accepted.validate(install_id, BuildChannel::Stable).unwrap();
+
+        let mut rejected = accepted;
+        let rejected_path = path_with_segments(MAX_RELATIVE_PATH_SEGMENTS + 1);
+        rejected.desired_files[0].path = rejected_path.clone();
+        let JournalMutation::InstallFile {
+            destination_path, ..
+        } = rejected.mutations.last_mut().unwrap()
+        else {
+            panic!("fixture must end with install")
+        };
+        *destination_path = rejected_path;
+        assert!(rejected.validate(install_id, BuildChannel::Stable).is_err());
+        assert!(validate_desired_file_policy_count(MAX_FILES_PER_PRESET).is_ok());
+        assert!(validate_desired_file_policy_count(MAX_FILES_PER_PRESET + 1).is_err());
+        assert_eq!(
+            checked_reconcile_path_component_total(MAX_RELEASE_PATH_COMPONENTS - 1, 1).unwrap(),
+            MAX_RELEASE_PATH_COMPONENTS
+        );
+        assert!(checked_reconcile_path_component_total(MAX_RELEASE_PATH_COMPONENTS, 1).is_err());
+        assert!(checked_reconcile_path_component_total(usize::MAX, 1).is_err());
+        assert_eq!(
+            checked_desired_file_bytes(
+                MAX_MANAGED_RELEASE_BYTES - MAX_MANAGED_FILE_BYTES,
+                MAX_MANAGED_FILE_BYTES,
+            )
+            .unwrap(),
+            MAX_MANAGED_RELEASE_BYTES
+        );
+        assert!(checked_desired_file_bytes(MAX_MANAGED_RELEASE_BYTES, 1).is_err());
+        assert!(checked_desired_file_bytes(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn durable_current_plan_transition_is_detected_and_protected_before_pointer_swap() {
+        let root = temp_root("durable-transition");
+        let install_id = Uuid::new_v4();
+        fs::create_dir_all(&root).unwrap();
+        let state = InstanceStateStore::new(&root, install_id);
+        let lock = state.acquire_operation_lock(BuildChannel::Stable).unwrap();
+        let failed = install_plan(install_id, BuildChannel::Stable);
+        let failed_pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &failed).unwrap();
+        publish_pending(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+        )
+        .unwrap();
+        let mut successor = install_plan(install_id, BuildChannel::Stable);
+        successor.operation_id = Uuid::new_v4();
+        let successor_pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &successor)
+                .unwrap();
+        let failed_paths = JournalPaths::new(BuildChannel::Stable, &failed_pointer).unwrap();
+        let failed_pointer_bytes = serialize_bounded(
+            &failed_pointer,
+            MAX_POINTER_BYTES as usize,
+            "failed pointer",
+        )
+        .unwrap();
+        let completion = JournalTombstoneV2 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            install_id,
+            channel: BuildChannel::Stable,
+            completed_pointer: failed_pointer.clone(),
+            completed_pointer_sha256: format!("{:x}", Sha256::digest(failed_pointer_bytes)),
+            outcome: JournalCompletionOutcomeV2::SupersededForCurrentPlan,
+            continuation: None,
+            successor: Some(successor_pointer.clone()),
+        };
+        let completion_bytes = serialize_bounded(
+            &completion,
+            MAX_POINTER_BYTES as usize,
+            "transition completion",
+        )
+        .unwrap();
+        publish_immutable_file(
+            &root,
+            &failed_paths.temporary,
+            &failed_paths.completion,
+            &completion_bytes,
+            true,
+        )
+        .unwrap();
+        for operation in [failed.operation_id, successor.operation_id] {
+            let path = root.join(format!("state/reconcile/stable/operations/{operation}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("state.bin"), b"protected").unwrap();
+        }
+
+        let transition = detect_pending_transition(&root, install_id, BuildChannel::Stable, &lock)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transition.pending.pointer, failed_pointer);
+        assert_eq!(
+            transition.durable_successor.unwrap().pointer,
+            successor_pointer
+        );
+        let report =
+            maintain_completed_reconcile_state(&root, install_id, BuildChannel::Stable, &lock)
+                .unwrap();
+        assert_eq!(report.operation_roots_removed, 0);
+        assert!(root
+            .join(format!(
+                "state/reconcile/stable/operations/{}",
+                failed.operation_id
+            ))
+            .is_dir());
+        assert!(root
+            .join(format!(
+                "state/reconcile/stable/operations/{}",
+                successor.operation_id
+            ))
+            .is_dir());
+        assert!(failed_paths.completion.join_to(&root).is_file());
+        assert!(JournalPaths::new(BuildChannel::Stable, &successor_pointer)
+            .unwrap()
+            .plan
+            .join_to(&root)
+            .is_file());
+        let mut third = install_plan(install_id, BuildChannel::Stable);
+        third.operation_id = Uuid::new_v4();
+        let third_pointer =
+            write_immutable_plan(&root, install_id, BuildChannel::Stable, &lock, &third).unwrap();
+        assert!(advance_pending_to_recorded_successor(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            &third_pointer,
+        )
+        .is_err());
+        let advanced = advance_pending_to_recorded_successor(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            &successor_pointer,
+        )
+        .unwrap();
+        assert_eq!(advanced.pointer, successor_pointer);
+        assert_eq!(
+            detect_pending(&root, install_id, BuildChannel::Stable, &lock)
+                .unwrap()
+                .unwrap()
+                .pointer,
+            successor_pointer
+        );
+        assert_eq!(
+            advance_pending_to_recorded_successor(
+                &root,
+                install_id,
+                BuildChannel::Stable,
+                &lock,
+                &failed_pointer,
+                &successor_pointer,
+            )
+            .unwrap()
+            .pointer,
+            successor_pointer
+        );
+        let pending_path = journal_pending_path(BuildChannel::Stable)
+            .unwrap()
+            .join_to(&root);
+        let third_pointer_bytes =
+            serialize_bounded(&third_pointer, MAX_POINTER_BYTES as usize, "third pointer").unwrap();
+        fs::write(&pending_path, &third_pointer_bytes).unwrap();
+        assert!(advance_pending_to_recorded_successor(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            &successor_pointer,
+        )
+        .is_err());
+        let successor_pointer_bytes = serialize_bounded(
+            &successor_pointer,
+            MAX_POINTER_BYTES as usize,
+            "successor pointer",
+        )
+        .unwrap();
+        fs::write(&pending_path, &successor_pointer_bytes).unwrap();
+
+        let mut forged_completion = completion.clone();
+        forged_completion.successor = Some(third_pointer.clone());
+        let forged_completion_bytes = serialize_bounded(
+            &forged_completion,
+            MAX_POINTER_BYTES as usize,
+            "forged transition completion",
+        )
+        .unwrap();
+        fs::write(
+            failed_paths.completion.join_to(&root),
+            forged_completion_bytes,
+        )
+        .unwrap();
+        assert!(advance_pending_to_recorded_successor(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            &successor_pointer,
+        )
+        .is_err());
+        fs::write(failed_paths.completion.join_to(&root), &completion_bytes).unwrap();
+
+        state.save_locked(&lock, &failed.target).unwrap();
+        assert!(advance_pending_to_recorded_successor(
+            &root,
+            install_id,
+            BuildChannel::Stable,
+            &lock,
+            &failed_pointer,
+            &successor_pointer,
+        )
+        .is_err());
+
+        drop(lock);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

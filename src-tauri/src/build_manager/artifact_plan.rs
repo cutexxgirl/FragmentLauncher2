@@ -1,6 +1,6 @@
 use super::{
     availability::{ArtifactAvailabilityStateV2, VerifiedAvailabilityV2},
-    cas::VerifiedCasObject,
+    cas::{VerifiedCasObject, VerifiedCasPartialAllocationV2},
     contracts::{
         validate_manifest_path, validate_official_game_source, GameRuntimeLock, GameRuntimeRole,
         GameRuntimeSource, RuntimeLock,
@@ -132,6 +132,7 @@ pub(super) struct PlannedArtifactV2 {
     requirement: ArtifactRequirementV2,
     availability: ArtifactAvailabilityStateV2,
     resume_from: u64,
+    partial_allocation: Option<VerifiedCasPartialAllocationV2>,
 }
 
 /// A short-lived view that is usable only while the exact owned CAS capability is live. It is
@@ -227,6 +228,10 @@ impl PlannedArtifactExecutionV2<'_> {
 
     pub(super) fn availability(&self) -> ArtifactAvailabilityStateV2 {
         self.planned.availability
+    }
+
+    pub(super) fn partial_allocation(&self) -> Option<&VerifiedCasPartialAllocationV2> {
+        self.planned.partial_allocation.as_ref()
     }
 
     pub(super) fn channel(&self) -> BuildChannel {
@@ -464,6 +469,20 @@ impl ArtifactInventoryV2 {
         &self.official_sha256
     }
 
+    pub(super) fn mutable_default_sha256(&self, path: &str) -> Result<&str, String> {
+        self.mutable_by_path
+            .get(&path_key(path))
+            .map(String::as_str)
+            .ok_or_else(|| format!("Artifact inventory has no mutable default for {path}"))
+    }
+
+    pub(super) fn manifest_sha256(&self, path: &str) -> Result<&str, String> {
+        self.manifest_by_path
+            .get(&path_key(path))
+            .map(String::as_str)
+            .ok_or_else(|| format!("Artifact inventory has no manifest object for {path}"))
+    }
+
     pub(super) fn is_java_archive_sha256(&self, sha256: &str) -> bool {
         self.java_archive_sha256 == sha256
     }
@@ -691,6 +710,73 @@ impl ArtifactPlanV2 {
         self.disk_download_reserve_bytes
     }
 
+    pub(super) fn disk_download_reserve_bytes_for_allocation_unit(
+        &self,
+        allocation_unit: u64,
+    ) -> Result<u64, String> {
+        if allocation_unit == 0 {
+            return Err("Artifact disk allocation unit is zero".into());
+        }
+        let content = self.requirements.iter().try_fold(0_u64, |total, planned| {
+            let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
+                0
+            } else {
+                round_up_allocation(planned.requirement.size, allocation_unit)?
+            };
+            total
+                .checked_add(charge)
+                .ok_or_else(|| "Artifact physical disk reserve overflow".to_string())
+        })?;
+        content
+            .checked_add(artifact_namespace_reserve(
+                &self.requirements,
+                allocation_unit,
+            )?)
+            .ok_or_else(|| "Artifact physical namespace reserve overflow".to_string())
+    }
+
+    /// Revalidates every credited partial against the exact live CAS root and charges only
+    /// clusters already proven to be physically allocated. Missing/uncredited objects retain the
+    /// full rounded-final reserve. Network accounting deliberately remains the full signed size.
+    pub(super) fn validated_disk_download_reserve_bytes(
+        &self,
+        root: &OwnedCasRoot,
+        inventory: &ArtifactInventoryV2,
+    ) -> Result<u64, String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        let allocation_unit = super::planner::filesystem_allocation_unit(root.install_root())?;
+        if allocation_unit == 0 {
+            return Err("Artifact disk allocation unit is zero".into());
+        }
+        let content = self.requirements.iter().try_fold(0_u64, |total, planned| {
+            let rounded_final = round_up_allocation(planned.requirement.size, allocation_unit)?;
+            let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
+                0
+            } else if let Some(evidence) = &planned.partial_allocation {
+                evidence.validate_live(
+                    root,
+                    &planned.requirement.sha256,
+                    planned.requirement.size,
+                )?;
+                rounded_final.saturating_sub(evidence.allocated_size().min(rounded_final))
+            } else {
+                rounded_final
+            };
+            total
+                .checked_add(charge)
+                .ok_or_else(|| "Artifact physical disk reserve overflow".to_string())
+        })?;
+        let reserve = content
+            .checked_add(artifact_namespace_reserve(
+                &self.requirements,
+                allocation_unit,
+            )?)
+            .ok_or_else(|| "Artifact physical namespace reserve overflow".to_string())?;
+        inventory.validate_root(root)?;
+        Ok(reserve)
+    }
+
     pub(super) fn validate_for(&self, inventory: &ArtifactInventoryV2) -> Result<(), String> {
         if self.binding != inventory.binding
             || self.inventory_fingerprint != inventory.fingerprint
@@ -707,6 +793,14 @@ impl ArtifactPlanV2 {
                 let expected = inventory.requirement(&planned.requirement.sha256)?;
                 if expected != &planned.requirement || !valid_planned_availability(planned) {
                     return Err("Artifact plan contains a forged requirement".into());
+                }
+                if let Some(evidence) = &planned.partial_allocation {
+                    evidence.validate_sealed_identity(
+                        self.binding.cas_root.binding_nonce,
+                        self.binding.install_id,
+                        planned.requirement.sha256(),
+                        planned.requirement.size(),
+                    )?;
                 }
                 let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
                     0
@@ -725,6 +819,53 @@ impl ArtifactPlanV2 {
         if network != self.network_bytes || reserve != self.disk_download_reserve_bytes {
             return Err("Artifact plan byte total changed".into());
         }
+        Ok(())
+    }
+
+    /// Proves that every reconcile install path is backed by a manifest artifact carried by this
+    /// exact sealed download plan. Runtime-only requirements may also be present; callers still
+    /// cannot turn them into instance files because path authorization stays in the inventory.
+    pub(super) fn validate_reconcile_install_paths<'a>(
+        &self,
+        root: &OwnedCasRoot,
+        inventory: &ArtifactInventoryV2,
+        install_paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        let mut seen = BTreeSet::new();
+        for path in install_paths {
+            let key = path_key(path);
+            if !seen.insert(key.clone()) {
+                return Err("Reconcile staging paths are duplicated or case-colliding".into());
+            }
+            let sha256 = inventory
+                .manifest_by_path
+                .get(&key)
+                .ok_or_else(|| format!("Reconcile staging path is not in the manifest: {path}"))?;
+            let planned = self
+                .requirements
+                .binary_search_by(|candidate| candidate.requirement.sha256.as_str().cmp(sha256))
+                .ok()
+                .and_then(|index| self.requirements.get(index))
+                .ok_or_else(|| format!("Artifact plan does not authorize staging path: {path}"))?;
+            let expected = inventory.requirement(sha256)?;
+            if &planned.requirement != expected
+                || !expected.provenances.iter().any(|provenance| {
+                    provenance.path == path
+                        && matches!(
+                            provenance.kind,
+                            ArtifactProvenanceKindV2::ManifestExact
+                                | ArtifactProvenanceKindV2::MutableDefault
+                        )
+                })
+            {
+                return Err(format!(
+                    "Artifact plan staging provenance is invalid for path: {path}"
+                ));
+            }
+        }
+        root.revalidate()?;
         Ok(())
     }
 }
@@ -947,6 +1088,45 @@ impl MutableBootstrapPlanV2 {
         self.disk_download_reserve_bytes
     }
 
+    pub(super) fn validated_disk_download_reserve_bytes(
+        &self,
+        root: &OwnedCasRoot,
+        inventory: &ArtifactInventoryV2,
+    ) -> Result<u64, String> {
+        self.validate_for(inventory)?;
+        inventory.validate_root(root)?;
+        let allocation_unit = super::planner::filesystem_allocation_unit(root.install_root())?;
+        if allocation_unit == 0 {
+            return Err("Mutable bootstrap allocation unit is zero".into());
+        }
+        let content = self.requirements.iter().try_fold(0_u64, |total, planned| {
+            let rounded_final = round_up_allocation(planned.requirement.size, allocation_unit)?;
+            let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
+                0
+            } else if let Some(evidence) = &planned.partial_allocation {
+                evidence.validate_live(
+                    root,
+                    &planned.requirement.sha256,
+                    planned.requirement.size,
+                )?;
+                rounded_final.saturating_sub(evidence.allocated_size().min(rounded_final))
+            } else {
+                rounded_final
+            };
+            total
+                .checked_add(charge)
+                .ok_or_else(|| "Mutable bootstrap physical reserve overflow".to_string())
+        })?;
+        let reserve = content
+            .checked_add(artifact_namespace_reserve(
+                &self.requirements,
+                allocation_unit,
+            )?)
+            .ok_or_else(|| "Mutable bootstrap namespace reserve overflow".to_string())?;
+        inventory.validate_root(root)?;
+        Ok(reserve)
+    }
+
     pub(super) fn validate_for(&self, inventory: &ArtifactInventoryV2) -> Result<(), String> {
         if self.binding != inventory.binding || self.inventory_fingerprint != inventory.fingerprint
         {
@@ -971,6 +1151,14 @@ impl MutableBootstrapPlanV2 {
                     .any(|hash| hash == planned.requirement.sha256())
             {
                 return Err("Mutable bootstrap contains a forged non-default artifact".into());
+            }
+            if let Some(evidence) = &planned.partial_allocation {
+                evidence.validate_sealed_identity(
+                    self.binding.cas_root.binding_nonce,
+                    self.binding.install_id,
+                    planned.requirement.sha256(),
+                    planned.requirement.size(),
+                )?;
             }
             let charge = if planned.availability == ArtifactAvailabilityStateV2::Complete {
                 0
@@ -1002,6 +1190,7 @@ fn missing_requirements(
     for sha256 in hashes {
         let expected = inventory.requirement(&sha256)?;
         let state = *availability.state(&sha256)?;
+        let partial_allocation = availability.partial_allocation(&sha256)?.cloned();
         let resume_from = match state {
             ArtifactAvailabilityStateV2::Complete
             | ArtifactAvailabilityStateV2::Missing
@@ -1033,6 +1222,7 @@ fn missing_requirements(
             requirement: expected.clone(),
             availability: state,
             resume_from,
+            partial_allocation,
         });
     }
     Ok((requirements, network, reserve))
@@ -1041,14 +1231,79 @@ fn missing_requirements(
 fn valid_planned_availability(planned: &PlannedArtifactV2) -> bool {
     match planned.availability {
         ArtifactAvailabilityStateV2::Partial { bytes } => {
-            bytes == planned.resume_from && bytes <= planned.requirement.size
+            bytes == planned.resume_from
+                && bytes <= planned.requirement.size
+                && planned
+                    .partial_allocation
+                    .as_ref()
+                    .is_none_or(|evidence| evidence.logical_size() == bytes)
         }
         ArtifactAvailabilityStateV2::Complete
         | ArtifactAvailabilityStateV2::Missing
-        | ArtifactAvailabilityStateV2::Corrupt => planned.resume_from == 0,
+        | ArtifactAvailabilityStateV2::Corrupt => {
+            planned.resume_from == 0 && planned.partial_allocation.is_none()
+        }
         ArtifactAvailabilityStateV2::CoveredByJavaGeneration
         | ArtifactAvailabilityStateV2::CoveredByGameGeneration => false,
     }
+}
+
+fn round_up_allocation(size: u64, allocation_unit: u64) -> Result<u64, String> {
+    if size == 0 || allocation_unit == 1 {
+        return Ok(size);
+    }
+    let remainder = size % allocation_unit;
+    if remainder == 0 {
+        Ok(size)
+    } else {
+        size.checked_add(allocation_unit - remainder)
+            .ok_or_else(|| "Artifact allocation rounding overflow".into())
+    }
+}
+
+fn artifact_namespace_reserve(
+    requirements: &[PlannedArtifactV2],
+    allocation_unit: u64,
+) -> Result<u64, String> {
+    if allocation_unit == 1 {
+        return Ok(0);
+    }
+    let incomplete = requirements
+        .iter()
+        .filter(|planned| planned.availability != ArtifactAvailabilityStateV2::Complete)
+        .collect::<Vec<_>>();
+    if incomplete.is_empty() {
+        return Ok(0);
+    }
+    let count = u64::try_from(incomplete.len())
+        .map_err(|_| "Artifact namespace count overflow".to_string())?;
+    let corrupt = u64::try_from(
+        incomplete
+            .iter()
+            .filter(|planned| planned.availability == ArtifactAvailabilityStateV2::Corrupt)
+            .count(),
+    )
+    .map_err(|_| "Artifact corrupt namespace count overflow".to_string())?;
+    let shards = incomplete
+        .iter()
+        .map(|planned| &planned.requirement.sha256[..2])
+        .collect::<BTreeSet<_>>();
+    let shard_count = u64::try_from(shards.len())
+        .map_err(|_| "Artifact shard namespace count overflow".to_string())?;
+    // Each incomplete object can require its object/partial entry and persistent lock entry.
+    // At most eight no-replace destination names coexist because downloads are bounded to eight.
+    // Three fixed entries cover objects, lock and temporary namespace roots; corrupt finals need
+    // one additional quarantine destination each.
+    let entries = count
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(count.min(8)))
+        .and_then(|value| value.checked_add(shard_count))
+        .and_then(|value| value.checked_add(3))
+        .and_then(|value| value.checked_add(corrupt))
+        .ok_or_else(|| "Artifact namespace entry count overflow".to_string())?;
+    entries
+        .checked_mul(allocation_unit)
+        .ok_or_else(|| "Artifact namespace reserve overflow".to_string())
 }
 
 fn insert_requirement(
@@ -1657,6 +1912,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_download_reserve_rounds_each_physical_object_independently() {
+        let root = TestRoot::new("physical-download-reserve");
+        let release = trusted('a', 1);
+        let inventory = inventory(&root, &release, Uuid::new_v4());
+        let availability = VerifiedAvailabilityV2::for_test(&inventory, [], false, false);
+        let plan = ArtifactPlanV2::for_reconcile(&inventory, &availability, []).unwrap();
+        let items = plan
+            .execution_view(root.root(), &inventory)
+            .unwrap()
+            .items()
+            .map(|item| (item.sha256().to_owned(), item.size(), item.availability()))
+            .collect::<Vec<_>>();
+        let expected_content_4k = items
+            .iter()
+            .filter(|(_, _, state)| *state != ArtifactAvailabilityStateV2::Complete)
+            .try_fold(0_u64, |total, (_, size, _)| {
+                total.checked_add(round_up_allocation(*size, 4096).unwrap())
+            })
+            .unwrap();
+        let incomplete = items
+            .iter()
+            .filter(|(_, _, state)| *state != ArtifactAvailabilityStateV2::Complete)
+            .collect::<Vec<_>>();
+        let incomplete_count = incomplete.len() as u64;
+        let shard_count = incomplete
+            .iter()
+            .map(|(sha256, _, _)| &sha256[..2])
+            .collect::<BTreeSet<_>>()
+            .len() as u64;
+        let expected_4k = expected_content_4k
+            + (2 * incomplete_count + incomplete_count.min(8) + shard_count + 3) * 4096;
+        assert_eq!(
+            plan.disk_download_reserve_bytes_for_allocation_unit(4096)
+                .unwrap(),
+            expected_4k
+        );
+        assert_eq!(
+            plan.disk_download_reserve_bytes_for_allocation_unit(1)
+                .unwrap(),
+            plan.disk_download_reserve_bytes()
+        );
+        assert!(expected_4k >= plan.disk_download_reserve_bytes());
+        assert!(plan
+            .disk_download_reserve_bytes_for_allocation_unit(0)
+            .is_err());
+    }
+
+    #[test]
     fn java_install_authority_is_plan_root_and_operation_bound() {
         let root = TestRoot::new("java-authority");
         let release = trusted('a', 1);
@@ -1900,6 +2203,7 @@ mod tests {
                 requirement: inventory.requirement(&sha256).unwrap().clone(),
                 availability: state,
                 resume_from: 0,
+                partial_allocation: None,
             };
             assert!(!valid_planned_availability(&planned));
         }

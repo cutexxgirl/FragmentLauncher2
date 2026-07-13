@@ -248,6 +248,20 @@ pub fn load_config(path: &Path) -> LoadedConfig {
 }
 
 pub fn save_config(path: &Path, config: &BuildManagerConfig) -> Result<(), String> {
+    save_config_with_unlock(path, config, |lock_file| {
+        FileExt::unlock(lock_file)
+            .map_err(|error| format!("Не удалось снять блокировку настроек: {error}"))
+    })
+}
+
+fn save_config_with_unlock<F>(
+    path: &Path,
+    config: &BuildManagerConfig,
+    unlock_file: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&std::fs::File) -> Result<(), String>,
+{
     let parent = path
         .parent()
         .ok_or_else(|| "Папка настроек недоступна".to_string())?;
@@ -283,9 +297,21 @@ pub fn save_config(path: &Path, config: &BuildManagerConfig) -> Result<(), Strin
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    let unlock = FileExt::unlock(&lock_file)
-        .map_err(|error| format!("Не удалось снять блокировку настроек: {error}"));
-    result.and(unlock)
+    let unlock = unlock_file(&lock_file);
+    match result {
+        Ok(()) => {
+            // `replace_file` is the commit point. An explicit unlock failure cannot roll the
+            // committed file back; dropping `lock_file` still releases the OS lease.
+            let _ = unlock;
+            Ok(())
+        }
+        Err(operation_error) => match unlock {
+            Ok(()) => Err(operation_error),
+            Err(unlock_error) => Err(format!(
+                "{operation_error}; additionally failed to release the config lock: {unlock_error}"
+            )),
+        },
+    }
 }
 
 fn validate_path_shape(path: &Path) -> Result<(), String> {
@@ -655,6 +681,41 @@ mod tests {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn committed_config_survives_an_explicit_unlock_failure() {
+        let root =
+            std::env::temp_dir().join(format!("fragment-storage-config-unlock-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("build-manager.json");
+        let install_id = Uuid::new_v4();
+        let config = BuildManagerConfig {
+            install_directory: Some(root.join("selected")),
+            install_id: Some(install_id),
+        };
+
+        let result = save_config_with_unlock(&path, &config, |_| {
+            Err("injected unlock failure after replace".into())
+        });
+
+        assert!(result.is_ok());
+        let loaded = load_config(&path);
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.config.install_directory, config.install_directory);
+        assert_eq!(loaded.config.install_id, Some(install_id));
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock_file
+            .try_lock_exclusive()
+            .expect("dropping the committed writer releases the lock");
+        FileExt::unlock(&lock_file).unwrap();
+        drop(lock_file);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn refuses_to_claim_a_non_empty_directory() {

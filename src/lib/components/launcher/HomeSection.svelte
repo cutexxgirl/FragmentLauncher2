@@ -10,9 +10,11 @@
 		Package,
 		Play,
 		RefreshCw,
+		RotateCcw,
 		Settings,
 		ShieldCheck,
 		TriangleAlert,
+		X,
 	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import type { BuildStatus } from '$lib/launcher';
@@ -25,9 +27,11 @@
 		feedItems: FeedItem[];
 		feedImages: string[];
 		buildStatus: BuildStatus;
+		operationCancelPending: boolean;
 		selectBuild: (buildId: string) => void;
 		openSettings: () => void;
 		primaryAction: () => void;
+		cancelAction: () => void;
 	};
 
 	let {
@@ -37,9 +41,11 @@
 		feedItems,
 		feedImages,
 		buildStatus,
+		operationCancelPending,
 		selectBuild,
 		openSettings,
 		primaryAction,
+		cancelAction,
 	}: Props = $props();
 
 	let activeCategory = $state<FeedCategory>('news');
@@ -57,10 +63,8 @@
 	let showStatusPopover = $derived(
 		buildStatus.operationActive ||
 			buildStatus.primaryAction === 'blocked' ||
+			buildStatus.primaryAction === 'retry' ||
 			buildStatus.primaryAction === 'busy',
-	);
-	let projectedFreeBytes = $derived(
-		Math.max(0, buildStatus.progress.diskFreeBytes - buildStatus.progress.diskRequiredBytes),
 	);
 
 	onMount(() => {
@@ -113,6 +117,8 @@
 				return 'Исправить';
 			case 'play':
 				return 'Играть';
+			case 'retry':
+				return 'Повторить проверку';
 			case 'busy':
 				return 'Подождите';
 			default:
@@ -192,7 +198,12 @@
 	<div class="home-actions">
 		<div class="primary-action-wrap">
 			{#if showStatusPopover}
-				<div class="operation-status-popover" id="build-action-status" role="status">
+				<div
+					class="operation-status-popover"
+					id="build-action-status"
+					role="region"
+					aria-live="polite"
+				>
 					<div class="operation-status-head">
 						<strong>{buildStatus.message}</strong>
 						{#if buildStatus.operationActive}
@@ -224,14 +235,36 @@
 							<strong>{formatBytes(buildStatus.progress.downloadedBytes)}</strong>
 							<span>Осталось скачать</span>
 							<strong>{formatBytes(buildStatus.progress.remainingBytes)}</strong>
-							<span><HardDrive size={13} /> Требуется</span>
+							<span><HardDrive size={13} /> Резерв операции</span>
 							<strong>{formatBytes(buildStatus.progress.diskRequiredBytes)}</strong>
-							<span><HardDrive size={13} /> Будет свободно</span>
-							<strong>{formatBytes(projectedFreeBytes)}</strong>
+							<span><HardDrive size={13} /> Свободно сейчас</span>
+							<strong>{formatBytes(buildStatus.progress.diskFreeBytes)}</strong>
 						</div>
 						{#if buildStatus.progress.currentFile}
 							<p class="operation-current-file">{buildStatus.progress.currentFile}</p>
 						{/if}
+						{#if buildStatus.operationId}
+							<button
+								type="button"
+								class="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-semibold text-white/75 transition hover:border-white/20 hover:bg-white/[0.08] hover:text-white disabled:cursor-wait disabled:opacity-50"
+								disabled={operationCancelPending}
+								onclick={cancelAction}
+							>
+								{#if operationCancelPending}
+									<LoaderCircle size={14} class="spin-icon" />
+								{:else}
+									<X size={14} />
+								{/if}
+								<span>{operationCancelPending ? 'Отменяем…' : 'Отменить'}</span>
+							</button>
+						{/if}
+					{:else if buildStatus.phase === 'diskInsufficient'}
+						<div class="operation-status-grid">
+							<span><HardDrive size={13} /> Резерв операции</span>
+							<strong>{formatBytes(buildStatus.progress.diskRequiredBytes)}</strong>
+							<span><HardDrive size={13} /> Свободно сейчас</span>
+							<strong>{formatBytes(buildStatus.progress.diskFreeBytes)}</strong>
+						</div>
 					{/if}
 				</div>
 			{/if}
@@ -250,6 +283,8 @@
 					<RefreshCw size={18} />
 				{:else if buildStatus.primaryAction === 'repair'}
 					<ShieldCheck size={18} />
+				{:else if buildStatus.primaryAction === 'retry'}
+					<RotateCcw size={18} />
 				{:else if buildStatus.primaryAction === 'busy'}
 					<LoaderCircle size={18} class="spin-icon" />
 				{:else if buildStatus.primaryAction === 'blocked' && buildStatus.phase === 'error'}

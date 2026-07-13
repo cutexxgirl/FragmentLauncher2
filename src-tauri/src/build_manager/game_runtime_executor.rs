@@ -7,7 +7,8 @@ use super::{
     game_generation::GameGenerationProcessorBuild,
     game_runtime::{
         audit_existing_game_runtime_outputs, run_prepared_java_process, GameRuntimeOutputLease,
-        JavaProcessLimits, JavaProcessOutput, ProcessorWorkspaceMonitorLimits, StreamCapture,
+        JavaProcessError, JavaProcessLimits, JavaProcessOutput, ProcessorWorkspaceMonitorLimits,
+        StreamCapture,
     },
     game_runtime_invocation::{prepare_processor_invocations, PreparedProcessorInvocation},
     game_runtime_materializer::ProcessorWorkspace,
@@ -21,7 +22,7 @@ use super::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -36,6 +37,42 @@ const MAX_PARTIAL_OUTPUT_ENTRIES: usize = 128;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROCESSOR_MAX_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 const PROCESSOR_MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProcessorExecutionError {
+    Cancelled,
+    Failed(String),
+}
+
+impl fmt::Display for ProcessorExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("NeoForge processor execution was cancelled"),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ProcessorExecutionError {}
+
+impl From<String> for ProcessorExecutionError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for ProcessorExecutionError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+fn map_java_process_error(error: JavaProcessError) -> ProcessorExecutionError {
+    match error {
+        JavaProcessError::Cancelled => ProcessorExecutionError::Cancelled,
+        JavaProcessError::Failed(message) => ProcessorExecutionError::Failed(message),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,7 +292,7 @@ trait PreparedProcessSpawner {
         invocation: &PreparedProcessorInvocation,
         monitor_limits: ProcessorWorkspaceMonitorLimits,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<JavaProcessOutput, String>;
+    ) -> Result<JavaProcessOutput, ProcessorExecutionError>;
 }
 
 struct NativeProcessorHost<'a> {
@@ -279,7 +316,7 @@ impl PreparedProcessSpawner for NativeProcessorHost<'_> {
         invocation: &PreparedProcessorInvocation,
         monitor_limits: ProcessorWorkspaceMonitorLimits,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<JavaProcessOutput, String> {
+    ) -> Result<JavaProcessOutput, ProcessorExecutionError> {
         run_prepared_java_process(
             invocation,
             self.runtime_lock,
@@ -289,6 +326,7 @@ impl PreparedProcessSpawner for NativeProcessorHost<'_> {
             monitor_limits,
             cancelled,
         )
+        .map_err(map_java_process_error)
     }
 }
 
@@ -302,6 +340,7 @@ fn processor_limits() -> JavaProcessLimits {
 
 fn workspace_monitor_limits(
     step: &ProcessorStepContract,
+    output_directories: &BTreeMap<String, String>,
 ) -> Result<ProcessorWorkspaceMonitorLimits, String> {
     let output_max_bytes = step
         .after_write
@@ -314,6 +353,12 @@ fn workspace_monitor_limits(
     Ok(ProcessorWorkspaceMonitorLimits {
         output_max_entries: MAX_PARTIAL_OUTPUT_ENTRIES,
         output_max_bytes,
+        allowed_output_files: step
+            .after_write
+            .values()
+            .map(|artifact| (artifact.path.clone(), artifact.size))
+            .collect(),
+        allowed_output_directories: output_directories.values().cloned().collect(),
     })
 }
 
@@ -326,7 +371,7 @@ pub(super) fn execute_game_runtime_processors(
     build: &GameGenerationProcessorBuild<'_, '_>,
     runtime: &RuntimeInstallation,
     cancelled: Arc<AtomicBool>,
-) -> Result<ProcessorExecutionResult, String> {
+) -> Result<ProcessorExecutionResult, ProcessorExecutionError> {
     let authority = build.authority();
     workspace.validate_for_build(build)?;
     if runtime.runtime_lock_sha256() != authority.runtime_lock_sha256() {
@@ -364,7 +409,7 @@ fn execute_with_host<H>(
     runtime: &RuntimeInstallation,
     cancelled: Arc<AtomicBool>,
     host: &mut H,
-) -> Result<ExecutedProcessorArtifacts, String>
+) -> Result<ExecutedProcessorArtifacts, ProcessorExecutionError>
 where
     H: RuntimeRevalidator + PreparedProcessSpawner,
 {
@@ -436,7 +481,7 @@ where
             require_not_cancelled(&cancelled)?;
             let output = host.spawn(
                 invocation,
-                workspace_monitor_limits(step)?,
+                workspace_monitor_limits(step, &contract.output_directories)?,
                 Arc::clone(&cancelled),
             )?;
             require_successful_exit(&step.id, step.upstream_index, &output)?;
@@ -585,9 +630,9 @@ fn signed_derived_identity<'lock>(
     }
 }
 
-fn require_not_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+fn require_not_cancelled(cancelled: &AtomicBool) -> Result<(), ProcessorExecutionError> {
     if cancelled.load(Ordering::Acquire) {
-        Err("NeoForge processor execution was cancelled".into())
+        Err(ProcessorExecutionError::Cancelled)
     } else {
         Ok(())
     }
@@ -1636,9 +1681,23 @@ mod tests {
     #[test]
     fn cancellation_and_nonzero_results_are_fail_closed() {
         let cancelled = AtomicBool::new(true);
-        assert!(require_not_cancelled(&cancelled).is_err());
+        assert!(matches!(
+            require_not_cancelled(&cancelled),
+            Err(ProcessorExecutionError::Cancelled)
+        ));
         cancelled.store(false, Ordering::Release);
         assert!(require_not_cancelled(&cancelled).is_ok());
+
+        assert!(matches!(
+            map_java_process_error(JavaProcessError::Cancelled),
+            ProcessorExecutionError::Cancelled
+        ));
+        assert!(matches!(
+            map_java_process_error(JavaProcessError::Failed(
+                "NeoForge processor execution was cancelled".into()
+            )),
+            ProcessorExecutionError::Failed(_)
+        ));
 
         let nonzero = JavaProcessOutput {
             exit_code: 7,

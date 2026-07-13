@@ -13,6 +13,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -411,22 +412,47 @@ fn launcher_status() -> LauncherStatus {
 }
 
 #[tauri::command]
-fn build_status(
-    manager: tauri::State<'_, BuildManager>,
+async fn build_status(
+    manager: tauri::State<'_, Arc<BuildManager>>,
+    auth: tauri::State<'_, Arc<AuthSessionManager>>,
     channel: BuildChannel,
     preset: PresetId,
+    operation_id: Option<uuid::Uuid>,
 ) -> Result<BuildStatus, String> {
-    manager.status(channel, preset)
+    if let Some(operation_id) = operation_id {
+        return manager.operation_status(operation_id, channel, preset);
+    }
+    Arc::clone(manager.inner())
+        .status(Arc::clone(auth.inner()), channel, preset)
+        .await
 }
 
 #[tauri::command]
 fn set_build_install_directory(
-    manager: tauri::State<'_, BuildManager>,
+    manager: tauri::State<'_, Arc<BuildManager>>,
     path: String,
     channel: BuildChannel,
     preset: PresetId,
 ) -> Result<BuildStatus, String> {
     manager.set_install_directory(PathBuf::from(path), channel, preset)
+}
+
+#[tauri::command]
+fn start_build_operation(
+    manager: tauri::State<'_, Arc<BuildManager>>,
+    auth: tauri::State<'_, Arc<AuthSessionManager>>,
+    channel: BuildChannel,
+    preset: PresetId,
+) -> Result<BuildStatus, String> {
+    Arc::clone(manager.inner()).start_operation(Arc::clone(auth.inner()), channel, preset)
+}
+
+#[tauri::command]
+fn cancel_build_operation(
+    manager: tauri::State<'_, Arc<BuildManager>>,
+    operation_id: uuid::Uuid,
+) -> Result<BuildStatus, String> {
+    manager.cancel_operation(operation_id)
 }
 
 fn map_auth_error(error: AuthError) -> String {
@@ -435,35 +461,35 @@ fn map_auth_error(error: AuthError) -> String {
 
 #[tauri::command]
 async fn auth_restore(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
 ) -> Result<AuthSnapshot, String> {
     manager.restore().await.map_err(map_auth_error)
 }
 
 #[tauri::command]
 async fn auth_begin_login(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
 ) -> Result<TelegramLoginSnapshot, String> {
     manager.begin_login(None).await.map_err(map_auth_error)
 }
 
 #[tauri::command]
 async fn auth_poll_login(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
 ) -> Result<TelegramPollSnapshot, String> {
     manager.poll_login().await.map_err(map_auth_error)
 }
 
 #[tauri::command]
 async fn auth_refresh_profile(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
 ) -> Result<AuthSnapshot, String> {
     manager.refresh_profile().await.map_err(map_auth_error)
 }
 
 #[tauri::command]
 async fn auth_update_nickname(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
     nickname: Option<String>,
 ) -> Result<AuthSnapshot, String> {
     manager
@@ -474,14 +500,14 @@ async fn auth_update_nickname(
 
 #[tauri::command]
 async fn auth_logout(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
 ) -> Result<AuthSnapshot, String> {
     manager.logout().await.map_err(map_auth_error)
 }
 
 #[tauri::command]
 async fn auth_admission(
-    manager: tauri::State<'_, AuthSessionManager>,
+    manager: tauri::State<'_, Arc<AuthSessionManager>>,
     channel: AdmissionChannel,
 ) -> Result<LauncherAdmissionSnapshot, String> {
     manager.admission(channel).await.map_err(map_auth_error)
@@ -548,9 +574,9 @@ pub fn run() {
             let app_data_dir = app.path().app_local_data_dir()?;
             let auth = AuthSessionManager::production(app_data_dir.join("auth-refresh-v2.lock"))
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-            app.manage(auth);
+            app.manage(Arc::new(auth));
             let config_path = app_data_dir.join("build-manager.json");
-            app.manage(BuildManager::new(config_path));
+            app.manage(Arc::new(BuildManager::new(config_path)));
             if let Some(window) = app.get_webview_window("main") {
                 configure_windows_frame(&window)?;
                 window.center()?;
@@ -569,6 +595,8 @@ pub fn run() {
             launcher_status,
             build_status,
             set_build_install_directory,
+            start_build_operation,
+            cancel_build_operation,
             auth_restore,
             auth_begin_login,
             auth_poll_login,

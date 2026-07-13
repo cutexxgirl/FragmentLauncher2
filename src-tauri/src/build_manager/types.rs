@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +65,7 @@ pub enum PrimaryAction {
     Update,
     Repair,
     Play,
+    Retry,
     Busy,
     Blocked,
 }
@@ -83,6 +85,8 @@ pub struct TransferProgress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildStatus {
+    pub operation_id: Option<Uuid>,
+    pub revision: u64,
     pub channel: BuildChannel,
     pub preset: PresetId,
     pub phase: BuildPhase,
@@ -103,6 +107,8 @@ impl BuildStatus {
         message: String,
     ) -> Self {
         Self {
+            operation_id: None,
+            revision: 0,
             channel,
             preset,
             phase: BuildPhase::Error,
@@ -122,15 +128,22 @@ impl BuildStatus {
         install_directory: Option<String>,
         disk_free_bytes: u64,
     ) -> Self {
+        let message = if install_directory.is_some() {
+            "Сборка Fragment ещё не установлена."
+        } else {
+            "Выберите папку установки Fragment."
+        };
         Self {
+            operation_id: None,
+            revision: 0,
             channel,
             preset,
             phase: BuildPhase::NotInstalled,
-            primary_action: PrimaryAction::Blocked,
+            primary_action: PrimaryAction::Download,
             install_directory,
             installed_release_id: None,
             available_release_id: None,
-            message: "Загрузчик и TUF-клиент ещё не подключены: эта dev-ветка пока является безопасным каркасом.".into(),
+            message: message.into(),
             operation_active: false,
             progress: TransferProgress {
                 disk_free_bytes,

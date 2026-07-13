@@ -1,15 +1,20 @@
+#[cfg(test)]
+use super::cas::{DownloadProgressEvent, DownloadProgressPhase};
 use super::{
     artifact_plan::{ArtifactExecutionSourceV2, PlannedArtifactExecutionV2},
     availability::ArtifactAvailabilityStateV2,
     cas::{
         acquire_object_lock, activate_partial_if, audit_existing_official_final,
-        discard_stale_partial, managed_error, CasError, CasPaths, ExistingFinal, ExpectedObject,
-        VerifiedCasObject,
+        cleanup_active_cas_quarantine, discard_stale_partial, managed_error,
+        quarantine_corrupt_cas_object, reclaim_cas_quarantine_bucket_locked, ActiveCasQuarantine,
+        CasError, CasPaths, DownloadCancellation, DownloadObserver, DownloadProgressReporter,
+        ExistingFinal, ExpectedObject, NoopDownloadObserver, VerifiedCasObject,
+        VerifiedCasPartialAllocationV2,
     },
     contracts::{
         official_game_host_is_allowed, validate_official_game_source, OFFICIAL_GAME_HOSTS,
     },
-    managed_fs::{quarantine_node, ResumableManagedFile},
+    managed_fs::{ManagedLockFile, ResumableManagedFile},
     spark_client::{is_retryable_status, retry_after},
     storage::OwnedCasRoot,
 };
@@ -26,15 +31,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
-    sync::{Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
 use url::Url;
@@ -51,50 +53,7 @@ const MIN_ATTEMPT_TIME: Duration = Duration::from_secs(120);
 const MAX_ATTEMPT_TIME: Duration = Duration::from_secs(30 * 60);
 const MIN_TRANSFER_RATE_BYTES_PER_SECOND: u64 = 64 * 1024;
 
-#[derive(Clone, Default)]
-pub(super) struct OfficialDownloadCancellation {
-    inner: Arc<CancellationInner>,
-}
-
-#[derive(Default)]
-struct CancellationInner {
-    cancelled: AtomicBool,
-    notify: Notify,
-}
-
-impl OfficialDownloadCancellation {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(super) fn cancel(&self) {
-        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
-            self.inner.notify.notify_waiters();
-        }
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::Acquire)
-    }
-
-    async fn cancelled(&self) {
-        loop {
-            let notified = self.inner.notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    fn check(&self) -> OfficialResult<()> {
-        if self.is_cancelled() {
-            Err(OfficialCasError::Cancelled)
-        } else {
-            Ok(())
-        }
-    }
-}
+pub(super) type OfficialDownloadCancellation = DownloadCancellation;
 
 #[derive(Debug, Error)]
 pub(super) enum OfficialCasError {
@@ -115,10 +74,24 @@ pub(super) enum OfficialCasError {
     #[error("Official artifact failed its signed size or digest checks")]
     Integrity,
     #[error(transparent)]
-    Cas(#[from] CasError),
+    Cas(CasError),
+}
+
+impl From<CasError> for OfficialCasError {
+    fn from(error: CasError) -> Self {
+        match error {
+            CasError::Cancelled => Self::Cancelled,
+            other => Self::Cas(other),
+        }
+    }
 }
 
 type OfficialResult<T> = Result<T, OfficialCasError>;
+
+struct LockedOfficialCas<'a> {
+    paths: &'a CasPaths,
+    object_lock: &'a ManagedLockFile,
+}
 
 /// Official Mojang/NeoForge transport. Production construction fixes the WebPKI TLS client,
 /// pinned DNS policy and concurrency ceilings. Its only production download entry point accepts
@@ -128,6 +101,7 @@ pub(super) struct OfficialCasDownloader<'root> {
     transport: OfficialHttpTransport,
     gates: RequestGates,
     retry_governor: OperationRetryGovernor,
+    observer: Arc<dyn DownloadObserver>,
 }
 
 impl fmt::Debug for OfficialCasDownloader<'_> {
@@ -140,12 +114,20 @@ impl fmt::Debug for OfficialCasDownloader<'_> {
 
 impl<'root> OfficialCasDownloader<'root> {
     pub(super) fn new(cache_root: &'root OwnedCasRoot) -> Result<Self, String> {
+        Self::with_observer(cache_root, Arc::new(NoopDownloadObserver))
+    }
+
+    pub(super) fn with_observer(
+        cache_root: &'root OwnedCasRoot,
+        observer: Arc<dyn DownloadObserver>,
+    ) -> Result<Self, String> {
         cache_root.revalidate()?;
         Ok(Self {
             cache_root,
             transport: OfficialHttpTransport::production()?,
             gates: RequestGates::new(),
             retry_governor: OperationRetryGovernor::new(),
+            observer,
         })
     }
 
@@ -156,6 +138,22 @@ impl<'root> OfficialCasDownloader<'root> {
             transport: OfficialHttpTransport::for_test(origin),
             gates: RequestGates::new(),
             retry_governor: OperationRetryGovernor::new(),
+            observer: Arc::new(NoopDownloadObserver),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_observer(
+        cache_root: &'root OwnedCasRoot,
+        origin: &str,
+        observer: Arc<dyn DownloadObserver>,
+    ) -> Self {
+        Self {
+            cache_root,
+            transport: OfficialHttpTransport::for_test(origin),
+            gates: RequestGates::new(),
+            retry_governor: OperationRetryGovernor::new(),
+            observer,
         }
     }
 
@@ -186,15 +184,28 @@ impl<'root> OfficialCasDownloader<'root> {
             availability: planned.availability(),
         };
         if planned.availability() == ArtifactAvailabilityStateV2::Complete {
-            return verify_complete_official(
+            let mut reporter = DownloadProgressReporter::new(
+                self.observer.clone(),
+                planned.sha256(),
+                planned.size(),
+            )
+            .map_err(OfficialCasError::InvalidPlan)?;
+            let object = verify_complete_official(
                 self.cache_root,
                 &expected,
                 planned.resume_from(),
                 cancellation,
-            );
+            )?;
+            reporter.complete();
+            return Ok(object);
         }
-        self.ensure_expected(&expected, planned.resume_from(), cancellation)
-            .await
+        self.ensure_expected_with_allocation(
+            &expected,
+            planned.resume_from(),
+            planned.partial_allocation(),
+            cancellation,
+        )
+        .await
     }
 
     async fn ensure_expected(
@@ -203,7 +214,24 @@ impl<'root> OfficialCasDownloader<'root> {
         planned_resume_from: u64,
         cancellation: &OfficialDownloadCancellation,
     ) -> OfficialResult<VerifiedCasObject> {
+        self.ensure_expected_with_allocation(expected, planned_resume_from, None, cancellation)
+            .await
+    }
+
+    async fn ensure_expected_with_allocation(
+        &self,
+        expected: &OfficialExpectation,
+        planned_resume_from: u64,
+        credited_partial: Option<&VerifiedCasPartialAllocationV2>,
+        cancellation: &OfficialDownloadCancellation,
+    ) -> OfficialResult<VerifiedCasObject> {
         cancellation.check()?;
+        let mut reporter = DownloadProgressReporter::new(
+            self.observer.clone(),
+            &expected.object.sha256,
+            expected.object.size,
+        )
+        .map_err(OfficialCasError::InvalidPlan)?;
         self.retry_governor.ensure_open()?;
         self.cache_root.revalidate().map_err(CasError::Failed)?;
         validate_official_game_source(expected.source.as_str(), &expected.sha1).map_err(|_| {
@@ -217,18 +245,33 @@ impl<'root> OfficialCasDownloader<'root> {
             acquire_object_lock(self.cache_root, &paths.lock),
         )
         .await??;
+        cancellation.check()?;
         guards.revalidate()?;
         let result = self
-            .ensure_expected_locked(expected, planned_resume_from, &paths, cancellation)
+            .ensure_expected_locked(
+                expected,
+                planned_resume_from,
+                credited_partial,
+                LockedOfficialCas {
+                    paths: &paths,
+                    object_lock: &lock,
+                },
+                cancellation,
+                &mut reporter,
+            )
             .await;
         let unlock = FileExt::unlock(lock.file()).map_err(|error| {
             CasError::Failed(format!("Cannot unlock official CAS object: {error}"))
         });
         drop(guards);
-        match (result, unlock) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.into()),
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => {
+                // Drop still releases the lease. Never reinterpret an exact applied CAS result
+                // as a generic failure because an explicit unlock call failed.
+                let _ = unlock;
+                Ok(value)
+            }
         }
     }
 
@@ -236,10 +279,14 @@ impl<'root> OfficialCasDownloader<'root> {
         &self,
         expected: &OfficialExpectation,
         planned_resume_from: u64,
-        paths: &CasPaths,
+        credited_partial: Option<&VerifiedCasPartialAllocationV2>,
+        locked: LockedOfficialCas<'_>,
         cancellation: &OfficialDownloadCancellation,
+        reporter: &mut DownloadProgressReporter,
     ) -> OfficialResult<VerifiedCasObject> {
+        let LockedOfficialCas { paths, object_lock } = locked;
         cancellation.check()?;
+        reclaim_cas_quarantine_bucket_locked(self.cache_root, paths, object_lock, None)?;
         let existing = audit_existing_official_final(
             self.cache_root,
             &expected.object,
@@ -247,56 +294,91 @@ impl<'root> OfficialCasDownloader<'root> {
             expected.object.size,
         )?;
         cancellation.check()?;
+        let mut active_quarantine = None;
         match existing {
             ExistingFinal::Missing => {}
             ExistingFinal::Verified(_) => {
                 cancellation.check()?;
                 discard_stale_partial(self.cache_root, paths, expected.object.size)?;
                 cancellation.check()?;
-                return verify_complete_official(
+                let object = verify_complete_official(
                     self.cache_root,
                     expected,
                     expected.object.size,
                     cancellation,
-                );
+                )?;
+                reporter.complete();
+                return Ok(object);
             }
-            ExistingFinal::Corrupt => {
+            ExistingFinal::Corrupt(evidence) => {
                 if expected.availability != ArtifactAvailabilityStateV2::Corrupt {
                     return Err(OfficialCasError::InvalidPlan(
                         "canonical CAS state changed after availability planning".into(),
                     ));
                 }
                 cancellation.check()?;
-                quarantine_node(
-                    self.cache_root.managed_root(),
-                    paths.final_path.clone(),
-                    &paths.quarantine,
-                )
-                .map_err(|error| {
-                    managed_error("Cannot quarantine corrupt official CAS object", error)
-                })?;
+                active_quarantine = Some(quarantine_corrupt_cas_object(
+                    self.cache_root,
+                    paths,
+                    object_lock,
+                    &evidence,
+                )?);
                 self.cache_root.revalidate().map_err(CasError::Failed)?;
             }
         }
 
         cancellation.check()?;
-        let mut partial = ResumableManagedFile::open_or_create(
-            self.cache_root.managed_root(),
-            paths.partial.clone(),
-            expected.object.size,
-        )
-        .map_err(|error| managed_error("Cannot open official CAS partial", error))?;
+        let mut partial = match credited_partial {
+            Some(evidence) => match evidence.open_exact(
+                self.cache_root,
+                &expected.object.sha256,
+                expected.object.size,
+            ) {
+                Ok(partial) => partial,
+                Err(evidence_error) => match audit_existing_official_final(
+                    self.cache_root,
+                    &expected.object,
+                    &expected.sha1,
+                    expected.object.size,
+                )? {
+                    ExistingFinal::Verified(object) => {
+                        reporter.complete();
+                        return finish_official_replacement(
+                            self.cache_root,
+                            paths,
+                            object_lock,
+                            &mut active_quarantine,
+                            object,
+                        );
+                    }
+                    ExistingFinal::Missing | ExistingFinal::Corrupt(_) => {
+                        return Err(evidence_error.into())
+                    }
+                },
+            },
+            None => ResumableManagedFile::open_or_create(
+                self.cache_root.managed_root(),
+                paths.partial.clone(),
+                expected.object.size,
+            )
+            .map_err(|error| managed_error("Cannot open official CAS partial", error))?,
+        };
         let mut original_partial = partial
             .len()
             .map_err(|error| managed_error("Cannot inspect official CAS partial", error))?;
+        reporter.resume(original_partial.min(expected.object.size));
         if original_partial > expected.object.size {
+            cancellation.check()?;
+            let discarded = original_partial;
             partial.truncate_zero().map_err(|error| {
                 managed_error("Cannot reset oversized official CAS partial", error)
             })?;
             original_partial = 0;
+            reporter.reset(discarded.min(expected.object.size));
         }
-        // The plan reserves the full signed size, so a live partial may safely grow or shrink
-        // after scanning. Its current leased-handle length, never the stale scan, drives Range.
+        // Uncredited plans reserve the full signed allocation and may adapt to current partial
+        // state. A credited plan reached this point only after reopening the exact physical
+        // allocation witness above. In either case the retained handle drives Range from here.
         let _ = planned_resume_from;
 
         let mut retry_budget = OfficialRetryBudget::default();
@@ -363,14 +445,24 @@ impl<'root> OfficialCasDownloader<'root> {
                         original_partial,
                         cancellation,
                     )?;
+                    let object = finish_official_replacement(
+                        self.cache_root,
+                        paths,
+                        object_lock,
+                        &mut active_quarantine,
+                        object,
+                    )?;
+                    reporter.complete();
                     self.retry_governor.verified_success();
                     return Ok(object);
                 }
                 cancellation.check()?;
+                let discarded = offset;
                 partial.truncate_zero().map_err(|error| {
                     managed_error("Cannot reset rejected official CAS partial", error)
                 })?;
                 original_partial = 0;
+                reporter.reset(discarded);
                 range_resets = range_resets.saturating_add(1);
                 if range_resets > MAX_RANGE_RESETS {
                     return Err(OfficialCasError::InvalidResponse(
@@ -388,10 +480,12 @@ impl<'root> OfficialCasDownloader<'root> {
                 // The origin ignored Range. Reset the already-open identity-stable handle; never
                 // close and reopen the path between deciding to restart and writing byte zero.
                 cancellation.check()?;
+                let discarded = offset;
                 partial
                     .truncate_zero()
                     .map_err(|error| managed_error("Cannot restart official CAS partial", error))?;
                 original_partial = 0;
+                reporter.reset(discarded);
             }
             match stream_response(
                 response,
@@ -400,6 +494,7 @@ impl<'root> OfficialCasDownloader<'root> {
                 expected.object.size,
                 attempt_deadline,
                 cancellation,
+                reporter,
             )
             .await
             {
@@ -438,22 +533,34 @@ impl<'root> OfficialCasDownloader<'root> {
                         original_partial,
                         cancellation,
                     )?;
+                    let object = finish_official_replacement(
+                        self.cache_root,
+                        paths,
+                        object_lock,
+                        &mut active_quarantine,
+                        object,
+                    )?;
+                    reporter.complete();
                     self.retry_governor.verified_success();
                     return Ok(object);
                 }
                 Ok(false) if clean_retries < MAX_CLEAN_RETRIES => {
                     cancellation.check()?;
+                    let discarded = length;
                     partial.truncate_zero().map_err(|error| {
                         managed_error("Cannot reset corrupt official CAS partial", error)
                     })?;
                     original_partial = 0;
+                    reporter.reset(discarded);
                     clean_retries += 1;
                 }
                 Ok(false) => {
                     cancellation.check()?;
+                    let discarded = length;
                     partial.discard().map_err(|error| {
                         managed_error("Cannot discard corrupt official CAS partial", error)
                     })?;
+                    reporter.reset(discarded);
                     return Err(OfficialCasError::Integrity);
                 }
                 Err(error) => return Err(error),
@@ -467,6 +574,7 @@ impl<'root> OfficialCasDownloader<'root> {
         retry_after: Option<Duration>,
         cancellation: &OfficialDownloadCancellation,
     ) -> OfficialResult<()> {
+        cancellation.check()?;
         self.retry_governor.transient_failure()?;
         retry_budget.wait(retry_after, cancellation).await
     }
@@ -494,7 +602,7 @@ fn verify_complete_official(
         ExistingFinal::Missing => Err(OfficialCasError::InvalidPlan(
             "Complete official CAS object is missing; rescan required".into(),
         )),
-        ExistingFinal::Corrupt => Err(OfficialCasError::InvalidPlan(
+        ExistingFinal::Corrupt(_) => Err(OfficialCasError::InvalidPlan(
             "Complete official CAS object changed; rescan required".into(),
         )),
     }
@@ -521,6 +629,26 @@ fn official_partial_matches_cancellable(
     let matches = official_partial_matches(partial, expected)?;
     cancellation.check()?;
     Ok(matches)
+}
+
+fn finish_official_replacement(
+    root: &OwnedCasRoot,
+    paths: &CasPaths,
+    object_lock: &ManagedLockFile,
+    active: &mut Option<ActiveCasQuarantine>,
+    object: VerifiedCasObject,
+) -> OfficialResult<VerifiedCasObject> {
+    if let Some(active) = active.take() {
+        cleanup_active_cas_quarantine(root, paths, object_lock, active).map_err(|error| {
+            CasError::AppliedButFinalAuditFailed {
+                destination: paths.final_path.as_str().to_owned(),
+                detail: format!(
+                    "verified official CAS replacement quarantine cleanup failed: {error}"
+                ),
+            }
+        })?;
+    }
+    Ok(object)
 }
 
 fn activate_official(
@@ -551,9 +679,28 @@ fn activate_official(
     };
     // The no-replace rename attempt is the commit point. From here cancellation cannot replace
     // the applied/durability outcome; finish the exact final audit and report that truth.
-    match audit_existing_official_final(root, &expected.object, &expected.sha1, resumed_bytes)? {
-        ExistingFinal::Verified(_) => Ok(object),
-        ExistingFinal::Missing | ExistingFinal::Corrupt => Err(OfficialCasError::Integrity),
+    let final_audit =
+        audit_existing_official_final(root, &expected.object, &expected.sha1, resumed_bytes);
+    match final_audit {
+        Ok(ExistingFinal::Verified(_)) => Ok(object),
+        Ok(ExistingFinal::Missing | ExistingFinal::Corrupt(_))
+            if object.published_by_this_operation() =>
+        {
+            Err(CasError::AppliedButFinalAuditFailed {
+                destination: paths.final_path.as_str().to_owned(),
+                detail: "published official CAS object failed its final dual-digest audit".into(),
+            }
+            .into())
+        }
+        Err(error) if object.published_by_this_operation() => {
+            Err(CasError::AppliedButFinalAuditFailed {
+                destination: paths.final_path.as_str().to_owned(),
+                detail: format!("published official CAS final audit failed: {error}"),
+            }
+            .into())
+        }
+        Ok(ExistingFinal::Missing | ExistingFinal::Corrupt(_)) => Err(OfficialCasError::Integrity),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -568,6 +715,7 @@ impl OfficialRetryBudget {
         retry_after: Option<Duration>,
         cancellation: &OfficialDownloadCancellation,
     ) -> OfficialResult<()> {
+        cancellation.check()?;
         if self.used >= MAX_TRANSIENT_RETRIES {
             return Err(OfficialCasError::RetryExhausted);
         }
@@ -976,6 +1124,7 @@ async fn stream_response(
     expected_size: u64,
     deadline: Instant,
     cancellation: &OfficialDownloadCancellation,
+    reporter: &mut DownloadProgressReporter,
 ) -> Result<(), StreamError> {
     let mut written = write_offset;
     let mut stream = response.bytes_stream();
@@ -986,12 +1135,14 @@ async fn stream_response(
                 partial.sync_all().map_err(|error| {
                     StreamError::Fatal(managed_error("Cannot flush cancelled official CAS partial", error).into())
                 })?;
+                reporter.flush_bytes(written);
                 return Err(StreamError::Cancelled);
             }
             _ = tokio::time::sleep_until(deadline) => {
                 partial.sync_all().map_err(|error| {
                     StreamError::Fatal(managed_error("Cannot flush timed-out official CAS partial", error).into())
                 })?;
+                reporter.flush_bytes(written);
                 return Err(StreamError::Retryable);
             }
             item = stream.next() => item,
@@ -1008,6 +1159,7 @@ async fn stream_response(
                             .into(),
                     )
                 })?;
+                reporter.flush_bytes(written);
                 return Err(StreamError::Retryable);
             }
         };
@@ -1026,10 +1178,12 @@ async fn stream_response(
             .map_err(|error| {
                 StreamError::Fatal(managed_error("Cannot write official CAS partial", error).into())
             })?;
+        reporter.bytes(written, chunk.len() as u64);
     }
     partial.sync_all().map_err(|error| {
         StreamError::Fatal(managed_error("Cannot flush official CAS partial", error).into())
     })?;
+    reporter.flush_bytes(written);
     Ok(())
 }
 
@@ -1176,7 +1330,10 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, Mutex,
+        },
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1188,6 +1345,17 @@ mod tests {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
         auto_content_length: bool,
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<super::DownloadProgressEvent>>,
+    }
+
+    impl DownloadObserver for RecordingObserver {
+        fn observe(&self, event: &super::DownloadProgressEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -1462,7 +1630,9 @@ mod tests {
         let (origin, requests, server) =
             spawn_server(expected.source.path().to_owned(), vec![ok(bytes)]);
         let (install, root) = owned_root("fresh");
-        let downloader = OfficialCasDownloader::new_for_test(&root, &origin);
+        let observer = Arc::new(RecordingObserver::default());
+        let downloader =
+            OfficialCasDownloader::new_for_test_with_observer(&root, &origin, observer.clone());
         let object = downloader
             .ensure_expected(&expected, 0, &OfficialDownloadCancellation::new())
             .await
@@ -1470,7 +1640,93 @@ mod tests {
         assert_eq!(object.resumed_bytes(), 0);
         assert_eq!(read_verified(&root, &object), bytes);
         assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events.first().unwrap().phase, DownloadProgressPhase::Resume);
+        assert_eq!(
+            events.last().unwrap().phase,
+            DownloadProgressPhase::Complete
+        );
+        assert!(events[1..events.len() - 1]
+            .iter()
+            .all(|event| event.phase == DownloadProgressPhase::Bytes));
+        assert_eq!(events[0].persisted_bytes, 0);
+        assert_eq!(
+            events.iter().map(|event| event.delta_bytes).sum::<u64>(),
+            bytes.len() as u64
+        );
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].persisted_bytes <= pair[1].persisted_bytes));
+        assert!(events.iter().all(|event| event.object.as_str().len() <= 30));
+        drop(events);
         server.join().unwrap();
+        drop(downloader);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_official_repair_reclaims_failure_crash_state_and_success_quarantine() {
+        let bytes = b"official-quarantine-object";
+        let corrupt = vec![b'x'; bytes.len()];
+        let expected = expectation(bytes, ArtifactAvailabilityStateV2::Corrupt);
+        let rejected = ScriptedResponse {
+            expected_range: Some(None),
+            status: "404 Not Found",
+            headers: Vec::new(),
+            body: Vec::new(),
+            auto_content_length: true,
+        };
+        let (origin, _, server) =
+            spawn_server(expected.source.path().to_owned(), vec![rejected, ok(bytes)]);
+        let (install, root) = owned_root("corrupt-quarantine-recovery");
+        write_final(&root, &expected, &corrupt);
+        let paths = CasPaths::new(&expected.object.sha256).unwrap();
+        let downloader = OfficialCasDownloader::new_for_test(&root, &origin);
+
+        assert!(matches!(
+            downloader
+                .ensure_expected(&expected, 0, &OfficialDownloadCancellation::new())
+                .await,
+            Err(OfficialCasError::Http(StatusCode::NOT_FOUND))
+        ));
+        assert_eq!(
+            fs::read(paths.quarantine_payload.join_to(root.managed_root())).unwrap(),
+            corrupt
+        );
+
+        // The next exact object-lock owner treats the deterministic payload as crash residue,
+        // removes it by identity, and can safely continue from canonical Missing.
+        let object = downloader
+            .ensure_expected(&expected, 0, &OfficialDownloadCancellation::new())
+            .await
+            .unwrap();
+        assert_eq!(read_verified(&root, &object), bytes);
+        assert!(!paths
+            .quarantine_bucket
+            .join_to(root.managed_root())
+            .exists());
+        server.join().unwrap();
+
+        // A direct corrupt->verified replacement retains the bucket through activation and then
+        // deletes it before reporting success.
+        drop(object);
+        fs::write(paths.final_path.join_to(root.managed_root()), &corrupt).unwrap();
+        let (origin, _, server) = spawn_server(expected.source.path().to_owned(), vec![ok(bytes)]);
+        let downloader = OfficialCasDownloader::new_for_test(&root, &origin);
+        let object = downloader
+            .ensure_expected(&expected, 0, &OfficialDownloadCancellation::new())
+            .await
+            .unwrap();
+        assert_eq!(read_verified(&root, &object), bytes);
+        assert!(!paths
+            .quarantine_bucket
+            .join_to(root.managed_root())
+            .exists());
+        server.join().unwrap();
+
+        drop(object);
         drop(downloader);
         drop(root);
         fs::remove_dir_all(install).unwrap();

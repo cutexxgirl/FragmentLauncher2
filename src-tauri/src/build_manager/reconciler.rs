@@ -1,9 +1,10 @@
 use super::{
+    journal::ReconcilePlanV2,
     managed_fs::{GuardedDirectoryChain, ImmutableManagedFile, RelativeManagedPath},
     release::{FilePolicy, ManifestFile, ReleaseManifest},
+    tuf::TrustedRelease,
     types::{BuildChannel, PresetId},
 };
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -86,6 +87,50 @@ pub(super) struct InstanceAudit {
     pub unsafe_entries: Vec<UnsafeEntry>,
 }
 
+/// Non-serializable proof that an instance audit was built from the exact immutable pending plan,
+/// not from a newer release manifest which may have become current after the target marker was
+/// committed.
+#[derive(Debug, Clone)]
+pub(super) struct ReconcilePlanAuditV2 {
+    install_id: uuid::Uuid,
+    channel: BuildChannel,
+    operation_id: uuid::Uuid,
+    plan_sha256: String,
+    audit: InstanceAudit,
+}
+
+impl ReconcilePlanAuditV2 {
+    pub(super) fn audit_for<'a>(
+        &'a self,
+        plan: &ReconcilePlanV2,
+    ) -> Result<&'a InstanceAudit, String> {
+        plan.validate(plan.install_id, plan.channel)?;
+        let canonical = plan.canonical_bytes()?;
+        if self.install_id != plan.install_id
+            || self.channel != plan.channel
+            || self.operation_id != plan.operation_id
+            || self.plan_sha256 != format!("{:x}", Sha256::digest(canonical))
+        {
+            return Err("Final instance audit belongs to another reconcile plan".into());
+        }
+        Ok(&self.audit)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(plan: &ReconcilePlanV2, audit: InstanceAudit) -> Self {
+        Self {
+            install_id: plan.install_id,
+            channel: plan.channel,
+            operation_id: plan.operation_id,
+            plan_sha256: format!(
+                "{:x}",
+                Sha256::digest(plan.canonical_bytes().expect("test plan must be canonical"))
+            ),
+            audit,
+        }
+    }
+}
+
 impl DesiredTree {
     pub(super) fn from_release(
         release: &ReleaseManifest,
@@ -97,6 +142,22 @@ impl DesiredTree {
             &release.integrity.strict_roots,
             &release.integrity.preserved_paths,
         )
+    }
+
+    fn from_reconcile_plan(plan: &ReconcilePlanV2) -> Result<Self, String> {
+        plan.validate(plan.install_id, plan.channel)?;
+        let files = plan
+            .desired_files
+            .iter()
+            .map(|file| ManifestFile {
+                path: file.path.clone(),
+                size: file.installed_size,
+                sha256: file.installed_sha256.clone(),
+                executable: file.executable,
+                policy: file.policy,
+            })
+            .collect::<Vec<_>>();
+        Self::from_parts(&files, &plan.strict_roots, &plan.preserved_paths)
     }
 
     fn from_parts(
@@ -265,6 +326,105 @@ pub(super) fn audit_release_instance(
     preset: PresetId,
 ) -> Result<InstanceAudit, String> {
     let desired = DesiredTree::from_release(release, preset)?;
+    audit_desired_instance(install_root, channel, &desired)
+}
+
+/// Audits the exact desired tree serialized in one immutable pending plan only while a freshly
+/// trusted TUF release still binds that exact target. A stale plan cannot obtain this capability;
+/// it must be atomically superseded by a fresh-current plan instead.
+pub(super) fn audit_current_reconcile_plan_instance(
+    install_root: &Path,
+    plan: &ReconcilePlanV2,
+    current_release: &TrustedRelease,
+) -> Result<ReconcilePlanAuditV2, String> {
+    plan.validate(plan.install_id, plan.channel)?;
+    validate_current_plan_binding(plan, current_release)?;
+    let desired = DesiredTree::from_reconcile_plan(plan)?;
+    let audit = audit_desired_instance(install_root, plan.channel, &desired)?;
+    let canonical = plan.canonical_bytes()?;
+    Ok(ReconcilePlanAuditV2 {
+        install_id: plan.install_id,
+        channel: plan.channel,
+        operation_id: plan.operation_id,
+        plan_sha256: format!("{:x}", Sha256::digest(canonical)),
+        audit,
+    })
+}
+
+fn validate_current_plan_binding(
+    plan: &ReconcilePlanV2,
+    current: &TrustedRelease,
+) -> Result<(), String> {
+    let manifest = current.manifest();
+    if current.channel() != plan.channel
+        || current.current().channel != plan.channel
+        || current.current().release_id != manifest.release.id
+        || plan.target.release_id != manifest.release.id
+        || !plan
+            .target
+            .trusted_release
+            .targets_match(current.evidence())
+        || !plan
+            .target
+            .trusted_release
+            .roles_are_monotonic_to(current.evidence())
+        || plan.target.release_manifest_sha256 != current.evidence().release_manifest.sha256
+        || plan.target.runtime_lock_sha256 != manifest.runtime.java.runtime_lock_sha256
+        || plan.target.game_runtime_lock_sha256 != manifest.runtime.game.runtime_lock_sha256
+    {
+        return Err("Historical TUF release does not bind the pending target".into());
+    }
+    current.evidence().validate_binding(
+        plan.channel,
+        &manifest.release.id,
+        &current.current().manifest_target,
+        &manifest.runtime.java.runtime_target,
+        &manifest.runtime.game.runtime_target,
+        &current.evidence().release_manifest.sha256,
+        &manifest.runtime.java.runtime_lock_sha256,
+        &manifest.runtime.game.runtime_lock_sha256,
+    )?;
+    manifest.bind_runtime_lock(current.runtime_lock())?;
+    manifest.bind_game_runtime_lock(current.runtime_lock(), current.game_runtime_lock())?;
+
+    let preset = manifest.selected_preset(plan.target.preset)?;
+    let mut signed_strict_roots = manifest.integrity.strict_roots.clone();
+    signed_strict_roots.sort_by(path_order);
+    let mut signed_preserved_paths = manifest.integrity.preserved_paths.clone();
+    signed_preserved_paths.sort_by(path_order);
+    if plan.strict_roots != signed_strict_roots
+        || plan.preserved_paths != signed_preserved_paths
+        || plan.desired_files.len() != preset.files.len()
+    {
+        return Err("Pending reconcile scope differs from the current signed manifest".into());
+    }
+    let signed = preset
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    for planned in &plan.desired_files {
+        let Some(file) = signed.get(planned.path.as_str()) else {
+            return Err("Pending desired file is absent from the current signed preset".into());
+        };
+        if planned.signed_size != file.size
+            || planned.signed_sha256 != file.sha256
+            || planned.executable != file.executable
+            || planned.policy != file.policy
+            || (planned.policy == FilePolicy::Exact
+                && (planned.installed_size != file.size || planned.installed_sha256 != file.sha256))
+        {
+            return Err("Pending desired file differs from the current signed preset".into());
+        }
+    }
+    Ok(())
+}
+
+fn audit_desired_instance(
+    install_root: &Path,
+    channel: BuildChannel,
+    desired: &DesiredTree,
+) -> Result<InstanceAudit, String> {
     let instance_relative = RelativeManagedPath::new(&format!("instances/{}", channel.as_str()))
         .map_err(|error| error.to_string())?;
     let instance_root = instance_relative.join_to(install_root);
@@ -280,24 +440,24 @@ pub(super) fn audit_release_instance(
         }
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Ok(audit_unavailable_root(
-                &desired,
+                desired,
                 Some(UnsafeEntryKind::Symlink),
             ));
         }
         Ok(metadata) if is_reparse_point(&metadata) => {
             return Ok(audit_unavailable_root(
-                &desired,
+                desired,
                 Some(UnsafeEntryKind::ReparsePoint),
             ));
         }
         Ok(_) => {
             return Ok(audit_unavailable_root(
-                &desired,
+                desired,
                 Some(UnsafeEntryKind::ExpectedDirectoryIsFile),
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(audit_unavailable_root(&desired, None));
+            return Ok(audit_unavailable_root(desired, None));
         }
         Err(error) => {
             return Err(format!(
@@ -306,7 +466,7 @@ pub(super) fn audit_release_instance(
             ));
         }
     };
-    let audit = audit_instance_directory(&instance_root, &desired)?;
+    let audit = audit_instance_directory(&instance_root, desired)?;
     recheck_guarded_directory(install_root, Some(&instance_relative), &anchor)?;
     Ok(audit)
 }

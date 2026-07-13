@@ -41,6 +41,21 @@ pub enum AuthError {
     SessionChanged,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NativeAccessFailure {
+    Authentication,
+    Failed(String),
+}
+
+impl AuthError {
+    pub(crate) fn into_native_access_failure(self) -> NativeAccessFailure {
+        match self {
+            Self::SignedOut => NativeAccessFailure::Authentication,
+            other => NativeAccessFailure::Failed(other.to_string()),
+        }
+    }
+}
+
 pub struct AuthSessionManager {
     api: Arc<dyn AuthApi>,
     credentials: Arc<dyn CredentialStore>,
@@ -49,6 +64,30 @@ pub struct AuthSessionManager {
     state: Mutex<SessionState>,
     refresh_gate: Mutex<()>,
     poll_gate: Mutex<()>,
+}
+
+/// Non-serializable native bearer capability for launcher-owned service calls.
+/// JavaScript and Tauri command responses can never obtain the underlying token.
+#[derive(Clone)]
+pub(crate) struct NativeAccessToken(Arc<Secret>);
+
+impl NativeAccessToken {
+    pub(crate) fn expose(&self) -> &str {
+        self.0.expose()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(Arc::new(
+            Secret::new(value.to_owned()).expect("test access token must be a valid secret"),
+        ))
+    }
+}
+
+impl std::fmt::Debug for NativeAccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NativeAccessToken([REDACTED])")
+    }
 }
 
 struct SessionState {
@@ -213,9 +252,29 @@ impl AuthSessionManager {
             .unwrap_or_else(AuthSnapshot::signed_out)
     }
 
+    /// Runs access refresh in an owned task. Dropping the caller's wait detaches the task instead
+    /// of cancelling a server-side one-time refresh-token rotation before local persistence.
+    pub(crate) async fn native_access_token_completion_safe(
+        self: &Arc<Self>,
+    ) -> Result<NativeAccessToken, AuthError> {
+        self.access_for_request().await.map(NativeAccessToken)
+    }
+
+    /// Forces the single-flight refresh path after Spark explicitly rejected this exact access
+    /// capability. The rejected token is owned by the detached task so its identity remains valid
+    /// even if the coordinator stops waiting.
+    pub(crate) async fn native_access_token_after_rejection_completion_safe(
+        self: &Arc<Self>,
+        rejected: NativeAccessToken,
+    ) -> Result<NativeAccessToken, AuthError> {
+        self.refresh_access(Some(&rejected.0), true)
+            .await
+            .map(NativeAccessToken)
+    }
+
     /// Restores a session by rotating the persisted refresh token. An invalid
     /// or revoked token produces a signed-out snapshot and is removed locally.
-    pub async fn restore(&self) -> Result<AuthSnapshot, AuthError> {
+    pub async fn restore(self: &Arc<Self>) -> Result<AuthSnapshot, AuthError> {
         match self.refresh_access(None, false).await {
             Ok(_) => Ok(self.snapshot().await),
             Err(AuthError::SignedOut) => Ok(AuthSnapshot::signed_out()),
@@ -252,7 +311,14 @@ impl AuthSessionManager {
 
     /// Polls the native-held challenge. Neither the challenge ID nor poll token
     /// is accepted from (or returned to) the webview.
-    pub async fn poll_login(&self) -> Result<TelegramPollSnapshot, AuthError> {
+    pub async fn poll_login(self: &Arc<Self>) -> Result<TelegramPollSnapshot, AuthError> {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move { manager.poll_login_core().await })
+            .await
+            .map_err(|_| AuthError::Api("Telegram login worker failed".into()))?
+    }
+
+    async fn poll_login_core(&self) -> Result<TelegramPollSnapshot, AuthError> {
         let _single_poll = self.poll_gate.lock().await;
         let (id, poll_token) = {
             let state = self.state.lock().await;
@@ -329,7 +395,7 @@ impl AuthSessionManager {
 
     /// Refreshes `/auth/me`, retrying exactly once after a 401 with a
     /// single-flight refresh-token rotation.
-    pub async fn refresh_profile(&self) -> Result<AuthSnapshot, AuthError> {
+    pub async fn refresh_profile(self: &Arc<Self>) -> Result<AuthSnapshot, AuthError> {
         let first = self.access_for_request().await?;
         let (profile, used_token) = match self.api.get_profile(&first).await {
             Ok(profile) => (profile, first),
@@ -345,7 +411,10 @@ impl AuthSessionManager {
 
     /// Updates the launcher nickname through a native authenticated PATCH,
     /// retrying exactly once after a 401.
-    pub async fn update_nickname(&self, nickname: Option<&str>) -> Result<AuthSnapshot, AuthError> {
+    pub async fn update_nickname(
+        self: &Arc<Self>,
+        nickname: Option<&str>,
+    ) -> Result<AuthSnapshot, AuthError> {
         let nickname = normalize_nickname(nickname)?;
         let first = self.access_for_request().await?;
         let (profile, used_token) =
@@ -370,7 +439,7 @@ impl AuthSessionManager {
     /// launch. The access token never leaves native memory. A real spawn command
     /// must call this again immediately before creating the Java process.
     pub async fn admission(
-        &self,
+        self: &Arc<Self>,
         channel: AdmissionChannel,
     ) -> Result<LauncherAdmissionSnapshot, AuthError> {
         let first = self.access_for_request().await?;
@@ -438,7 +507,7 @@ impl AuthSessionManager {
         Ok(AuthSnapshot::signed_out())
     }
 
-    async fn access_for_request(&self) -> Result<Arc<Secret>, AuthError> {
+    async fn access_for_request(self: &Arc<Self>) -> Result<Arc<Secret>, AuthError> {
         {
             let state = self.state.lock().await;
             if let Some(access) = state.access.as_ref() {
@@ -451,6 +520,18 @@ impl AuthSessionManager {
     }
 
     async fn refresh_access(
+        self: &Arc<Self>,
+        rejected: Option<&Arc<Secret>>,
+        force: bool,
+    ) -> Result<Arc<Secret>, AuthError> {
+        let manager = Arc::clone(self);
+        let rejected = rejected.cloned();
+        tokio::spawn(async move { manager.refresh_access_core(rejected.as_ref(), force).await })
+            .await
+            .map_err(|_| AuthError::Api("auth refresh worker failed".into()))?
+    }
+
+    async fn refresh_access_core(
         &self,
         rejected: Option<&Arc<Secret>>,
         force: bool,
@@ -462,7 +543,8 @@ impl AuthSessionManager {
             if let Some(access) = state.access.as_ref() {
                 let was_replaced =
                     rejected.is_some_and(|rejected| !Arc::ptr_eq(rejected, &access.token));
-                if was_replaced || (!force && access.refresh_at > Instant::now()) {
+                let is_fresh = access.refresh_at > Instant::now();
+                if is_fresh && (was_replaced || !force) {
                     return Ok(Arc::clone(&access.token));
                 }
             }
@@ -590,7 +672,10 @@ fn admission_failure(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
 
@@ -615,6 +700,88 @@ mod tests {
         reject_next_admission: AtomicBool,
         fail_logout: AtomicBool,
         admission_error: std::sync::Mutex<Option<&'static str>>,
+        scripted_expires_in: std::sync::Mutex<VecDeque<u64>>,
+    }
+
+    struct GatedCredentialStore {
+        inner: MemoryCredentialStore,
+        gate_next_replace: AtomicBool,
+        replace_started: tokio::sync::Notify,
+        allow_replace: tokio::sync::Notify,
+    }
+
+    impl GatedCredentialStore {
+        fn with(value: Secret) -> Self {
+            Self::with_gate(value, true)
+        }
+
+        fn unarmed(value: Secret) -> Self {
+            Self::with_gate(value, false)
+        }
+
+        fn with_gate(value: Secret, armed: bool) -> Self {
+            Self {
+                inner: MemoryCredentialStore::with(value),
+                gate_next_replace: AtomicBool::new(armed),
+                replace_started: tokio::sync::Notify::new(),
+                allow_replace: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn arm_next_replace(&self) {
+            assert!(!self.gate_next_replace.swap(true, Ordering::AcqRel));
+        }
+
+        async fn wait_until_replace_started(&self) {
+            if !self.gate_next_replace.load(Ordering::Acquire) {
+                return;
+            }
+            loop {
+                let notified = self.replace_started.notified();
+                if !self.gate_next_replace.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_replace(&self) {
+            self.allow_replace.notify_one();
+        }
+
+        async fn peek(&self) -> Option<String> {
+            self.inner.peek().await
+        }
+
+        fn writes(&self) -> usize {
+            self.inner.writes()
+        }
+    }
+
+    #[async_trait]
+    impl CredentialStore for GatedCredentialStore {
+        async fn load(&self) -> Result<Option<Secret>, CredentialStoreError> {
+            self.inner.load().await
+        }
+
+        async fn replace_if_current(
+            &self,
+            expected: Option<&Secret>,
+            next: &Secret,
+        ) -> Result<CredentialMutation, CredentialStoreError> {
+            if self.gate_next_replace.swap(false, Ordering::AcqRel) {
+                self.replace_started.notify_one();
+                self.allow_replace.notified().await;
+            }
+            self.inner.replace_if_current(expected, next).await
+        }
+
+        async fn clear_if_current(
+            &self,
+            expected: &Secret,
+        ) -> Result<CredentialMutation, CredentialStoreError> {
+            self.inner.clear_if_current(expected).await
+        }
     }
 
     impl FakeApi {
@@ -632,7 +799,12 @@ mod tests {
                 reject_next_admission: AtomicBool::new(false),
                 fail_logout: AtomicBool::new(false),
                 admission_error: std::sync::Mutex::new(None),
+                scripted_expires_in: std::sync::Mutex::new(VecDeque::new()),
             }
+        }
+
+        fn script_expires_in(&self, values: impl IntoIterator<Item = u64>) {
+            self.scripted_expires_in.lock().unwrap().extend(values);
         }
 
         fn session(&self) -> SessionResponse {
@@ -643,7 +815,12 @@ mod tests {
                     .unwrap(),
                 refresh_token: Secret::new(format!("refresh-{generation}-{}", "r".repeat(32)))
                     .unwrap(),
-                expires_in: 900,
+                expires_in: self
+                    .scripted_expires_in
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(900),
                 profile: profile(),
             }
         }
@@ -778,6 +955,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_access_failure_matrix_blocks_only_a_definite_signed_out_state() {
+        assert_eq!(
+            AuthError::SignedOut.into_native_access_failure(),
+            NativeAccessFailure::Authentication
+        );
+        for error in [
+            AuthError::Api("transport".into()),
+            AuthError::Credentials("store".into()),
+            AuthError::Contract("contract".into()),
+            AuthError::ProcessLock("lock".into()),
+            AuthError::CredentialChanged,
+            AuthError::SessionChanged,
+            AuthError::NoActiveChallenge,
+            AuthError::OpenTelegramLogin,
+        ] {
+            assert!(matches!(
+                error.into_native_access_failure(),
+                NativeAccessFailure::Failed(_)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_restore_is_single_flight() {
         let api = Arc::new(FakeApi::new());
@@ -799,13 +999,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_native_waiter_never_abandons_rotated_credential_persistence() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(GatedCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store.clone()));
+        let waiter = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.native_access_token_completion_safe().await }
+        });
+
+        store.wait_until_replace_started().await;
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 1);
+        assert!(store
+            .peek()
+            .await
+            .unwrap()
+            .starts_with("old-refresh-token-"));
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        store.release_replace();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store
+                    .peek()
+                    .await
+                    .is_some_and(|refresh| refresh.starts_with("refresh-1-"))
+                    && manager.snapshot().await.authenticated
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached refresh must finish credential persistence");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rejection_of_old_token_rotates_again_when_the_winner_is_stale() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(MemoryCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
+        manager.restore().await.unwrap();
+        let rejected = manager.native_access_token_completion_safe().await.unwrap();
+        api.script_expires_in([1, 900]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let rotate = |rejected: NativeAccessToken| {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager
+                    .native_access_token_after_rejection_completion_safe(rejected)
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = rotate(rejected.clone());
+        let second = rotate(rejected);
+        barrier.wait().await;
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 3);
+        let rotated = [first.expose(), second.expose()];
+        assert!(rotated.iter().any(|token| token.starts_with("access-2-")));
+        assert!(rotated.iter().any(|token| token.starts_with("access-3-")));
+        let current = manager.native_access_token_completion_safe().await.unwrap();
+        assert!(current.expose().starts_with("access-3-"));
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn aborted_rejected_token_waiter_does_not_duplicate_or_abandon_rotation() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(GatedCredentialStore::unarmed(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store.clone()));
+        manager.restore().await.unwrap();
+        let rejected = manager.native_access_token_completion_safe().await.unwrap();
+        store.arm_next_replace();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let rotate = |rejected: NativeAccessToken| {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager
+                    .native_access_token_after_rejection_completion_safe(rejected)
+                    .await
+            })
+        };
+        let abandoned = rotate(rejected.clone());
+        let survivor = rotate(rejected);
+        barrier.wait().await;
+        store.wait_until_replace_started().await;
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(store.writes(), 1);
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+        store.release_replace();
+
+        let winner = survivor.await.unwrap().unwrap();
+        assert!(winner.expose().starts_with("access-2-"));
+        assert_eq!(api.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(store.writes(), 2);
+        assert!(store.peek().await.unwrap().starts_with("refresh-2-"));
+    }
+
+    #[tokio::test]
     async fn failed_refresh_persistence_never_publishes_access_session() {
         let api = Arc::new(FakeApi::new());
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
         store.set_fail_writes(true);
-        let manager = AuthSessionManager::new(api, store);
+        let manager = Arc::new(AuthSessionManager::new(api, store));
 
         assert!(matches!(
             manager.restore().await,
@@ -820,7 +1137,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api.clone(), store);
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
         manager.restore().await.unwrap();
         api.reject_next_get.store(true, Ordering::SeqCst);
 
@@ -835,7 +1152,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api, store);
+        let manager = Arc::new(AuthSessionManager::new(api, store));
 
         let auth = manager.restore().await.unwrap();
         let auth_json = serde_json::to_string(&auth).unwrap();
@@ -857,7 +1174,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api, store.clone());
+        let manager = Arc::new(AuthSessionManager::new(api, store.clone()));
 
         assert!(!manager.restore().await.unwrap().authenticated);
         assert!(store.is_empty().await);
@@ -869,7 +1186,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api.clone(), store.clone());
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store.clone()));
         manager.restore().await.unwrap();
         api.fail_logout.store(true, Ordering::SeqCst);
 
@@ -885,8 +1202,11 @@ mod tests {
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
         let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_millis(5)));
-        let manager =
-            AuthSessionManager::new_with_process_lock(api, store.clone(), process_lock.clone());
+        let manager = Arc::new(AuthSessionManager::new_with_process_lock(
+            api,
+            store.clone(),
+            process_lock.clone(),
+        ));
         manager.restore().await.unwrap();
         let held = process_lock.hold().await;
 
@@ -907,8 +1227,11 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::empty());
         let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_secs(1)));
         process_lock.fail_next(ProcessLockError::Timeout);
-        let manager =
-            AuthSessionManager::new_with_process_lock(api.clone(), store.clone(), process_lock);
+        let manager = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock,
+        ));
         manager.begin_login(None).await.unwrap();
         api.confirm_next_poll.store(true, Ordering::SeqCst);
 
@@ -930,7 +1253,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api.clone(), store.clone());
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store.clone()));
         manager.begin_login(None).await.unwrap();
         api.confirm_next_poll.store(true, Ordering::SeqCst);
 
@@ -943,19 +1266,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_confirmed_login_waiter_never_abandons_credential_persistence() {
+        let api = Arc::new(FakeApi::new());
+        let store = Arc::new(GatedCredentialStore::with(
+            Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
+        ));
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store.clone()));
+        manager.begin_login(None).await.unwrap();
+        api.confirm_next_poll.store(true, Ordering::SeqCst);
+        let waiter = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.poll_login().await }
+        });
+
+        store.wait_until_replace_started().await;
+        assert!(store
+            .peek()
+            .await
+            .unwrap()
+            .starts_with("old-refresh-token-"));
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        store.release_replace();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store
+                    .peek()
+                    .await
+                    .is_some_and(|refresh| refresh.starts_with("refresh-0-"))
+                    && manager.snapshot().await.authenticated
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached confirmed-login task must persist its credential");
+    }
+
+    #[tokio::test]
     async fn separate_managers_reload_rotated_credential_under_shared_process_lock() {
         let api = Arc::new(FakeApi::new());
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
         let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_secs(1)));
-        let first = AuthSessionManager::new_with_process_lock(
+        let first = Arc::new(AuthSessionManager::new_with_process_lock(
             api.clone(),
             store.clone(),
             process_lock.clone(),
-        );
-        let second =
-            AuthSessionManager::new_with_process_lock(api.clone(), store.clone(), process_lock);
+        ));
+        let second = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock,
+        ));
 
         let (first_result, second_result) = tokio::join!(first.restore(), second.restore());
         assert!(first_result.unwrap().authenticated);
@@ -974,8 +1341,11 @@ mod tests {
         ));
         let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_millis(5)));
         let held = process_lock.hold().await;
-        let manager =
-            AuthSessionManager::new_with_process_lock(api.clone(), store.clone(), process_lock);
+        let manager = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock,
+        ));
 
         assert!(matches!(
             manager.restore().await,
@@ -999,8 +1369,11 @@ mod tests {
         ));
         let process_lock = Arc::new(MemoryRefreshProcessLock::new(Duration::from_secs(1)));
         process_lock.fail_next(ProcessLockError::Abandoned);
-        let manager =
-            AuthSessionManager::new_with_process_lock(api.clone(), store.clone(), process_lock);
+        let manager = Arc::new(AuthSessionManager::new_with_process_lock(
+            api.clone(),
+            store.clone(),
+            process_lock,
+        ));
 
         assert!(matches!(
             manager.restore().await,
@@ -1016,7 +1389,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api.clone(), store);
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
         manager.restore().await.unwrap();
         api.reject_next_admission.store(true, Ordering::SeqCst);
 
@@ -1037,7 +1410,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::with(
             Secret::new("old-refresh-token-".to_owned() + &"r".repeat(32)).unwrap(),
         ));
-        let manager = AuthSessionManager::new(api.clone(), store);
+        let manager = Arc::new(AuthSessionManager::new(api.clone(), store));
         manager.restore().await.unwrap();
         *api.admission_error.lock().unwrap() = Some("subscription_required");
 

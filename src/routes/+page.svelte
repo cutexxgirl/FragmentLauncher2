@@ -10,6 +10,7 @@
 		discardLegacyWebviewAuthSession,
 		logoutNativeAuth,
 		pollNativeTelegramLogin,
+		refreshNativeProfile,
 		requestNativeAdmission,
 		restoreNativeAuth,
 		updateNativeNickname,
@@ -18,13 +19,19 @@
 		type LauncherProfile,
 	} from '$lib/native-auth';
 	import {
+		acceptsObservedOperationStatus,
+		buildOperationStatusFingerprint,
+		cancelBuildOperation,
 		getLauncherStatus,
 		getBuildStatus,
 		getTgWsProxyStatus,
+		isPendingBuildInspection,
 		installTgWsProxy,
 		setBuildInstallDirectory,
+		startBuildOperation,
 		type BuildChannel,
 		type BuildStatus,
+		type ObservedBuildOperationStatus,
 		type TgWsProxyStatus,
 	} from '$lib/launcher';
 	import {
@@ -86,10 +93,30 @@
 	let tgWsProxyMessage = $state('');
 	let loginPollTimer: number | null = null;
 	let telegramHelpTimer: number | null = null;
+	let authProfileRefreshTimer: number | null = null;
+	let authProfileRefreshPending = false;
+	let buildStatusPollTimer: number | null = null;
+	let buildOperationCancelPending = $state(false);
+	let buildOperationStartPending = $state(false);
+	let buildInstallDirectorySelectionPending = $state(false);
+	const BUILD_INSPECTION_POLL_INTERVAL_MS = 500;
+	const BUILD_INSPECTION_POLL_LIMIT = 240;
+	const AUTH_PROFILE_REFRESH_INTERVAL_MS = 60_000;
 
 	let builds = $state<BuildProfile[]>(createBuildProfiles());
 	let buildStatusRequestGeneration = 0;
+	let activeBuildOperation = $state<{
+		operationId: string;
+		requestGeneration: number;
+		channel: BuildChannel;
+		preset: PresetId;
+		revision: number;
+	} | null>(null);
+	const observedBuildOperationRevisions = new Map<string, ObservedBuildOperationStatus>();
+	const terminalBuildOperations = new Map<string, number>();
 	let buildStatus = $state<BuildStatus>({
+		operationId: null,
+		revision: 0,
 		channel: 'stable',
 		preset: 'medium',
 		phase: 'checking',
@@ -148,7 +175,11 @@
 
 	$effect(() => {
 		if (!visibleBuilds.some((build) => build.id === selectedBuildId)) {
+			if (activeBuildOperation || buildOperationStartPending) return;
+			invalidateBuildStatusRequests();
+			stopBuildStatusPolling(true);
 			selectedBuildId = 'fragment-stable';
+			window.setTimeout(() => void refreshBuildStatus(), 0);
 		}
 	});
 
@@ -174,10 +205,23 @@
 		void restoreAuthSession();
 		void refreshBuildStatus();
 		void runBootSequence();
+		window.addEventListener('focus', refreshProfileOnFocus);
+		document.addEventListener('visibilitychange', refreshProfileWhenVisible);
+		authProfileRefreshTimer = window.setInterval(() => {
+			void refreshSignedInProfile();
+		}, AUTH_PROFILE_REFRESH_INTERVAL_MS);
 
 		return () => {
 			stopLoginPolling();
 			stopTelegramHelpTimer();
+			invalidateBuildStatusRequests();
+			stopBuildStatusPolling(true);
+			window.removeEventListener('focus', refreshProfileOnFocus);
+			document.removeEventListener('visibilitychange', refreshProfileWhenVisible);
+			if (authProfileRefreshTimer !== null) {
+				window.clearInterval(authProfileRefreshTimer);
+				authProfileRefreshTimer = null;
+			}
 		};
 	});
 
@@ -253,6 +297,40 @@
 			console.warn('Native auth restore failed', error);
 			authSnapshot = null;
 			authState = 'error';
+		}
+	}
+
+	function refreshProfileOnFocus() {
+		void refreshSignedInProfile();
+	}
+
+	function refreshProfileWhenVisible() {
+		if (document.visibilityState === 'visible') {
+			void refreshSignedInProfile();
+		}
+	}
+
+	async function refreshSignedInProfile() {
+		if (authState !== 'signed-in' || authProfileRefreshPending) return;
+		authProfileRefreshPending = true;
+		const preserveNicknameDraft = nicknameDirty;
+		try {
+			const refreshed = await refreshNativeProfile();
+			if (!refreshed.authenticated || !refreshed.profile) {
+				authSnapshot = null;
+				authState = 'signed-out';
+				invalidateBuildStatusRequests();
+				stopBuildStatusPolling(true);
+				return;
+			}
+			authSnapshot = refreshed;
+			if (!preserveNicknameDraft) {
+				syncNicknameFromProfile(refreshed.profile);
+			}
+		} catch (error) {
+			console.warn('Native profile refresh failed', error);
+		} finally {
+			authProfileRefreshPending = false;
 		}
 	}
 
@@ -341,6 +419,8 @@
 			profileVisible = false;
 			statsVisible = false;
 			activeSection = 'home';
+			invalidateBuildStatusRequests();
+			stopBuildStatusPolling(true);
 		} catch (error) {
 			console.warn('Native logout was not completed', error);
 			nicknameSaveMessage = 'Не удалось безопасно выйти. Повторите попытку.';
@@ -456,6 +536,10 @@
 	function selectBuild(buildId: string) {
 		const build = visibleBuilds.find((candidate) => candidate.id === buildId);
 		if (!build) return;
+		if (activeBuildOperation || buildOperationStartPending) return;
+		if (build.id === selectedBuildId) return;
+		invalidateBuildStatusRequests();
+		stopBuildStatusPolling(true);
 		selectedBuildId = buildId;
 		window.setTimeout(() => void refreshBuildStatus(), 0);
 	}
@@ -480,6 +564,10 @@
 	}
 
 	function setPreset(presetId: PresetId) {
+		if (activeBuildOperation || buildOperationStartPending) return;
+		if (activeBuild.preset === presetId) return;
+		invalidateBuildStatusRequests();
+		stopBuildStatusPolling(true);
 		activeBuild.preset = presetId;
 
 		void refreshBuildStatus();
@@ -487,13 +575,24 @@
 
 	async function refreshBuildStatus() {
 		if (!(typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window)) return;
+		if (buildOperationStartPending) return;
+		if (
+			activeBuildOperation?.channel === activeChannel &&
+			activeBuildOperation.preset === activeBuild.preset
+		) {
+			return;
+		}
 		const requestGeneration = ++buildStatusRequestGeneration;
 		const channel = activeChannel;
 		const preset = activeBuild.preset;
 		try {
 			const localStatus = await getBuildStatus(channel, preset);
-			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
-			buildStatus = localStatus;
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return;
+			if (localStatus.operationActive && localStatus.operationId) {
+				scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+			} else if (isPendingBuildInspection(localStatus)) {
+				scheduleBuildInspectionPoll(requestGeneration, channel, preset, 0);
+			}
 		} catch (error) {
 			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
 			buildStatus = errorBuildStatus(
@@ -504,31 +603,304 @@
 		}
 	}
 
-	async function chooseInstallDirectory() {
+	async function chooseInstallDirectory(forBuildStart = false) {
+		if (
+			activeBuildOperation ||
+			(buildOperationStartPending && !forBuildStart) ||
+			buildInstallDirectorySelectionPending
+		) {
+			return false;
+		}
+		buildInstallDirectorySelectionPending = true;
+		const channel = activeChannel;
+		const preset = activeBuild.preset;
 		try {
 			const selected = await open({ directory: true, multiple: false, title: 'Папка Fragment' });
-			if (typeof selected !== 'string') return;
+			if (typeof selected !== 'string') return false;
+			if (forBuildStart && !buildOperationStartPending) return false;
+			if (channel !== activeChannel || preset !== activeBuild.preset) return false;
 			const requestGeneration = ++buildStatusRequestGeneration;
-			const channel = activeChannel;
-			const preset = activeBuild.preset;
 			const localStatus = await setBuildInstallDirectory(selected, channel, preset);
-			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
-			buildStatus = localStatus;
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return false;
+			return true;
 		} catch (error) {
+			if (channel !== activeChannel || preset !== activeBuild.preset) return false;
 			buildStatus = errorBuildStatus(
-				activeChannel,
-				activeBuild.preset,
+				channel,
+				preset,
 				error instanceof Error ? error.message : 'Не удалось выбрать папку Fragment.',
+			);
+			return false;
+		} finally {
+			buildInstallDirectorySelectionPending = false;
+		}
+	}
+
+	function applyBuildStatus(
+		localStatus: BuildStatus,
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+		expectedOperationId?: string,
+	) {
+		if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return false;
+		if (localStatus.channel !== channel || localStatus.preset !== preset) return false;
+		if (!Number.isSafeInteger(localStatus.revision) || localStatus.revision < 0) return false;
+		if (localStatus.operationActive && !localStatus.operationId) return false;
+
+		const active = activeBuildOperation;
+		if (expectedOperationId && localStatus.operationId !== expectedOperationId) {
+			return false;
+		}
+		const correlatedOperationId = localStatus.operationId ?? undefined;
+		if (correlatedOperationId) {
+			const terminalRevision = terminalBuildOperations.get(correlatedOperationId);
+			if (terminalRevision !== undefined && localStatus.operationActive) return false;
+			const observed = observedBuildOperationRevisions.get(correlatedOperationId);
+			if (!acceptsObservedOperationStatus(localStatus, observed)) return false;
+		}
+
+		if (active) {
+			if (correlatedOperationId !== active.operationId) return false;
+			if (localStatus.revision < active.revision) return false;
+		}
+
+		buildStatus = localStatus;
+		if (correlatedOperationId) {
+			rememberObservedOperationStatus(correlatedOperationId, localStatus);
+			if (!localStatus.operationActive) {
+				rememberOperationRevision(
+					terminalBuildOperations,
+					correlatedOperationId,
+					localStatus.revision,
+				);
+			}
+		}
+		if (localStatus.operationActive && localStatus.operationId) {
+			activeBuildOperation = {
+				operationId: localStatus.operationId,
+				requestGeneration,
+				channel,
+				preset,
+				revision: localStatus.revision,
+			};
+		} else if (active && correlatedOperationId === active.operationId) {
+			stopBuildStatusPolling(true);
+		}
+		return true;
+	}
+
+	function rememberObservedOperationStatus(operationId: string, status: BuildStatus) {
+		observedBuildOperationRevisions.set(operationId, {
+			revision: status.revision,
+			fingerprint: buildOperationStatusFingerprint(status),
+		});
+		trimOperationMap(observedBuildOperationRevisions);
+	}
+
+	function rememberOperationRevision(target: Map<string, number>, operationId: string, revision: number) {
+		target.set(operationId, revision);
+		trimOperationMap(target);
+	}
+
+	function trimOperationMap<T>(target: Map<string, T>) {
+		if (target.size <= 32) return;
+		const oldestOperationId = target.keys().next().value;
+		if (typeof oldestOperationId === 'string') target.delete(oldestOperationId);
+	}
+
+	function invalidateBuildStatusRequests() {
+		buildStatusRequestGeneration += 1;
+	}
+
+	function clearBuildStatusPollTimer() {
+		if (buildStatusPollTimer !== null) {
+			window.clearTimeout(buildStatusPollTimer);
+			buildStatusPollTimer = null;
+		}
+	}
+
+	function stopBuildStatusPolling(clearOperation: boolean) {
+		clearBuildStatusPollTimer();
+		if (clearOperation) {
+			activeBuildOperation = null;
+			buildOperationCancelPending = false;
+			buildOperationStartPending = false;
+		}
+	}
+
+	function scheduleBuildInspectionPoll(
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+		attempt: number,
+	) {
+		clearBuildStatusPollTimer();
+		buildStatusPollTimer = window.setTimeout(() => {
+			buildStatusPollTimer = null;
+			void pollBuildInspection(requestGeneration, channel, preset, attempt);
+		}, BUILD_INSPECTION_POLL_INTERVAL_MS);
+	}
+
+	async function pollBuildInspection(
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+		attempt: number,
+	) {
+		if (!isCurrentBuildRequest(requestGeneration, channel, preset) || activeBuildOperation) return;
+		if (attempt >= BUILD_INSPECTION_POLL_LIMIT) {
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				'Проверка сборки не завершилась вовремя. Нажмите «Повторить проверку».',
+			);
+			return;
+		}
+
+		try {
+			const localStatus = await getBuildStatus(channel, preset);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) return;
+			if (localStatus.operationActive && localStatus.operationId) {
+				scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+			} else if (isPendingBuildInspection(localStatus)) {
+				scheduleBuildInspectionPoll(requestGeneration, channel, preset, attempt + 1);
+			}
+		} catch (error) {
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			console.warn('Build inspection poll failed', error);
+			scheduleBuildInspectionPoll(requestGeneration, channel, preset, attempt + 1);
+		}
+	}
+
+	function scheduleBuildStatusPoll(
+		operationId: string,
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+	) {
+		clearBuildStatusPollTimer();
+		buildStatusPollTimer = window.setTimeout(() => {
+			buildStatusPollTimer = null;
+			void pollBuildStatus(operationId, requestGeneration, channel, preset);
+		}, 500);
+	}
+
+	async function pollBuildStatus(
+		operationId: string,
+		requestGeneration: number,
+		channel: BuildChannel,
+		preset: PresetId,
+	) {
+		const active = activeBuildOperation;
+		if (
+			!active ||
+			active.operationId !== operationId ||
+			active.requestGeneration !== requestGeneration ||
+			!isCurrentBuildRequest(requestGeneration, channel, preset)
+		) {
+			return;
+		}
+
+		try {
+			const localStatus = await getBuildStatus(channel, preset, operationId);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset, operationId)) return;
+		} catch (error) {
+			console.warn('Build status poll failed', error);
+		}
+
+		if (
+			activeBuildOperation?.operationId === operationId &&
+			activeBuildOperation.requestGeneration === requestGeneration
+		) {
+			scheduleBuildStatusPoll(operationId, requestGeneration, channel, preset);
+		}
+	}
+
+	async function startCurrentBuildOperation() {
+		if (activeBuildOperation || !buildOperationStartPending) return;
+		const channel = activeChannel;
+		const preset = activeBuild.preset;
+		const requestGeneration = ++buildStatusRequestGeneration;
+		stopBuildStatusPolling(true);
+		buildOperationStartPending = true;
+		buildStatus = {
+			...buildStatus,
+			primaryAction: 'busy',
+			message: 'Подготавливаем операцию сборки…',
+			operationActive: false,
+		};
+
+		try {
+			const localStatus = await startBuildOperation(channel, preset);
+			if (!applyBuildStatus(localStatus, requestGeneration, channel, preset)) {
+				if (isCurrentBuildRequest(requestGeneration, channel, preset)) {
+					throw new Error('Лаунчер вернул состояние другой операции сборки.');
+				}
+				return;
+			}
+			if (localStatus.operationActive && localStatus.operationId) {
+				scheduleBuildStatusPoll(localStatus.operationId, requestGeneration, channel, preset);
+			} else if (isPendingBuildInspection(localStatus)) {
+				scheduleBuildInspectionPoll(requestGeneration, channel, preset, 0);
+			}
+		} catch (error) {
+			if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
+			stopBuildStatusPolling(true);
+			buildStatus = errorBuildStatus(
+				channel,
+				preset,
+				error instanceof Error ? error.message : 'Не удалось запустить операцию сборки.',
 			);
 		}
 	}
 
-	function errorBuildStatus(channel: BuildChannel, preset: PresetId, message: string): BuildStatus {
+	async function cancelCurrentBuildOperation() {
+		const active = activeBuildOperation;
+		if (!active || buildOperationCancelPending) return;
+		buildOperationCancelPending = true;
+		clearBuildStatusPollTimer();
+
+		try {
+			const localStatus = await cancelBuildOperation(active.operationId);
+			applyBuildStatus(
+				localStatus,
+				active.requestGeneration,
+				active.channel,
+				active.preset,
+				active.operationId,
+			);
+		} catch (error) {
+			console.warn('Build cancellation failed', error);
+		} finally {
+			buildOperationCancelPending = false;
+			if (
+				activeBuildOperation?.operationId === active.operationId &&
+				activeBuildOperation.requestGeneration === active.requestGeneration
+			) {
+				scheduleBuildStatusPoll(
+					active.operationId,
+					active.requestGeneration,
+					active.channel,
+					active.preset,
+				);
+			}
+		}
+	}
+
+	function errorBuildStatus(
+		channel: BuildChannel,
+		preset: PresetId,
+		message: string,
+		primaryAction: BuildStatus['primaryAction'] = 'retry',
+	): BuildStatus {
 		return {
+			operationId: null,
+			revision: buildStatus.revision + 1,
 			channel,
 			preset,
 			phase: 'error',
-			primaryAction: 'blocked',
+			primaryAction,
 			installDirectory: buildStatus.installDirectory,
 			installedReleaseId: null,
 			availableReleaseId: null,
@@ -559,8 +931,20 @@
 	}
 
 	async function handlePrimaryBuildAction() {
-		if (buildStatus.primaryAction === 'download' && !buildStatus.installDirectory) {
-			await chooseInstallDirectory();
+		if (
+			buildStatus.primaryAction === 'download' ||
+			buildStatus.primaryAction === 'update' ||
+			buildStatus.primaryAction === 'repair' ||
+			buildStatus.primaryAction === 'retry'
+		) {
+			if (activeBuildOperation || buildOperationStartPending) return;
+			buildOperationStartPending = true;
+			try {
+				if (!buildStatus.installDirectory && !(await chooseInstallDirectory(true))) return;
+				await startCurrentBuildOperation();
+			} finally {
+				buildOperationStartPending = false;
+			}
 			return;
 		}
 		if (buildStatus.primaryAction === 'play') {
@@ -592,6 +976,7 @@
 					channel,
 					preset,
 					'FragmentApi подтвердил доступ, но запуск Java пока не подключён.',
+					'blocked',
 				);
 			} catch (error) {
 				if (!isCurrentBuildRequest(requestGeneration, channel, preset)) return;
@@ -600,6 +985,7 @@
 						channel,
 						preset,
 						error instanceof Error ? error.message : 'FragmentApi не подтвердил право на запуск.',
+						'blocked',
 					),
 					phase: 'authUnavailable',
 				};
@@ -610,6 +996,7 @@
 			activeChannel,
 			activeBuild.preset,
 			'Операция ещё не подключена в этой dev-ветке лаунчера.',
+			'blocked',
 		);
 	}
 
@@ -619,7 +1006,7 @@
 		reason: LauncherAdmissionReason | null,
 	): BuildStatus {
 		const denied = (phase: BuildStatus['phase'], message: string) => ({
-			...errorBuildStatus(channel, preset, message),
+			...errorBuildStatus(channel, preset, message, 'blocked'),
 			phase,
 		});
 		switch (reason) {
@@ -754,9 +1141,11 @@
 							{feedItems}
 							{feedImages}
 							{buildStatus}
+							operationCancelPending={buildOperationCancelPending}
 							{selectBuild}
 							openSettings={() => (settingsVisible = true)}
 							primaryAction={handlePrimaryBuildAction}
+							cancelAction={cancelCurrentBuildOperation}
 						/>
 					{/if}
 				</div>

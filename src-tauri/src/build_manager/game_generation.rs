@@ -7,10 +7,11 @@ use super::{
     game_runtime_executor::ProcessorExecutionResult,
     managed_fs::{
         atomic_write_small, ensure_directory_chain, move_managed_directory_no_replace_if,
-        open_or_create_lock_file, quarantine_node, remove_bounded_managed_directory_tree,
-        ConditionalManagedDirectoryMoveOutcome, ExclusiveManagedFile, FileIdentity,
-        GuardedDirectoryChain, ImmutableManagedFile, ManagedDirectoryRemovalLimits, ManagedFsError,
-        ManagedLockFile, RelativeManagedPath,
+        open_or_create_lock_file, quarantine_node_if_identity,
+        remove_bounded_managed_directory_tree, ConditionalManagedDirectoryMoveOutcome,
+        ExclusiveManagedFile, FileIdentity, GuardedDirectoryChain, ImmutableManagedFile,
+        ManagedDirectoryRemovalLimits, ManagedFsError, ManagedLockFile, ManagedNodeKind,
+        RelativeManagedPath,
     },
     storage::{is_windows_reparse_point, OwnedCasRoot},
 };
@@ -40,12 +41,19 @@ const PROCESSOR_WORKSPACE_GC_MAX_DEPTH: usize = PROCESSOR_WORKSPACE_GC_MAX_ENTRI
 // calculated budget here would make a smaller future release unable to collect a larger old one.
 const PROCESSOR_WORKSPACE_GC_MAX_ALLOCATED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const PROCESSOR_WORKSPACE_LOCK: &str = "runtime/minecraft/locks/processor-workspaces.lock";
+const MAX_GAME_QUARANTINE_BUCKETS: usize = 8;
+const GAME_QUARANTINE_GC_LIMITS: ManagedDirectoryRemovalLimits = ManagedDirectoryRemovalLimits {
+    max_entries: 20_000,
+    max_allocated_bytes: 64 * 1024 * 1024 * 1024,
+    max_depth: 256,
+};
 const PINNED_FILE_COUNT: usize = 4_028;
 const PINNED_OFFICIAL_COUNT: usize = 4_022;
 const PINNED_DERIVED_COUNT: usize = 6;
 
 #[derive(Debug)]
 pub(super) enum GameGenerationError {
+    Cancelled,
     Failed(String),
     AppliedButDurabilityUnconfirmed { destination: String, detail: String },
 }
@@ -53,6 +61,7 @@ pub(super) enum GameGenerationError {
 impl fmt::Display for GameGenerationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("Game generation was cancelled"),
             Self::Failed(message) => formatter.write_str(message),
             Self::AppliedButDurabilityUnconfirmed {
                 destination,
@@ -395,8 +404,14 @@ pub(super) struct GameGenerationBuild<'root, 'plan> {
     staging_relative: RelativeManagedPath,
     workspaces_root: PathBuf,
     processor_workspace_gc_limits: ManagedDirectoryRemovalLimits,
+    quarantine_bucket: Option<GameQuarantineBucket>,
     _operation_lock: ManagedLockFile,
     _processor_workspace_lock: ManagedLockFile,
+}
+
+struct GameQuarantineBucket {
+    relative: RelativeManagedPath,
+    identity: FileIdentity,
 }
 
 pub(super) struct GameGenerationProcessorBuild<'root, 'plan> {
@@ -928,12 +943,139 @@ fn ensure_expected_staging_tree(
 fn quarantine_managed_generation(
     root: &OwnedCasRoot,
     relative: &RelativeManagedPath,
+    game_lock_sha256: &str,
+    bucket: &mut Option<GameQuarantineBucket>,
 ) -> GenerationResult<()> {
-    let quarantine = RelativeManagedPath::new("runtime/minecraft/quarantine")
-        .expect("static game quarantine path is valid");
-    quarantine_node(root.install_root(), relative.clone(), &quarantine)
-        .map_err(|error| managed_error("Cannot quarantine unsafe game generation", error))?;
+    let existing = GuardedDirectoryChain::open(root.install_root(), relative)
+        .map_err(|error| managed_error("Cannot lease unsafe game generation", error))?;
+    existing.revalidate().map_err(|error| {
+        managed_error("Unsafe game generation changed before quarantine", error)
+    })?;
+    let identity = existing.leaf().info().identity.clone();
+    drop(existing);
+    let bucket = ensure_game_quarantine_bucket(root, game_lock_sha256, bucket)?;
+    quarantine_node_if_identity(
+        root.install_root(),
+        relative.clone(),
+        &bucket.relative,
+        &identity,
+        ManagedNodeKind::Directory,
+    )
+    .map_err(|error| managed_error("Cannot quarantine unsafe game generation", error))?;
     Ok(())
+}
+
+fn game_quarantine_root() -> RelativeManagedPath {
+    RelativeManagedPath::new("runtime/minecraft/quarantine")
+        .expect("static game quarantine path is valid")
+}
+
+fn ensure_game_quarantine_bucket<'a>(
+    root: &OwnedCasRoot,
+    game_lock_sha256: &str,
+    bucket: &'a mut Option<GameQuarantineBucket>,
+) -> GenerationResult<&'a GameQuarantineBucket> {
+    if bucket.is_none() {
+        if !is_sha256(game_lock_sha256) {
+            return Err(GameGenerationError::Failed(
+                "Game quarantine bucket digest is invalid".into(),
+            ));
+        }
+        let relative = game_quarantine_root()
+            .join_component(game_lock_sha256)
+            .map_err(|error| managed_error("Cannot construct game quarantine bucket", error))?;
+        let guard = GuardedDirectoryChain::create_exclusive(root.install_root(), &relative)
+            .map_err(|error| managed_error("Cannot create game quarantine bucket", error))?;
+        guard
+            .revalidate()
+            .map_err(|error| managed_error("Game quarantine bucket changed", error))?;
+        *bucket = Some(GameQuarantineBucket {
+            relative,
+            identity: guard.leaf().info().identity.clone(),
+        });
+    }
+    Ok(bucket
+        .as_ref()
+        .expect("a game quarantine bucket was initialized"))
+}
+
+fn reclaim_game_quarantine(root: &OwnedCasRoot) -> GenerationResult<()> {
+    let quarantine = game_quarantine_root();
+    let guard = GuardedDirectoryChain::open(root.install_root(), &quarantine)
+        .map_err(|error| managed_error("Cannot lease game quarantine", error))?;
+    let mut buckets = Vec::new();
+    for entry in fs::read_dir(guard.leaf().path()).map_err(|error| {
+        GameGenerationError::Failed(format!("Cannot enumerate game quarantine: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            GameGenerationError::Failed(format!("Cannot inspect game quarantine entry: {error}"))
+        })?;
+        if buckets.len() >= MAX_GAME_QUARANTINE_BUCKETS {
+            return Err(GameGenerationError::Failed(
+                "Game quarantine retention bound was exceeded".into(),
+            ));
+        }
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| {
+                GameGenerationError::Failed(
+                    "Game quarantine contains a non-Unicode bucket name".into(),
+                )
+            })?
+            .to_owned();
+        if !is_sha256(&name) {
+            return Err(GameGenerationError::Failed(
+                "Game quarantine contains a non-canonical bucket name".into(),
+            ));
+        }
+        let relative = quarantine
+            .join_component(&name)
+            .map_err(|error| managed_error("Game quarantine bucket name is unsafe", error))?;
+        let bucket =
+            GuardedDirectoryChain::open(root.install_root(), &relative).map_err(|error| {
+                managed_error("Cannot lease retained game quarantine bucket", error)
+            })?;
+        bucket.revalidate().map_err(|error| {
+            managed_error(
+                "Retained game quarantine bucket changed during audit",
+                error,
+            )
+        })?;
+        buckets.push((relative, bucket.leaf().info().identity.clone()));
+    }
+    guard
+        .revalidate()
+        .map_err(|error| managed_error("Game quarantine changed during maintenance", error))?;
+    drop(guard);
+
+    for (relative, identity) in buckets {
+        remove_bounded_managed_directory_tree(
+            root.install_root(),
+            &relative,
+            &identity,
+            GAME_QUARANTINE_GC_LIMITS,
+        )
+        .map_err(|error| managed_error("Cannot reclaim retained game quarantine", error))?;
+    }
+    root.revalidate().map_err(GameGenerationError::Failed)
+}
+
+fn cleanup_game_quarantine_bucket(
+    root: &OwnedCasRoot,
+    bucket: Option<GameQuarantineBucket>,
+) -> GenerationResult<()> {
+    let Some(bucket) = bucket else {
+        return Ok(());
+    };
+    remove_bounded_managed_directory_tree(
+        root.install_root(),
+        &bucket.relative,
+        &bucket.identity,
+        GAME_QUARANTINE_GC_LIMITS,
+    )
+    .map_err(|error| managed_error("Cannot clean published game quarantine", error))?;
+    root.revalidate().map_err(GameGenerationError::Failed)
 }
 
 fn require_active_build(build: &GameGenerationBuild<'_, '_>) -> GenerationResult<()> {
@@ -964,13 +1106,15 @@ fn require_active_build(build: &GameGenerationBuild<'_, '_>) -> GenerationResult
 }
 
 fn cancelled() -> GameGenerationError {
-    GameGenerationError::Failed("Game generation was cancelled".into())
+    GameGenerationError::Cancelled
 }
 
-fn quarantine_stale_incoming(root: &OwnedCasRoot, game_lock_sha256: &str) -> GenerationResult<()> {
+fn quarantine_stale_incoming(
+    root: &OwnedCasRoot,
+    game_lock_sha256: &str,
+    bucket: &mut Option<GameQuarantineBucket>,
+) -> GenerationResult<()> {
     let incoming_root = root.install_root().join("runtime/minecraft/incoming");
-    let quarantine = RelativeManagedPath::new("runtime/minecraft/quarantine")
-        .expect("static game quarantine path is valid");
     let prefix = format!("{game_lock_sha256}-");
     let mut matching = 0_usize;
     for entry in fs::read_dir(&incoming_root).map_err(|error| {
@@ -995,8 +1139,19 @@ fn quarantine_stale_incoming(root: &OwnedCasRoot, game_lock_sha256: &str) -> Gen
             .map_err(|error| {
                 GameGenerationError::Failed(format!("Stale incoming path is unsafe: {error}"))
             })?;
-        quarantine_node(root.install_root(), relative, &quarantine)
-            .map_err(|error| managed_error("Cannot quarantine stale incoming file", error))?;
+        let file = ImmutableManagedFile::open(root.install_root(), &relative)
+            .map_err(|error| managed_error("Cannot lease stale incoming file", error))?;
+        let identity = file.info().identity.clone();
+        drop(file);
+        let bucket = ensure_game_quarantine_bucket(root, game_lock_sha256, bucket)?;
+        quarantine_node_if_identity(
+            root.install_root(),
+            relative,
+            &bucket.relative,
+            &identity,
+            ManagedNodeKind::File,
+        )
+        .map_err(|error| managed_error("Cannot quarantine stale incoming file", error))?;
     }
     Ok(())
 }
@@ -1125,25 +1280,34 @@ pub(super) fn begin_game_generation<'root, 'plan>(
         max_allocated_bytes: PROCESSOR_WORKSPACE_GC_MAX_ALLOCATED_BYTES,
         max_depth: PROCESSOR_WORKSPACE_GC_MAX_DEPTH,
     };
-    quarantine_stale_incoming(root, planned.game_runtime_lock_sha256())?;
+    // The global processor-workspace lock is also the game quarantine lifecycle owner. Therefore
+    // no active game build can still need a retained bucket while startup maintenance runs.
+    reclaim_game_quarantine(root)?;
+    let mut current_quarantine_bucket = None;
+    quarantine_stale_incoming(
+        root,
+        planned.game_runtime_lock_sha256(),
+        &mut current_quarantine_bucket,
+    )?;
     remove_stale_processor_workspaces(root, processor_workspace_gc_limits)?;
 
     let (expected, marker) = generation_contract_from_plan(&planned)?;
     let canonical = generation_relative("generations", planned.game_runtime_lock_sha256())?;
     match audit_complete_generation(root.install_root(), &canonical, &expected, &marker) {
         Ok(Some((lease, marker_bytes))) => {
-            return Ok(BeginGameGeneration::Installed(installation_from_plan(
-                root,
-                &planned,
-                &canonical,
-                lease,
-                marker_bytes,
-            )));
+            let installed = installation_from_plan(root, &planned, &canonical, lease, marker_bytes);
+            cleanup_game_quarantine_bucket(root, current_quarantine_bucket)?;
+            return Ok(BeginGameGeneration::Installed(installed));
         }
         Ok(None) => {}
         Err(_) => {
             if path_exists_nofollow(&canonical.join_to(root.install_root()))? {
-                quarantine_managed_generation(root, &canonical)?;
+                quarantine_managed_generation(
+                    root,
+                    &canonical,
+                    planned.game_runtime_lock_sha256(),
+                    &mut current_quarantine_bucket,
+                )?;
             }
         }
     }
@@ -1152,7 +1316,12 @@ pub(super) fn begin_game_generation<'root, 'plan>(
     if path_exists_nofollow(&staging.join_to(root.install_root()))?
         && audit_partial_generation(root.install_root(), &staging, &expected, &marker).is_err()
     {
-        quarantine_managed_generation(root, &staging)?;
+        quarantine_managed_generation(
+            root,
+            &staging,
+            planned.game_runtime_lock_sha256(),
+            &mut current_quarantine_bucket,
+        )?;
     }
     ensure_expected_staging_tree(root.install_root(), &staging, &expected)?;
     let workspaces_root = root.install_root().join("runtime/minecraft/workspaces");
@@ -1162,6 +1331,7 @@ pub(super) fn begin_game_generation<'root, 'plan>(
         staging_relative: staging,
         workspaces_root,
         processor_workspace_gc_limits,
+        quarantine_bucket: current_quarantine_bucket,
         _operation_lock: operation_lock,
         _processor_workspace_lock: processor_workspace_lock,
     };
@@ -1410,7 +1580,7 @@ pub(super) fn publish_game_generation(
     ready: GameGenerationReady<'_, '_>,
     cancelled_flag: &AtomicBool,
 ) -> GenerationResult<GameRuntimeInstallation> {
-    let build = ready.build;
+    let mut build = ready.build;
     require_active_build(&build)?;
     if cancelled_flag.load(Ordering::Acquire) {
         return Err(cancelled());
@@ -1468,7 +1638,23 @@ pub(super) fn publish_game_generation(
     if commit == GenerationCommitResult::ConcurrentWinner
         && path_exists_nofollow(&build.staging_relative.join_to(build.root.install_root()))?
     {
-        quarantine_managed_generation(build.root, &build.staging_relative)?;
+        let staging = build.staging_relative.clone();
+        let game_lock_sha256 = build.planned.game_runtime_lock_sha256().to_owned();
+        quarantine_managed_generation(
+            build.root,
+            &staging,
+            &game_lock_sha256,
+            &mut build.quarantine_bucket,
+        )?;
+    }
+    if let Err(error) = cleanup_game_quarantine_bucket(build.root, build.quarantine_bucket.take()) {
+        return Err(GameGenerationError::AppliedButDurabilityUnconfirmed {
+            destination: canonical
+                .join_to(build.root.install_root())
+                .display()
+                .to_string(),
+            detail: format!("published generation quarantine cleanup failed: {error}"),
+        });
     }
     Ok(installation_from_plan(
         build.root,
@@ -1630,6 +1816,117 @@ mod tests {
             marker.canonical_bytes().unwrap(),
         )
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn game_quarantine_crash_recovery_and_tamper_loops_are_bounded() {
+        let install = temp_root("quarantine-lifecycle");
+        let root = select_install_directory(&install)
+            .unwrap()
+            .into_owned_cas_root();
+        ensure_generation_layout(&root).unwrap();
+        let game_hash = "a".repeat(64);
+
+        for attempt in 0..8 {
+            let mut bucket = None;
+            let current = ensure_game_quarantine_bucket(&root, &game_hash, &mut bucket).unwrap();
+            fs::create_dir(
+                current
+                    .relative
+                    .join_to(root.install_root())
+                    .join("generation"),
+            )
+            .unwrap();
+            fs::write(
+                current
+                    .relative
+                    .join_to(root.install_root())
+                    .join("generation/tampered.bin"),
+                format!("tamper-{attempt}"),
+            )
+            .unwrap();
+            cleanup_game_quarantine_bucket(&root, bucket).unwrap();
+            assert_eq!(
+                fs::read_dir(game_quarantine_root().join_to(root.install_root()))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+
+        // A process death after quarantine but before or after canonical replacement leaves the
+        // same deterministic bucket. The next lock owner reclaims it before creating new state.
+        let mut crash_bucket = None;
+        let current = ensure_game_quarantine_bucket(&root, &game_hash, &mut crash_bucket).unwrap();
+        fs::write(
+            current
+                .relative
+                .join_to(root.install_root())
+                .join("crash.bin"),
+            b"crash-leftover",
+        )
+        .unwrap();
+        drop(crash_bucket);
+        reclaim_game_quarantine(&root).unwrap();
+        assert_eq!(
+            fs::read_dir(game_quarantine_root().join_to(root.install_root()))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn game_quarantine_unsafe_or_excess_retention_fails_closed() {
+        let install = temp_root("quarantine-fail-closed");
+        let root = select_install_directory(&install)
+            .unwrap()
+            .into_owned_cas_root();
+        ensure_generation_layout(&root).unwrap();
+        let quarantine = game_quarantine_root();
+        for index in 0..=MAX_GAME_QUARANTINE_BUCKETS {
+            let bucket = quarantine.join_component(&format!("{index:064x}")).unwrap();
+            GuardedDirectoryChain::create_exclusive(root.install_root(), &bucket).unwrap();
+        }
+        assert!(reclaim_game_quarantine(&root).is_err());
+        assert_eq!(
+            fs::read_dir(quarantine.join_to(root.install_root()))
+                .unwrap()
+                .count(),
+            MAX_GAME_QUARANTINE_BUCKETS + 1
+        );
+        drop(root);
+        fs::remove_dir_all(&install).unwrap();
+
+        let root = select_install_directory(&install)
+            .unwrap()
+            .into_owned_cas_root();
+        ensure_generation_layout(&root).unwrap();
+        let mut bucket = None;
+        let current = ensure_game_quarantine_bucket(&root, &"b".repeat(64), &mut bucket).unwrap();
+        let original = current
+            .relative
+            .join_to(root.install_root())
+            .join("original.bin");
+        fs::write(&original, b"unsafe").unwrap();
+        fs::hard_link(
+            &original,
+            current
+                .relative
+                .join_to(root.install_root())
+                .join("alias.bin"),
+        )
+        .unwrap();
+        assert!(reclaim_game_quarantine(&root).is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"unsafe");
+        drop(bucket);
+        drop(root);
+        fs::remove_dir_all(install).unwrap();
     }
 
     #[test]

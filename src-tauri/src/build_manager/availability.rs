@@ -1,6 +1,9 @@
 use super::{
     artifact_plan::ArtifactInventoryV2,
-    cas::{audit_object_availability, CasObjectAvailability, ExpectedObject},
+    cas::{
+        audit_object_availability, maintain_cas_quarantine, CasObjectAvailability, ExpectedObject,
+        VerifiedCasPartialAllocationV2,
+    },
     game_generation::{audit_installed_game_generation, GameRuntimeInstallation},
     managed_fs::{GuardedDirectoryChain, ManagedFsError, RelativeManagedPath},
     runtime::{audit_installed_runtime_generation, RuntimeInstallation},
@@ -24,6 +27,7 @@ pub(super) enum ArtifactAvailabilityStateV2 {
 struct VerifiedArtifactAvailabilityV2 {
     sha256: String,
     state: ArtifactAvailabilityStateV2,
+    partial_allocation: Option<VerifiedCasPartialAllocationV2>,
 }
 
 /// A sealed snapshot emitted only by the native CAS/runtime scanner. There is intentionally no
@@ -46,6 +50,9 @@ impl VerifiedAvailabilityV2 {
         root: &OwnedCasRoot,
         inventory: &ArtifactInventoryV2,
     ) -> Result<Self, String> {
+        inventory.validate_root(root)?;
+        maintain_cas_quarantine(root)
+            .map_err(|error| format!("Cannot maintain CAS quarantine: {error}"))?;
         inventory.validate_root(root)?;
         let (binding_nonce, install_id, _, _) = root.binding();
         if install_id != inventory.install_id() {
@@ -93,6 +100,28 @@ impl VerifiedAvailabilityV2 {
             if let ArtifactAvailabilityStateV2::Partial { bytes } = actual.state {
                 if bytes > expected.size() {
                     return Err("Verified partial artifact exceeds its signed size".into());
+                }
+            }
+            match (&actual.state, &actual.partial_allocation) {
+                (ArtifactAvailabilityStateV2::Partial { bytes }, Some(evidence)) => {
+                    evidence.validate_sealed_identity(
+                        self.root_binding_nonce,
+                        self.install_id,
+                        expected.sha256(),
+                        expected.size(),
+                    )?;
+                    if evidence.logical_size() != *bytes {
+                        return Err(
+                            "Verified partial allocation disagrees with resumable length".into(),
+                        );
+                    }
+                }
+                (ArtifactAvailabilityStateV2::Partial { .. }, None) => {}
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(
+                        "Non-partial availability carries partial allocation evidence".into(),
+                    )
                 }
             }
             match actual.state {
@@ -149,6 +178,17 @@ impl VerifiedAvailabilityV2 {
             .ok_or_else(|| "Availability has no state for a sealed artifact".into())
     }
 
+    pub(super) fn partial_allocation(
+        &self,
+        sha256: &str,
+    ) -> Result<Option<&VerifiedCasPartialAllocationV2>, String> {
+        self.artifacts
+            .binary_search_by(|candidate| candidate.sha256.as_str().cmp(sha256))
+            .ok()
+            .map(|index| self.artifacts[index].partial_allocation.as_ref())
+            .ok_or_else(|| "Availability has no partial evidence for a sealed artifact".into())
+    }
+
     pub(super) fn java_generation_complete(&self) -> bool {
         self.java_installation.is_some()
     }
@@ -200,6 +240,7 @@ impl VerifiedAvailabilityV2 {
                         .copied()
                         .unwrap_or(ArtifactAvailabilityStateV2::Missing)
                 },
+                partial_allocation: None,
             })
             .collect();
         Self {
@@ -326,27 +367,31 @@ fn scan_artifact_states_with(
         .artifacts()
         .iter()
         .map(|expected| {
-            let state = if java_generation_complete
+            let (state, partial_allocation) = if java_generation_complete
                 && inventory.is_java_archive_sha256(expected.sha256())
             {
-                ArtifactAvailabilityStateV2::CoveredByJavaGeneration
+                (ArtifactAvailabilityStateV2::CoveredByJavaGeneration, None)
             } else if game_generation_complete
                 && inventory.is_official_game_sha256(expected.sha256())
             {
-                ArtifactAvailabilityStateV2::CoveredByGameGeneration
+                (ArtifactAvailabilityStateV2::CoveredByGameGeneration, None)
             } else {
                 match audit(expected)? {
-                    CasObjectAvailability::Missing => ArtifactAvailabilityStateV2::Missing,
-                    CasObjectAvailability::Partial { bytes } => {
-                        ArtifactAvailabilityStateV2::Partial { bytes }
+                    CasObjectAvailability::Missing => (ArtifactAvailabilityStateV2::Missing, None),
+                    CasObjectAvailability::Partial { bytes, allocation } => (
+                        ArtifactAvailabilityStateV2::Partial { bytes },
+                        Some(allocation),
+                    ),
+                    CasObjectAvailability::Complete => {
+                        (ArtifactAvailabilityStateV2::Complete, None)
                     }
-                    CasObjectAvailability::Complete => ArtifactAvailabilityStateV2::Complete,
-                    CasObjectAvailability::Corrupt => ArtifactAvailabilityStateV2::Corrupt,
+                    CasObjectAvailability::Corrupt => (ArtifactAvailabilityStateV2::Corrupt, None),
                 }
             };
             Ok(VerifiedArtifactAvailabilityV2 {
                 sha256: expected.sha256().to_owned(),
                 state,
+                partial_allocation,
             })
         })
         .collect()
@@ -510,6 +555,23 @@ mod tests {
             scanned.state(&mutable_hash).unwrap(),
             &ArtifactAvailabilityStateV2::Partial { bytes: 4 }
         );
+        assert!(scanned.partial_allocation(&mutable_hash).unwrap().is_some());
+        let partial_plan = super::super::artifact_plan::ArtifactPlanV2::for_reconcile(
+            &inventory,
+            &scanned,
+            ["options.txt".to_owned()],
+        )
+        .unwrap();
+        partial_plan
+            .validated_disk_download_reserve_bytes(root.root(), &inventory)
+            .unwrap();
+        // Same path and length are not enough: replacing the file ID invalidates the physical
+        // allocation witness before any reduced capacity can be used.
+        fs::remove_file(&mutable_partial).unwrap();
+        write(&mutable_partial, b"part");
+        assert!(partial_plan
+            .validated_disk_download_reserve_bytes(root.root(), &inventory)
+            .is_err());
         assert!(scanned
             .artifacts
             .iter()

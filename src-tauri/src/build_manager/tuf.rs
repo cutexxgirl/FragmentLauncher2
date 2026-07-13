@@ -1,5 +1,10 @@
 use super::{
     contracts::{GameRuntimeLock, RuntimeLock, MAX_GAME_RUNTIME_LOCK_BYTES},
+    managed_fs::{
+        inspect_managed_node_nofollow, remove_bounded_managed_directory_tree,
+        remove_verified_managed_file, FileDigests, ManagedDirectoryRemovalLimits, ManagedNodeKind,
+        RelativeManagedPath,
+    },
     release::{CurrentPointer, ReleaseManifest},
     storage::{
         inspect_existing_ancestors, open_or_create_regular_single_link, open_regular_single_link,
@@ -13,6 +18,7 @@ use futures_util::StreamExt;
 use jiff::Timestamp;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -40,6 +46,17 @@ const CLOCK_STATE_LIMIT: usize = 4 * 1024;
 const TRUST_FILE: &str = "trust.json";
 const TRUST_RECOVERY_FILE: &str = "trust-recovery.json";
 const TRUST_STATE_LIMIT: usize = 4 * 1024;
+const GENERATION_LIFECYCLE_DIRECTORY: &str = "generation-lifecycle";
+const GENERATION_LIFECYCLE_LIMIT: usize = 8 * 1024;
+const GENERATION_LIFECYCLE_NAMESPACE_LIMIT: usize = 128;
+const PRETRUST_ORPHAN_GENERATION_LIMIT: usize = 8;
+const TUF_GENERATION_NAMESPACE_LIMIT: usize = 64;
+const TUF_GENERATION_REMOVAL_LIMITS: ManagedDirectoryRemovalLimits =
+    ManagedDirectoryRemovalLimits {
+        max_entries: 64,
+        max_allocated_bytes: 32 * 1024 * 1024,
+        max_depth: 2,
+    };
 const DATASTORE_FILES: [&str; 5] = [
     "root.json",
     "timestamp.json",
@@ -193,18 +210,62 @@ impl TrustedReleaseEvidence {
             && self.game_runtime_lock == newer.game_runtime_lock
     }
 
-    pub fn is_monotonic_to(&self, newer: &Self) -> bool {
-        self.targets_match(newer)
+    /// Returns whether `newer` preserves this release-evidence identity while advancing (or
+    /// retaining) every trusted TUF role version. Target equality is intentionally independent:
+    /// a legitimate new release changes target evidence but must still never roll roles back.
+    pub fn roles_are_monotonic_to(&self, newer: &Self) -> bool {
+        self.schema_version == newer.schema_version
+            && self.channel == newer.channel
             && newer.roles.root >= self.roles.root
             && newer.roles.timestamp >= self.roles.timestamp
             && newer.roles.snapshot >= self.roles.snapshot
             && newer.roles.targets >= self.roles.targets
+    }
+
+    pub fn targets_match_and_roles_are_monotonic_to(&self, newer: &Self) -> bool {
+        self.targets_match(newer) && self.roles_are_monotonic_to(newer)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SparkTufClient {
     state_root: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(super) enum TufRefreshError {
+    #[error("Fragment authentication expired: {0}")]
+    Authentication(String),
+    #[error("Fragment entitlement or channel permission was denied: {0}")]
+    Forbidden(String),
+    #[error("Launcher update required: {0}")]
+    LauncherUpdateRequired(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for TufRefreshError {
+    fn from(message: String) -> Self {
+        if let Some(required) = message.strip_prefix("launcher_update_required:") {
+            if !required.is_empty() && Version::parse(required).is_ok() {
+                return Self::LauncherUpdateRequired(required.to_owned());
+            }
+        }
+        match message.as_str() {
+            "spark_auth_required" | "spark_session_invalid" => Self::Authentication(message),
+            "spark_subscription_required"
+            | "spark_dev_access_required"
+            | "spark_admission_denied"
+            | "spark_access_denied" => Self::Forbidden(message),
+            _ => Self::Failed(message),
+        }
+    }
+}
+
+impl From<&str> for TufRefreshError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +324,29 @@ struct TrustWitness {
     established: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum GenerationLifecycleState {
+    Staging,
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GenerationLifecycleWitness {
+    schema_version: u8,
+    channel: BuildChannel,
+    generation: Uuid,
+    state: GenerationLifecycleState,
+    pin: Option<GenerationPin>,
+}
+
+struct GenerationLifecycleNamespace {
+    records: BTreeMap<Uuid, (GenerationLifecycleWitness, Vec<u8>)>,
+    temporaries: Vec<(String, Vec<u8>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveGenerationSource {
     metadata: GenerationPin,
@@ -285,19 +369,33 @@ impl SparkTufClient {
         channel: BuildChannel,
         bearer_token: &str,
         embedded_root: &[u8],
-    ) -> Result<TrustedRelease, String> {
+    ) -> Result<TrustedRelease, TufRefreshError> {
         if embedded_root.is_empty() || embedded_root.len() > MAX_TRUSTED_ROOT_BYTES {
             return Err("Embedded TUF root is missing or oversized".into());
         }
         let channel_root = self.state_root.join(channel.as_str());
         let generations = channel_root.join("generations");
+        let lifecycle = channel_root.join(GENERATION_LIFECYCLE_DIRECTORY);
         inspect_existing_ancestors(&channel_root)?;
         fs::create_dir_all(&generations)
             .map_err(|error| format!("Cannot create TUF state directories: {error}"))?;
+        fs::create_dir_all(&lifecycle)
+            .map_err(|error| format!("Cannot create TUF lifecycle directory: {error}"))?;
         inspect_existing_ancestors(&generations)?;
+        inspect_existing_ancestors(&lifecycle)?;
 
         let lock = acquire_lock(&channel_root.join(".refresh.lock")).await?;
+        recover_pretrust_orphan_generations(&channel_root, channel)?;
         let active = read_active_state(&channel_root, channel)?;
+        if let Some(active) = active.as_ref() {
+            select_active_generation(&channel_root, active)?;
+            // A prior process may have made recovery.json durable and then died before one of
+            // the lifecycle/trust/active replicas was replaced. Promote that exact, already
+            // validated epoch idempotently before deriving another epoch. Without this barrier,
+            // repeated crashes could advance recovery twice while active still lagged by two.
+            normalize_active_recovery_prefix(&channel_root, active)?;
+        }
+        pre_admit_generation_slot(&channel_root, channel, active.as_ref())?;
         let active_clock_floor = active
             .as_ref()
             .map(|state| read_pinned_latest_known_time(&channel_root, &state.current))
@@ -306,8 +404,19 @@ impl SparkTufClient {
             advance_clock_witness_at(&channel_root, channel, Timestamp::now(), active_clock_floor)?;
         let generation_id = Uuid::new_v4();
         let generation = generations.join(generation_id.to_string());
+        write_generation_lifecycle(
+            &channel_root,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel,
+                generation: generation_id,
+                state: GenerationLifecycleState::Staging,
+                pin: None,
+            },
+        )?;
         fs::create_dir(&generation)
             .map_err(|error| format!("Cannot create TUF staging generation: {error}"))?;
+        sync_directory(&generations)?;
         let result = self
             .refresh_generation(
                 channel,
@@ -324,14 +433,15 @@ impl SparkTufClient {
             // A crash between recovery.json and active.json can leave the new generation
             // referenced only by the durable recovery pointer. Never delete such a generation.
             if !generation_is_referenced(&channel_root, channel, generation_id) {
-                let _ = fs::remove_dir_all(&generation);
+                let _ = remove_generation_bounded(&channel_root, generation_id);
+                let _ = remove_generation_lifecycle(&channel_root, channel, generation_id);
             }
         }
         // Dropping the file also releases the lock. In particular, an unlock failure after a
         // committed active pointer must never turn a successful refresh into a reported failure.
         let _ = FileExt::unlock(&lock);
         drop(lock);
-        result
+        result.map_err(TufRefreshError::from)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -398,6 +508,16 @@ impl SparkTufClient {
         let release_result = read_trusted_release(&repository, channel, versions.root).await;
         drop(repository);
         let current_pin = sync_and_pin_datastore(generation, generation_id, versions)?;
+        write_generation_lifecycle(
+            channel_root,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel,
+                generation: generation_id,
+                state: GenerationLifecycleState::Prepared,
+                pin: Some(current_pin.clone()),
+            },
+        )?;
         let next = ActiveTufState {
             schema_version: ACTIVE_STATE_SCHEMA_VERSION,
             channel,
@@ -411,11 +531,12 @@ impl SparkTufClient {
             current: current_pin,
             previous: source_pin,
         };
-        write_active_state(channel_root, &next)?;
+        write_active_state_with_generation_lifecycle(channel_root, &next)?;
         // Cleanup is non-authoritative: after active.json is committed, failure to remove an old
         // generation must not make the caller discard the newly active generation.
         let _ = prune_generations(
             channel_root,
+            channel,
             generation_id,
             next.previous.as_ref().map(|value| value.generation),
         );
@@ -727,7 +848,7 @@ fn read_clock_witness(
 }
 
 fn read_clock_pointer(path: &Path, channel: BuildChannel) -> Result<Option<ClockWitness>, String> {
-    if !path.exists() {
+    if namespace_path_is_absent(path)? {
         return Ok(None);
     }
     let bytes = read_bounded(path, CLOCK_STATE_LIMIT)?;
@@ -751,6 +872,11 @@ fn advance_clock_witness_at(
     floor: Option<Timestamp>,
 ) -> Result<ClockWitness, String> {
     let existing = read_clock_witness(channel_root, channel)?;
+    if let Some(existing) = existing.as_ref() {
+        // Complete an interrupted recovery-first write before advancing again. Rewriting the
+        // same witness is idempotent and prevents repeated crashes from producing an epoch gap.
+        write_clock_witness(channel_root, existing)?;
+    }
     if floor.is_some() && existing.is_none() {
         return Err("TUF clock witness is missing for an active v2 state".into());
     }
@@ -781,6 +907,9 @@ fn persist_clock_observation(
 ) -> Result<(), String> {
     let current = read_clock_witness(channel_root, channel)?
         .ok_or_else(|| "TUF clock witness disappeared during refresh".to_string())?;
+    // This path can itself follow an interrupted advance. Normalize the selected recovery
+    // witness before it is ever incremented by a later observation.
+    write_clock_witness(channel_root, &current)?;
     let current_time = current.timestamp()?;
     if observed <= current_time {
         return Ok(());
@@ -887,7 +1016,7 @@ fn read_trust_witness(
 }
 
 fn read_trust_pointer(path: &Path, channel: BuildChannel) -> Result<Option<TrustWitness>, String> {
-    if !path.exists() {
+    if namespace_path_is_absent(path)? {
         return Ok(None);
     }
     let bytes = read_bounded(path, TRUST_STATE_LIMIT)?;
@@ -913,6 +1042,331 @@ fn write_trust_witness(channel_root: &Path, witness: &TrustWitness) -> Result<()
     write_pointer_file(channel_root, TRUST_FILE, &bytes)
 }
 
+fn namespace_path_is_absent(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "Cannot inspect TUF state namespace {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn ensure_generation_lifecycle_directory(channel_root: &Path) -> Result<PathBuf, String> {
+    let directory = channel_root.join(GENERATION_LIFECYCLE_DIRECTORY);
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Cannot create TUF lifecycle directory: {error}"))?;
+    inspect_existing_ancestors(&directory)?;
+    Ok(directory)
+}
+
+fn generation_lifecycle_path(channel_root: &Path, generation: Uuid) -> PathBuf {
+    channel_root
+        .join(GENERATION_LIFECYCLE_DIRECTORY)
+        .join(format!("{generation}.json"))
+}
+
+fn validate_generation_lifecycle(
+    witness: &GenerationLifecycleWitness,
+    channel: BuildChannel,
+    generation: Uuid,
+) -> Result<(), String> {
+    if witness.schema_version != 1 || witness.channel != channel || witness.generation != generation
+    {
+        return Err("TUF generation lifecycle identity is invalid".into());
+    }
+    match (witness.state, witness.pin.as_ref()) {
+        (GenerationLifecycleState::Staging, None) => Ok(()),
+        (GenerationLifecycleState::Prepared | GenerationLifecycleState::Committed, Some(pin))
+            if pin.generation == generation =>
+        {
+            validate_generation_pin(pin)
+        }
+        _ => Err("TUF generation lifecycle transition is invalid".into()),
+    }
+}
+
+fn write_generation_lifecycle(
+    channel_root: &Path,
+    witness: &GenerationLifecycleWitness,
+) -> Result<(), String> {
+    validate_generation_lifecycle(witness, witness.channel, witness.generation)?;
+    let directory = ensure_generation_lifecycle_directory(channel_root)?;
+    let bytes = serde_json::to_vec_pretty(witness)
+        .map_err(|error| format!("Cannot serialize TUF generation lifecycle: {error}"))?;
+    if bytes.len() > GENERATION_LIFECYCLE_LIMIT {
+        return Err("TUF generation lifecycle exceeds launcher limit".into());
+    }
+    write_pointer_file(&directory, &format!("{}.json", witness.generation), &bytes)
+}
+
+fn read_generation_lifecycle(
+    channel_root: &Path,
+    channel: BuildChannel,
+    generation: Uuid,
+) -> Result<Option<(GenerationLifecycleWitness, Vec<u8>)>, String> {
+    let path = generation_lifecycle_path(channel_root, generation);
+    if namespace_path_is_absent(&path)? {
+        return Ok(None);
+    }
+    let bytes = read_bounded(&path, GENERATION_LIFECYCLE_LIMIT)?;
+    let witness: GenerationLifecycleWitness = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("TUF generation lifecycle is corrupt: {error}"))?;
+    validate_generation_lifecycle(&witness, channel, generation)?;
+    Ok(Some((witness, bytes)))
+}
+
+fn lifecycle_records_bounded(
+    channel_root: &Path,
+    channel: BuildChannel,
+) -> Result<GenerationLifecycleNamespace, String> {
+    let directory = ensure_generation_lifecycle_directory(channel_root)?;
+    let mut records = BTreeMap::new();
+    let mut temporaries = Vec::new();
+    let mut entry_count = 0_usize;
+    for entry in fs::read_dir(&directory)
+        .map_err(|error| format!("Cannot inspect TUF lifecycle namespace: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Cannot inspect TUF lifecycle entry: {error}"))?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| "TUF lifecycle namespace entry count overflowed".to_string())?;
+        if entry_count > GENERATION_LIFECYCLE_NAMESPACE_LIMIT {
+            return Err("TUF lifecycle namespace exceeds launcher limit".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "TUF lifecycle entry has a non-UTF-8 name".to_string())?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("Cannot inspect TUF lifecycle entry: {error}"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!("Unsafe TUF lifecycle entry: {name}"));
+        }
+        let bytes = read_bounded(&entry.path(), GENERATION_LIFECYCLE_LIMIT)?;
+        if is_generation_lifecycle_temporary_name(&name) {
+            temporaries.push((name, bytes));
+            continue;
+        }
+        let id_text = name
+            .strip_suffix(".json")
+            .ok_or_else(|| format!("TUF lifecycle entry has an invalid name: {name}"))?;
+        let generation = Uuid::parse_str(id_text)
+            .map_err(|_| format!("TUF lifecycle entry has an invalid name: {name}"))?;
+        if name != format!("{generation}.json") {
+            return Err(format!("TUF lifecycle entry is not canonical: {name}"));
+        }
+        let witness: GenerationLifecycleWitness = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("TUF generation lifecycle is corrupt: {error}"))?;
+        validate_generation_lifecycle(&witness, channel, generation)?;
+        if records.insert(generation, (witness, bytes)).is_some() {
+            return Err("TUF lifecycle namespace contains duplicate generations".into());
+        }
+    }
+    Ok(GenerationLifecycleNamespace {
+        records,
+        temporaries,
+    })
+}
+
+fn is_generation_lifecycle_temporary_name(name: &str) -> bool {
+    if !name.is_ascii() || name.len() != 83 || !name.starts_with('.') || !name.ends_with(".tmp") {
+        return false;
+    }
+    let body = &name[1..name.len() - 4];
+    let destination = &body[..41];
+    let separator = body.as_bytes()[41];
+    let transaction = &body[42..];
+    let Some(generation) = destination.strip_suffix(".json") else {
+        return false;
+    };
+    separator == b'-'
+        && Uuid::parse_str(generation).is_ok_and(|id| generation == id.to_string())
+        && Uuid::parse_str(transaction).is_ok_and(|id| transaction == id.to_string())
+}
+
+fn remove_lifecycle_namespace_file(
+    channel_root: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let relative_text = format!("{GENERATION_LIFECYCLE_DIRECTORY}/{name}");
+    let relative = RelativeManagedPath::new(&relative_text)
+        .map_err(|error| format!("Cannot bind TUF lifecycle cleanup path: {error}"))?;
+    let expected = FileDigests {
+        size: bytes.len() as u64,
+        sha1: format!("{:x}", Sha1::digest(bytes)),
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+    };
+    remove_verified_managed_file(channel_root, &relative, &expected)
+        .map_err(|error| format!("Cannot remove TUF lifecycle namespace file: {error}"))
+}
+
+fn remove_generation_lifecycle(
+    channel_root: &Path,
+    channel: BuildChannel,
+    generation: Uuid,
+) -> Result<(), String> {
+    let Some((_, bytes)) = read_generation_lifecycle(channel_root, channel, generation)? else {
+        return Ok(());
+    };
+    remove_lifecycle_namespace_file(channel_root, &format!("{generation}.json"), &bytes)
+}
+
+fn generation_ids_bounded(channel_root: &Path, maximum: usize) -> Result<Vec<Uuid>, String> {
+    let generations = channel_root.join("generations");
+    inspect_existing_ancestors(&generations)?;
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(&generations)
+        .map_err(|error| format!("Cannot inspect TUF generations: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Cannot inspect TUF generation: {error}"))?;
+        if ids.len() == maximum {
+            return Err("TUF generation namespace exceeds launcher cleanup limit".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "TUF generation has a non-UTF-8 name".to_string())?;
+        let id = Uuid::parse_str(&name)
+            .map_err(|_| format!("TUF generation has an invalid name: {name}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("Cannot inspect TUF generation: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!("Unsafe TUF generation entry: {name}"));
+        }
+        ids.push(id);
+    }
+    ids.sort_unstable_by_key(|id| id.as_u128());
+    Ok(ids)
+}
+
+fn remove_generation_bounded(channel_root: &Path, generation: Uuid) -> Result<(), String> {
+    let relative_path = format!("generations/{generation}");
+    let relative = RelativeManagedPath::new(&relative_path)
+        .map_err(|error| format!("Cannot bind TUF generation cleanup path: {error}"))?;
+    let (identity, kind, reparse_tag) = inspect_managed_node_nofollow(channel_root, &relative)
+        .map_err(|error| format!("Cannot inspect TUF generation for cleanup: {error}"))?;
+    if kind != ManagedNodeKind::Directory || reparse_tag != 0 {
+        return Err("TUF generation cleanup target is not a real directory".into());
+    }
+    remove_bounded_managed_directory_tree(
+        channel_root,
+        &relative,
+        &identity,
+        TUF_GENERATION_REMOVAL_LIMITS,
+    )
+    .map_err(|error| format!("Cannot remove bounded TUF generation: {error}"))?;
+    Ok(())
+}
+
+/// Deletes only lifecycle-bound staging/prepared generations that never crossed the durable
+/// recovery-pointer boundary. A committed, missing or corrupt lifecycle record is preservation
+/// evidence, never deletion authority. Therefore losing every small state pointer after a valid
+/// commit cannot erase the last rollback witness or silently re-enable bootstrap.
+fn recover_pretrust_orphan_generations(
+    channel_root: &Path,
+    channel: BuildChannel,
+) -> Result<(), String> {
+    for name in [ACTIVE_FILE, RECOVERY_FILE, TRUST_FILE, TRUST_RECOVERY_FILE] {
+        if !namespace_path_is_absent(&channel_root.join(name))? {
+            return Ok(());
+        }
+    }
+
+    let generations = generation_ids_bounded(channel_root, PRETRUST_ORPHAN_GENERATION_LIMIT)?;
+    let lifecycle = lifecycle_records_bounded(channel_root, channel)?;
+    let records = lifecycle.records;
+    if records
+        .values()
+        .any(|(witness, _)| witness.state == GenerationLifecycleState::Committed)
+    {
+        return Err("Committed TUF lifecycle exists without state pointers".into());
+    }
+    for generation in &generations {
+        match records.get(generation) {
+            Some((witness, _))
+                if matches!(
+                    witness.state,
+                    GenerationLifecycleState::Staging | GenerationLifecycleState::Prepared
+                ) => {}
+            _ => {
+                return Err(
+                    "TUF generation without deletable pre-trust lifecycle must be preserved".into(),
+                )
+            }
+        }
+    }
+
+    for generation in generations {
+        remove_generation_bounded(channel_root, generation)?;
+        remove_generation_lifecycle(channel_root, channel, generation)?;
+    }
+    for (generation, (witness, _)) in records {
+        if matches!(
+            witness.state,
+            GenerationLifecycleState::Staging | GenerationLifecycleState::Prepared
+        ) {
+            remove_generation_lifecycle(channel_root, channel, generation)?;
+        }
+    }
+    for (name, bytes) in lifecycle.temporaries {
+        remove_lifecycle_namespace_file(channel_root, &name, &bytes)?;
+    }
+    if !generations_are_empty(channel_root)? {
+        return Err("TUF pre-trust generation namespace changed during recovery".into());
+    }
+    Ok(())
+}
+
+fn pre_admit_generation_slot(
+    channel_root: &Path,
+    channel: BuildChannel,
+    active: Option<&ActiveTufState>,
+) -> Result<(), String> {
+    let ids = generation_ids_bounded(channel_root, TUF_GENERATION_NAMESPACE_LIMIT)?;
+    let Some(active) = active else {
+        if !ids.is_empty() {
+            return Err("TUF bootstrap generation namespace is not empty after recovery".into());
+        }
+        return Ok(());
+    };
+
+    let keep: HashSet<_> = [
+        Some(active.current.generation),
+        active.previous.as_ref().map(|pin| pin.generation),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for generation in ids {
+        if !keep.contains(&generation) {
+            remove_generation_bounded(channel_root, generation)?;
+            let _ = remove_generation_lifecycle(channel_root, channel, generation);
+        }
+    }
+    if generation_ids_bounded(channel_root, TUF_GENERATION_NAMESPACE_LIMIT)?.len()
+        >= TUF_GENERATION_NAMESPACE_LIMIT
+    {
+        return Err("TUF generation namespace has no slot for a refresh transaction".into());
+    }
+    for pin in std::iter::once(&active.current).chain(active.previous.iter()) {
+        write_generation_lifecycle(
+            channel_root,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel,
+                generation: pin.generation,
+                state: GenerationLifecycleState::Committed,
+                pin: Some(pin.clone()),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn generations_are_empty(channel_root: &Path) -> Result<bool, String> {
     let generations = channel_root.join("generations");
     inspect_existing_ancestors(&generations)?;
@@ -927,8 +1381,8 @@ fn read_active_state(
 ) -> Result<Option<ActiveTufState>, String> {
     let active_path = channel_root.join(ACTIVE_FILE);
     let recovery_path = channel_root.join(RECOVERY_FILE);
-    let active_exists = active_path.exists();
-    let recovery_exists = recovery_path.exists();
+    let active_exists = !namespace_path_is_absent(&active_path)?;
+    let recovery_exists = !namespace_path_is_absent(&recovery_path)?;
     if !active_exists && !recovery_exists {
         return match read_trust_witness(channel_root, channel) {
             Ok(None) if generations_are_empty(channel_root)? => Ok(None),
@@ -997,7 +1451,7 @@ fn read_pointer_if_valid(
     path: &Path,
     channel: BuildChannel,
 ) -> Result<Option<ActiveTufState>, String> {
-    if !path.exists() {
+    if namespace_path_is_absent(path)? {
         return Ok(None);
     }
     let bytes = read_bounded(path, ACTIVE_STATE_LIMIT)?;
@@ -1173,13 +1627,18 @@ fn copy_datastore(
     Ok(())
 }
 
-fn write_active_state(channel_root: &Path, active: &ActiveTufState) -> Result<(), String> {
+fn active_state_bytes(active: &ActiveTufState) -> Result<Vec<u8>, String> {
     validate_active_shape(active, active.channel)?;
     let bytes = serde_json::to_vec_pretty(active)
         .map_err(|error| format!("Cannot serialize TUF active state: {error}"))?;
     if bytes.len() > ACTIVE_STATE_LIMIT {
         return Err("TUF active state exceeds launcher limit".into());
     }
+    Ok(bytes)
+}
+
+fn write_active_state(channel_root: &Path, active: &ActiveTufState) -> Result<(), String> {
+    let bytes = active_state_bytes(active)?;
     // The recovery pointer is written first. If the process dies before active.json is replaced,
     // startup selects the higher recovery epoch. The independent trust witness is committed
     // between recovery and active so deleting both state pointers can never look like bootstrap.
@@ -1194,6 +1653,46 @@ fn write_active_state(channel_root: &Path, active: &ActiveTufState) -> Result<()
         },
     )?;
     write_pointer_file(channel_root, ACTIVE_FILE, &bytes)
+}
+
+fn write_active_state_with_generation_lifecycle(
+    channel_root: &Path,
+    active: &ActiveTufState,
+) -> Result<(), String> {
+    let bytes = active_state_bytes(active)?;
+    // Prepared remains safely discardable until recovery.json is durable. Once that pointer
+    // exists it is authoritative even if the following lifecycle/trust/active writes crash.
+    write_pointer_file(channel_root, RECOVERY_FILE, &bytes)?;
+    write_generation_lifecycle(
+        channel_root,
+        &GenerationLifecycleWitness {
+            schema_version: 1,
+            channel: active.channel,
+            generation: active.current.generation,
+            state: GenerationLifecycleState::Committed,
+            pin: Some(active.current.clone()),
+        },
+    )?;
+    write_trust_witness(
+        channel_root,
+        &TrustWitness {
+            schema_version: 1,
+            channel: active.channel,
+            epoch: active.epoch,
+            established: true,
+        },
+    )?;
+    write_pointer_file(channel_root, ACTIVE_FILE, &bytes)
+}
+
+fn normalize_active_recovery_prefix(
+    channel_root: &Path,
+    active: &ActiveTufState,
+) -> Result<(), String> {
+    // The caller has already selected and verified the exact generation under the refresh lock.
+    // Replaying the normal commit prefix with the same epoch repairs every possible crash
+    // boundary without creating a new epoch or trusting an unreferenced generation.
+    write_active_state_with_generation_lifecycle(channel_root, active)
 }
 
 fn write_pointer_file(channel_root: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -1568,29 +2067,15 @@ fn sync_directory(directory: &Path) -> Result<(), String> {
 
 fn prune_generations(
     channel_root: &Path,
+    channel: BuildChannel,
     current: Uuid,
     previous: Option<Uuid>,
 ) -> Result<(), String> {
     let keep: HashSet<_> = [Some(current), previous].into_iter().flatten().collect();
-    let generations = channel_root.join("generations");
-    for entry in fs::read_dir(&generations)
-        .map_err(|error| format!("Cannot inspect TUF generations: {error}"))?
-    {
-        let entry = entry.map_err(|error| format!("Cannot inspect TUF generation: {error}"))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "TUF generation has a non-UTF-8 name".to_string())?;
-        let id = Uuid::parse_str(&name)
-            .map_err(|_| format!("TUF generation has an invalid name: {name}"))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|error| format!("Cannot inspect TUF generation: {error}"))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(format!("Unsafe TUF generation entry: {name}"));
-        }
+    for id in generation_ids_bounded(channel_root, TUF_GENERATION_NAMESPACE_LIMIT)? {
         if !keep.contains(&id) {
-            fs::remove_dir_all(entry.path())
-                .map_err(|error| format!("Cannot prune old TUF generation: {error}"))?;
+            remove_generation_bounded(channel_root, id)?;
+            let _ = remove_generation_lifecycle(channel_root, channel, id);
         }
     }
     Ok(())
@@ -1609,6 +2094,109 @@ mod tests {
         key_source::{KeySource, LocalKeySource},
         FilesystemTransport,
     };
+
+    fn evidence_for_semantics(version: u64) -> TrustedReleaseEvidence {
+        let target = |name: &str, marker: char| TrustedTargetEvidence {
+            name: name.into(),
+            length: 1,
+            sha256: marker.to_string().repeat(64),
+        };
+        TrustedReleaseEvidence {
+            schema_version: TRUSTED_RELEASE_EVIDENCE_SCHEMA_VERSION,
+            channel: BuildChannel::Stable,
+            roles: TrustedRoleVersions {
+                root: version,
+                timestamp: version,
+                snapshot: version,
+                targets: version,
+            },
+            current: target("current.json", 'a'),
+            release_manifest: target("release-rel_aaaaaaaaaaaaaaaaaaaaaaaa.json", 'b'),
+            java_runtime_lock: target("runtime-windows-x64.json", 'c'),
+            game_runtime_lock: target("game-runtime-windows-x64.json", 'd'),
+        }
+    }
+
+    #[test]
+    fn every_tuf_role_is_independently_rollback_protected() {
+        let old = evidence_for_semantics(2);
+        for roles in [
+            TrustedRoleVersions {
+                root: 1,
+                ..old.roles
+            },
+            TrustedRoleVersions {
+                timestamp: 1,
+                ..old.roles
+            },
+            TrustedRoleVersions {
+                snapshot: 1,
+                ..old.roles
+            },
+            TrustedRoleVersions {
+                targets: 1,
+                ..old.roles
+            },
+        ] {
+            let mut rollback = old.clone();
+            rollback.roles = roles;
+            assert!(!old.roles_are_monotonic_to(&rollback));
+            assert!(!old.targets_match_and_roles_are_monotonic_to(&rollback));
+        }
+    }
+
+    #[test]
+    fn role_monotonicity_and_each_signed_target_binding_are_independent() {
+        let old = evidence_for_semantics(1);
+        let mut higher = old.clone();
+        higher.roles = TrustedRoleVersions {
+            root: 2,
+            timestamp: 2,
+            snapshot: 2,
+            targets: 2,
+        };
+        assert!(old.roles_are_monotonic_to(&higher));
+        assert!(old.targets_match(&higher));
+        assert!(old.targets_match_and_roles_are_monotonic_to(&higher));
+
+        for changed in 0..4 {
+            let mut candidate = higher.clone();
+            match changed {
+                0 => candidate.current.sha256 = "e".repeat(64),
+                1 => candidate.release_manifest.sha256 = "e".repeat(64),
+                2 => candidate.java_runtime_lock.sha256 = "e".repeat(64),
+                3 => candidate.game_runtime_lock.sha256 = "e".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(old.roles_are_monotonic_to(&candidate));
+            assert!(!old.targets_match(&candidate));
+            assert!(!old.targets_match_and_roles_are_monotonic_to(&candidate));
+        }
+    }
+
+    #[test]
+    fn refresh_error_preserves_http_authentication_classification() {
+        assert!(matches!(
+            TufRefreshError::from("spark_session_invalid".to_owned()),
+            TufRefreshError::Authentication(_)
+        ));
+        assert!(matches!(
+            TufRefreshError::from("spark_subscription_required".to_owned()),
+            TufRefreshError::Forbidden(_)
+        ));
+        assert_eq!(
+            TufRefreshError::from("launcher_update_required:2.3.4".to_owned()),
+            TufRefreshError::LauncherUpdateRequired("2.3.4".into())
+        );
+        assert!(matches!(
+            TufRefreshError::from("launcher_update_required:not-semver".to_owned()),
+            TufRefreshError::Failed(_)
+        ));
+        assert!(matches!(
+            TufRefreshError::from("TUF metadata signature failed".to_owned()),
+            TufRefreshError::Failed(_)
+        ));
+    }
 
     const TEST_TUF_ROOT: &[u8] = include_bytes!("../../tests/fixtures/tuf-test-root.json");
     // Fixed PKCS#8 v1 Ed25519 key used only for the local test root above. `tough` 0.24 accepts
@@ -2003,6 +2591,85 @@ mod tests {
     }
 
     #[test]
+    fn exact_generation_limit_is_prepruned_before_admitting_a_refresh() {
+        let directory = temp_root("generation-preprune");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let current = create_datastore(&directory, 2);
+        let previous = create_datastore(&directory, 1);
+        let active = ActiveTufState {
+            schema_version: ACTIVE_STATE_SCHEMA_VERSION,
+            channel: BuildChannel::Stable,
+            epoch: 2,
+            rollback_ledger: current.versions,
+            current: current.clone(),
+            previous: Some(previous.clone()),
+        };
+        for _ in 0..(TUF_GENERATION_NAMESPACE_LIMIT - 2) {
+            fs::create_dir(generation_path(&directory, Uuid::new_v4())).unwrap();
+        }
+        assert_eq!(
+            generation_ids_bounded(&directory, TUF_GENERATION_NAMESPACE_LIMIT)
+                .unwrap()
+                .len(),
+            TUF_GENERATION_NAMESPACE_LIMIT
+        );
+        select_active_generation(&directory, &active).unwrap();
+
+        pre_admit_generation_slot(&directory, BuildChannel::Stable, Some(&active)).unwrap();
+
+        let remaining = generation_ids_bounded(&directory, TUF_GENERATION_NAMESPACE_LIMIT)
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            remaining,
+            HashSet::from([current.generation, previous.generation])
+        );
+        for pin in [&current, &previous] {
+            let (lifecycle, _) =
+                read_generation_lifecycle(&directory, BuildChannel::Stable, pin.generation)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(lifecycle.state, GenerationLifecycleState::Committed);
+            assert_eq!(lifecycle.pin.as_ref(), Some(pin));
+        }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn over_limit_generation_namespace_fails_before_preprune_mutation() {
+        let directory = temp_root("generation-over-limit");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let current = create_datastore(&directory, 2);
+        let previous = create_datastore(&directory, 1);
+        let active = ActiveTufState {
+            schema_version: ACTIVE_STATE_SCHEMA_VERSION,
+            channel: BuildChannel::Stable,
+            epoch: 2,
+            rollback_ledger: current.versions,
+            current,
+            previous: Some(previous),
+        };
+        let mut paths = fs::read_dir(directory.join("generations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        for _ in paths.len()..=TUF_GENERATION_NAMESPACE_LIMIT {
+            let path = generation_path(&directory, Uuid::new_v4());
+            fs::create_dir(&path).unwrap();
+            paths.push(path);
+        }
+        assert_eq!(paths.len(), TUF_GENERATION_NAMESPACE_LIMIT + 1);
+
+        assert!(
+            pre_admit_generation_slot(&directory, BuildChannel::Stable, Some(&active)).is_err()
+        );
+        assert!(paths.iter().all(|path| path.is_dir()));
+        assert!(namespace_path_is_absent(&directory.join(GENERATION_LIFECYCLE_DIRECTORY)).unwrap());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn active_v2_never_ignores_a_missing_or_corrupt_recovery_pointer() {
         let directory = temp_root("pointer-fail-closed");
         fs::create_dir_all(directory.join("generations")).unwrap();
@@ -2045,6 +2712,17 @@ mod tests {
             previous: None,
         };
         write_active_state(&directory, &active).unwrap();
+        write_generation_lifecycle(
+            &directory,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                generation: active.current.generation,
+                state: GenerationLifecycleState::Committed,
+                pin: Some(active.current.clone()),
+            },
+        )
+        .unwrap();
         fs::remove_file(directory.join(ACTIVE_FILE)).unwrap();
         assert_eq!(
             read_active_state(&directory, BuildChannel::Stable).unwrap(),
@@ -2067,13 +2745,55 @@ mod tests {
             previous: None,
         };
         write_active_state(&directory, &active).unwrap();
+        write_generation_lifecycle(
+            &directory,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                generation: active.current.generation,
+                state: GenerationLifecycleState::Committed,
+                pin: Some(active.current.clone()),
+            },
+        )
+        .unwrap();
         fs::remove_file(directory.join(ACTIVE_FILE)).unwrap();
         fs::remove_file(directory.join(RECOVERY_FILE)).unwrap();
         assert!(read_active_state(&directory, BuildChannel::Stable).is_err());
 
         fs::remove_file(directory.join(TRUST_FILE)).unwrap();
         fs::remove_file(directory.join(TRUST_RECOVERY_FILE)).unwrap();
+        assert!(recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).is_err());
+        assert!(generation_path(&directory, active.current.generation).is_dir());
         assert!(read_active_state(&directory, BuildChannel::Stable).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn generation_without_lifecycle_is_preserved_as_ambiguous_trust() {
+        let directory = temp_root("missing-lifecycle");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let generation = create_datastore(&directory, 1);
+
+        assert!(recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).is_err());
+        assert!(generation_path(&directory, generation.generation).is_dir());
+        assert!(read_active_state(&directory, BuildChannel::Stable).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn corrupt_lifecycle_never_authorizes_generation_cleanup() {
+        let directory = temp_root("corrupt-lifecycle");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let generation = create_datastore(&directory, 1);
+        let lifecycle = ensure_generation_lifecycle_directory(&directory).unwrap();
+        fs::write(
+            lifecycle.join(format!("{}.json", generation.generation)),
+            b"{corrupt",
+        )
+        .unwrap();
+
+        assert!(recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).is_err());
+        assert!(generation_path(&directory, generation.generation).is_dir());
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -2095,6 +2815,138 @@ mod tests {
     }
 
     #[test]
+    fn crash_prefix_pretrust_generation_is_removed_and_never_adopted() {
+        let directory = temp_root("pretrust-orphan");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let clock = advance_clock_witness_at(
+            &directory,
+            BuildChannel::Stable,
+            timestamp("2026-07-11T10:00:00Z"),
+            None,
+        )
+        .unwrap();
+        let orphan_id = Uuid::new_v4();
+        let orphan = generation_path(&directory, orphan_id);
+        write_generation_lifecycle(
+            &directory,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                generation: orphan_id,
+                state: GenerationLifecycleState::Staging,
+                pin: None,
+            },
+        )
+        .unwrap();
+        fs::create_dir(&orphan).unwrap();
+        // Even plausible-looking bytes created before recovery.json are not trust authority.
+        fs::write(orphan.join("root.json"), TEST_TUF_ROOT).unwrap();
+        fs::write(
+            directory.join(format!(".{RECOVERY_FILE}-crash.tmp")),
+            br#"{"uncommitted":true}"#,
+        )
+        .unwrap();
+
+        recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).unwrap();
+        recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).unwrap();
+
+        assert!(fs::symlink_metadata(&orphan).is_err());
+        assert!(generations_are_empty(&directory).unwrap());
+        assert_eq!(
+            read_clock_witness(&directory, BuildChannel::Stable)
+                .unwrap()
+                .unwrap(),
+            clock
+        );
+        assert!(read_active_state(&directory, BuildChannel::Stable)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn prepared_generation_without_recovery_pointer_is_discarded() {
+        let directory = temp_root("prepared-orphan");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let prepared = create_datastore(&directory, 1);
+        write_generation_lifecycle(
+            &directory,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                generation: prepared.generation,
+                state: GenerationLifecycleState::Prepared,
+                pin: Some(prepared.clone()),
+            },
+        )
+        .unwrap();
+
+        recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).unwrap();
+
+        assert!(generations_are_empty(&directory).unwrap());
+        assert!(
+            read_generation_lifecycle(&directory, BuildChannel::Stable, prepared.generation,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(read_active_state(&directory, BuildChannel::Stable)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn lifecycle_temporary_crash_prefix_does_not_block_bootstrap() {
+        let directory = temp_root("lifecycle-temporary");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let lifecycle = ensure_generation_lifecycle_directory(&directory).unwrap();
+        let temporary_name = format!(".{}.json-{}.tmp", Uuid::new_v4(), Uuid::new_v4());
+        let temporary = lifecycle.join(&temporary_name);
+        fs::write(&temporary, br#"{"schemaVersion":1"#).unwrap();
+        assert!(is_generation_lifecycle_temporary_name(&temporary_name));
+
+        recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).unwrap();
+
+        assert!(fs::symlink_metadata(&temporary).is_err());
+        assert!(read_active_state(&directory, BuildChannel::Stable)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn corrupt_pointer_namespace_preserves_orphan_and_fails_closed() {
+        let directory = temp_root("pretrust-ambiguous");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let orphan = generation_path(&directory, Uuid::new_v4());
+        fs::create_dir(&orphan).unwrap();
+        fs::write(directory.join(RECOVERY_FILE), b"{corrupt").unwrap();
+
+        recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).unwrap();
+
+        assert!(orphan.is_dir());
+        assert!(read_active_state(&directory, BuildChannel::Stable).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pretrust_generation_count_limit_rejects_before_any_cleanup() {
+        let directory = temp_root("pretrust-limit");
+        fs::create_dir_all(directory.join("generations")).unwrap();
+        let orphans = (0..=PRETRUST_ORPHAN_GENERATION_LIMIT)
+            .map(|_| {
+                let orphan = generation_path(&directory, Uuid::new_v4());
+                fs::create_dir(&orphan).unwrap();
+                orphan
+            })
+            .collect::<Vec<_>>();
+
+        assert!(recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).is_err());
+        assert!(orphans.iter().all(|orphan| orphan.is_dir()));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn first_commit_recovery_pointer_survives_pre_witness_crash_window() {
         let directory = temp_root("trust-write-order");
         fs::create_dir_all(directory.join("generations")).unwrap();
@@ -2108,10 +2960,33 @@ mod tests {
             previous: None,
         };
         let bytes = serde_json::to_vec_pretty(&active).unwrap();
+        write_generation_lifecycle(
+            &directory,
+            &GenerationLifecycleWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                generation: active.current.generation,
+                state: GenerationLifecycleState::Prepared,
+                pin: Some(active.current.clone()),
+            },
+        )
+        .unwrap();
         write_pointer_file(&directory, RECOVERY_FILE, &bytes).unwrap();
+        recover_pretrust_orphan_generations(&directory, BuildChannel::Stable).unwrap();
+        assert!(generation_path(&directory, active.current.generation).is_dir());
         assert_eq!(
             read_active_state(&directory, BuildChannel::Stable).unwrap(),
             Some(active.clone())
+        );
+        select_active_generation(&directory, &active).unwrap();
+        pre_admit_generation_slot(&directory, BuildChannel::Stable, Some(&active)).unwrap();
+        assert_eq!(
+            read_generation_lifecycle(&directory, BuildChannel::Stable, active.current.generation,)
+                .unwrap()
+                .unwrap()
+                .0
+                .state,
+            GenerationLifecycleState::Committed
         );
 
         write_trust_witness(
@@ -2129,6 +3004,147 @@ mod tests {
             Some(active)
         );
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn every_recovery_first_crash_boundary_is_normalized_before_the_next_active_epoch() {
+        for crash_boundary in 0..=4 {
+            let directory = temp_root(&format!("active-prefix-{crash_boundary}"));
+            fs::create_dir_all(directory.join("generations")).unwrap();
+            let first = create_datastore(&directory, 1);
+            let first_state = ActiveTufState {
+                schema_version: ACTIVE_STATE_SCHEMA_VERSION,
+                channel: BuildChannel::Stable,
+                epoch: 1,
+                rollback_ledger: first.versions,
+                current: first,
+                previous: None,
+            };
+            write_active_state_with_generation_lifecycle(&directory, &first_state).unwrap();
+
+            let second = create_datastore(&directory, 2);
+            let second_state = ActiveTufState {
+                schema_version: ACTIVE_STATE_SCHEMA_VERSION,
+                channel: BuildChannel::Stable,
+                epoch: 2,
+                rollback_ledger: second.versions,
+                current: second,
+                previous: Some(first_state.current.clone()),
+            };
+            write_generation_lifecycle(
+                &directory,
+                &GenerationLifecycleWitness {
+                    schema_version: 1,
+                    channel: BuildChannel::Stable,
+                    generation: second_state.current.generation,
+                    state: GenerationLifecycleState::Prepared,
+                    pin: Some(second_state.current.clone()),
+                },
+            )
+            .unwrap();
+            let second_bytes = active_state_bytes(&second_state).unwrap();
+            write_pointer_file(&directory, RECOVERY_FILE, &second_bytes).unwrap();
+
+            if crash_boundary >= 1 {
+                write_generation_lifecycle(
+                    &directory,
+                    &GenerationLifecycleWitness {
+                        schema_version: 1,
+                        channel: BuildChannel::Stable,
+                        generation: second_state.current.generation,
+                        state: GenerationLifecycleState::Committed,
+                        pin: Some(second_state.current.clone()),
+                    },
+                )
+                .unwrap();
+            }
+            let second_trust = TrustWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                epoch: 2,
+                established: true,
+            };
+            let second_trust_bytes = serde_json::to_vec_pretty(&second_trust).unwrap();
+            if crash_boundary >= 2 {
+                write_pointer_file(&directory, TRUST_RECOVERY_FILE, &second_trust_bytes).unwrap();
+            }
+            if crash_boundary >= 3 {
+                write_pointer_file(&directory, TRUST_FILE, &second_trust_bytes).unwrap();
+            }
+            if crash_boundary >= 4 {
+                write_pointer_file(&directory, ACTIVE_FILE, &second_bytes).unwrap();
+            }
+
+            let selected = read_active_state(&directory, BuildChannel::Stable)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected, second_state);
+            select_active_generation(&directory, &selected).unwrap();
+            normalize_active_recovery_prefix(&directory, &selected).unwrap();
+
+            for name in [ACTIVE_FILE, RECOVERY_FILE] {
+                assert_eq!(
+                    read_pointer_if_valid(&directory.join(name), BuildChannel::Stable)
+                        .unwrap()
+                        .unwrap(),
+                    second_state
+                );
+            }
+            for name in [TRUST_FILE, TRUST_RECOVERY_FILE] {
+                assert_eq!(
+                    read_trust_pointer(&directory.join(name), BuildChannel::Stable)
+                        .unwrap()
+                        .unwrap(),
+                    second_trust
+                );
+            }
+            assert_eq!(
+                read_generation_lifecycle(
+                    &directory,
+                    BuildChannel::Stable,
+                    second_state.current.generation,
+                )
+                .unwrap()
+                .unwrap()
+                .0
+                .state,
+                GenerationLifecycleState::Committed
+            );
+
+            // Model the immediately following transaction dying after its recovery write. The
+            // repaired active epoch is only one behind, so the next startup remains recoverable.
+            let third = create_datastore(&directory, 3);
+            let third_state = ActiveTufState {
+                schema_version: ACTIVE_STATE_SCHEMA_VERSION,
+                channel: BuildChannel::Stable,
+                epoch: 3,
+                rollback_ledger: third.versions,
+                current: third,
+                previous: Some(second_state.current.clone()),
+            };
+            write_generation_lifecycle(
+                &directory,
+                &GenerationLifecycleWitness {
+                    schema_version: 1,
+                    channel: BuildChannel::Stable,
+                    generation: third_state.current.generation,
+                    state: GenerationLifecycleState::Prepared,
+                    pin: Some(third_state.current.clone()),
+                },
+            )
+            .unwrap();
+            write_pointer_file(
+                &directory,
+                RECOVERY_FILE,
+                &active_state_bytes(&third_state).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                read_active_state(&directory, BuildChannel::Stable).unwrap(),
+                Some(third_state)
+            );
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 
     #[test]
@@ -2167,6 +3183,76 @@ mod tests {
         )
         .is_err());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interrupted_clock_recovery_is_normalized_before_every_later_advance() {
+        for active_write_completed in [false, true] {
+            let directory = temp_root(&format!("clock-prefix-{active_write_completed}"));
+            fs::create_dir_all(&directory).unwrap();
+            let first = ClockWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                epoch: 1,
+                latest_known_time: "2026-07-11T10:00:00Z".into(),
+            };
+            write_clock_witness(&directory, &first).unwrap();
+            let second = ClockWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                epoch: 2,
+                latest_known_time: "2026-07-11T10:01:00Z".into(),
+            };
+            let second_bytes = serde_json::to_vec_pretty(&second).unwrap();
+            write_pointer_file(&directory, CLOCK_RECOVERY_FILE, &second_bytes).unwrap();
+            if active_write_completed {
+                write_pointer_file(&directory, CLOCK_FILE, &second_bytes).unwrap();
+            }
+
+            let third = advance_clock_witness_at(
+                &directory,
+                BuildChannel::Stable,
+                timestamp("2026-07-11T10:02:00Z"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(third.epoch, 3);
+
+            // A second recovery-only crash must still be healed rather than accumulating a gap.
+            let fourth = ClockWitness {
+                schema_version: 1,
+                channel: BuildChannel::Stable,
+                epoch: 4,
+                latest_known_time: "2026-07-11T10:03:00Z".into(),
+            };
+            write_pointer_file(
+                &directory,
+                CLOCK_RECOVERY_FILE,
+                &serde_json::to_vec_pretty(&fourth).unwrap(),
+            )
+            .unwrap();
+            let fifth = advance_clock_witness_at(
+                &directory,
+                BuildChannel::Stable,
+                timestamp("2026-07-11T10:04:00Z"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(fifth.epoch, 5);
+            assert_eq!(
+                read_clock_pointer(&directory.join(CLOCK_FILE), BuildChannel::Stable)
+                    .unwrap()
+                    .unwrap(),
+                fifth
+            );
+            assert_eq!(
+                read_clock_pointer(&directory.join(CLOCK_RECOVERY_FILE), BuildChannel::Stable,)
+                    .unwrap()
+                    .unwrap(),
+                fifth
+            );
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 
     #[test]

@@ -3,9 +3,11 @@ use super::{
     cas::VerifiedCasObject,
     contracts::{validate_manifest_path, RuntimeLock},
     managed_fs::{
-        move_managed_node_no_replace, open_or_create_lock_file, quarantine_node,
-        ExclusiveManagedFile, FileIdentity, GuardedDirectoryChain, ImmutableManagedFile,
-        ManagedFsError, ManagedLockFile, RelativeManagedPath,
+        move_managed_directory_no_replace_if, open_or_create_lock_file,
+        quarantine_node_if_identity, remove_bounded_managed_directory_tree,
+        ConditionalManagedDirectoryMoveOutcome, ExclusiveManagedFile, FileIdentity,
+        GuardedDirectoryChain, ImmutableManagedFile, ManagedDirectoryRemovalLimits, ManagedFsError,
+        ManagedLockFile, ManagedNodeKind, RelativeManagedPath,
     },
     storage::OwnedCasRoot,
 };
@@ -21,7 +23,12 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
     io::{Read, Seek, SeekFrom, Write},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use unicode_normalization::UnicodeNormalization;
@@ -33,6 +40,12 @@ const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RUNTIME_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_GENERATION_MARKER_BYTES: u64 = 16 * 1024;
 const MAX_STAGING_CANDIDATES: usize = 32;
+const MAX_RUNTIME_QUARANTINE_BUCKETS: usize = 32;
+const RUNTIME_QUARANTINE_GC_LIMITS: ManagedDirectoryRemovalLimits = ManagedDirectoryRemovalLimits {
+    max_entries: MAX_RUNTIME_ENTRIES + 2,
+    max_allocated_bytes: 4 * 1024 * 1024 * 1024,
+    max_depth: 128,
+};
 
 pub(super) struct RuntimeInstallation {
     generation: PathBuf,
@@ -107,9 +120,109 @@ impl Clone for RuntimeInstallation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum RuntimeInstallPhase {
+    VerifyingArchive,
+    InspectingArchive,
+    Extracting,
+    Committing,
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RuntimeInstallProgress {
+    pub(super) phase: RuntimeInstallPhase,
+    pub(super) completed_bytes: u64,
+    pub(super) total_bytes: u64,
+    pub(super) completed_files: usize,
+    pub(super) total_files: usize,
+}
+
+pub(super) type RuntimeInstallObserver = Arc<dyn Fn(RuntimeInstallProgress) + Send + Sync>;
+
+#[derive(Clone)]
+pub(super) struct RuntimeInstallControl {
+    cancelled: Arc<AtomicBool>,
+    observer: RuntimeInstallObserver,
+}
+
+impl RuntimeInstallControl {
+    pub(super) fn new(cancelled: Arc<AtomicBool>, observer: RuntimeInstallObserver) -> Self {
+        Self {
+            cancelled,
+            observer,
+        }
+    }
+
+    fn unattended() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)), Arc::new(|_| {}))
+    }
+
+    fn checkpoint(&self, progress: RuntimeInstallProgress) -> Result<(), RuntimeInstallError> {
+        validate_runtime_progress(&progress)?;
+        catch_unwind(AssertUnwindSafe(|| (self.observer)(progress.clone())))
+            .map_err(|_| RuntimeInstallError::Rejected("Java progress observer panicked".into()))?;
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(RuntimeInstallError::Cancelled { progress })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn should_commit(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancelled(&self, progress: RuntimeInstallProgress) -> RuntimeInstallError {
+        RuntimeInstallError::Cancelled { progress }
+    }
+
+    fn report_applied(&self, progress: RuntimeInstallProgress) {
+        let _ = catch_unwind(AssertUnwindSafe(|| (self.observer)(progress)));
+    }
+}
+
+fn validate_runtime_progress(progress: &RuntimeInstallProgress) -> Result<(), String> {
+    if progress.completed_bytes > progress.total_bytes
+        || progress.completed_files > progress.total_files
+    {
+        return Err("Java runtime install progress exceeds its declared total".into());
+    }
+    Ok(())
+}
+
+fn runtime_install_progress(
+    phase: RuntimeInstallPhase,
+    completed_bytes: u64,
+    total_bytes: u64,
+    completed_files: usize,
+    total_files: usize,
+) -> RuntimeInstallProgress {
+    RuntimeInstallProgress {
+        phase,
+        completed_bytes,
+        total_bytes,
+        completed_files,
+        total_files,
+    }
+}
+
+fn runtime_extracted_total_bytes(lock: &RuntimeLock) -> Result<u64, String> {
+    lock.java.files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .ok_or_else(|| "Java runtime extracted byte total overflowed".to_string())
+    })
+}
+
 #[derive(Debug)]
 pub(super) enum RuntimeInstallError {
     Rejected(String),
+    Cancelled {
+        progress: RuntimeInstallProgress,
+    },
     DurabilityUnknown {
         destination: PathBuf,
         detail: String,
@@ -120,6 +233,15 @@ impl fmt::Display for RuntimeInstallError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected(message) => formatter.write_str(message),
+            Self::Cancelled { progress } => write!(
+                formatter,
+                "Java runtime installation was cancelled during {:?} at {}/{} bytes and {}/{} files",
+                progress.phase,
+                progress.completed_bytes,
+                progress.total_bytes,
+                progress.completed_files,
+                progress.total_files
+            ),
             Self::DurabilityUnknown {
                 destination,
                 detail,
@@ -266,6 +388,20 @@ pub(super) fn install_runtime(
     archive_plan: &PlannedJavaArchiveV2<'_>,
     archive: &VerifiedCasObject,
 ) -> Result<RuntimeInstallation, RuntimeInstallError> {
+    install_runtime_with_control(
+        owned_root,
+        archive_plan,
+        archive,
+        &RuntimeInstallControl::unattended(),
+    )
+}
+
+pub(super) fn install_runtime_with_control(
+    owned_root: &OwnedCasRoot,
+    archive_plan: &PlannedJavaArchiveV2<'_>,
+    archive: &VerifiedCasObject,
+    control: &RuntimeInstallControl,
+) -> Result<RuntimeInstallation, RuntimeInstallError> {
     archive_plan.validate_root(owned_root)?;
     let lock = archive_plan.runtime_lock();
     let runtime_lock_sha256 = archive_plan.runtime_lock_sha256();
@@ -279,12 +415,27 @@ pub(super) fn install_runtime(
     let mut archive = archive
         .open(owned_root)
         .map_err(|error| error.to_string())?;
-    let installed =
-        install_runtime_from_reader(owned_root, &mut archive, runtime_lock_sha256, lock)?;
+    let installed = install_runtime_from_reader_with_control(
+        owned_root,
+        &mut archive,
+        runtime_lock_sha256,
+        lock,
+        control,
+    )?;
     archive.revalidate().map_err(|error| {
-        format!("Java runtime archive lease changed during installation: {error}")
+        applied_runtime_install_error(
+            installed.generation(),
+            "Java runtime archive lease revalidation",
+            error,
+        )
     })?;
-    archive_plan.validate_root(owned_root)?;
+    archive_plan.validate_root(owned_root).map_err(|error| {
+        applied_runtime_install_error(
+            installed.generation(),
+            "sealed Java plan root revalidation",
+            error,
+        )
+    })?;
     Ok(installed)
 }
 
@@ -309,9 +460,34 @@ fn install_runtime_from_reader<R: Read + Seek>(
     runtime_lock_sha256: &str,
     lock: &RuntimeLock,
 ) -> Result<RuntimeInstallation, RuntimeInstallError> {
+    install_runtime_from_reader_with_control(
+        owned_root,
+        archive,
+        runtime_lock_sha256,
+        lock,
+        &RuntimeInstallControl::unattended(),
+    )
+}
+
+fn install_runtime_from_reader_with_control<R: Read + Seek>(
+    owned_root: &OwnedCasRoot,
+    archive: &mut R,
+    runtime_lock_sha256: &str,
+    lock: &RuntimeLock,
+    control: &RuntimeInstallControl,
+) -> Result<RuntimeInstallation, RuntimeInstallError> {
     validate_sha256(runtime_lock_sha256)?;
     lock.validate()?;
-    verify_archive(archive, lock)?;
+    let extracted_total_bytes = runtime_extracted_total_bytes(lock)?;
+    let total_files = lock.java.files.len();
+    control.checkpoint(runtime_install_progress(
+        RuntimeInstallPhase::VerifyingArchive,
+        0,
+        lock.java.archive.size,
+        0,
+        total_files,
+    ))?;
+    verify_archive(archive, lock, control, total_files)?;
 
     owned_root.revalidate()?;
     let binding = RuntimeRootBinding::capture(owned_root)?;
@@ -320,10 +496,22 @@ fn install_runtime_from_reader<R: Read + Seek>(
     let java_guard = GuardedDirectoryChain::ensure(install_root, &java_root)?;
     java_guard.revalidate()?;
 
+    // Java installs are rare and already serialized per signed runtime lock. A second global lock
+    // covers the quarantine namespace so startup reclamation can prove no live replacement owns a
+    // retained generation. The lock is intentionally held until exact publication and cleanup.
+    let _quarantine_lifecycle_guard =
+        acquire_runtime_quarantine_lock(install_root, control, extracted_total_bytes, total_files)?;
+
     // The lock is deliberately acquired before inspecting or mutating a generation. A second
     // launcher process must always revalidate the winning generation instead of trusting that a
     // successful rename by the first process implies valid contents.
-    let runtime_guard = acquire_runtime_lock(install_root, runtime_lock_sha256)?;
+    let runtime_guard = acquire_runtime_lock(
+        install_root,
+        runtime_lock_sha256,
+        control,
+        extracted_total_bytes,
+        total_files,
+    )?;
     runtime_guard.revalidate()?;
     owned_root.revalidate()?;
     binding.validate_owned(owned_root)?;
@@ -334,19 +522,56 @@ fn install_runtime_from_reader<R: Read + Seek>(
     let quarantine_guard = GuardedDirectoryChain::ensure(install_root, &quarantine)?;
     generations_guard.revalidate()?;
     quarantine_guard.revalidate()?;
+    reclaim_runtime_quarantine(install_root, &quarantine)?;
+    quarantine_guard.revalidate()?;
 
     let generation = generations.join_component(runtime_lock_sha256)?;
+    let mut current_quarantine_bucket: Option<(RelativeManagedPath, FileIdentity)> = None;
+    control.checkpoint(runtime_install_progress(
+        RuntimeInstallPhase::Committing,
+        0,
+        extracted_total_bytes,
+        0,
+        total_files,
+    ))?;
     match audit_generation(&binding, &generation, runtime_lock_sha256, lock) {
         Ok(installed) => {
             runtime_guard.revalidate()?;
             binding.validate_owned(owned_root)?;
+            control.checkpoint(runtime_install_progress(
+                RuntimeInstallPhase::Complete,
+                extracted_total_bytes,
+                extracted_total_bytes,
+                total_files,
+                total_files,
+            ))?;
             return Ok(installed);
         }
         Err(audit_error) => match GuardedDirectoryChain::open(install_root, &generation) {
             Ok(existing) => {
+                control.checkpoint(runtime_install_progress(
+                    RuntimeInstallPhase::Committing,
+                    0,
+                    extracted_total_bytes,
+                    0,
+                    total_files,
+                ))?;
                 existing.revalidate()?;
+                let existing_identity = existing.leaf().info().identity.clone();
                 drop(existing);
-                quarantine_node(install_root, generation.clone(), &quarantine)?;
+                let (bucket, bucket_identity) = create_runtime_quarantine_bucket(
+                    install_root,
+                    &quarantine,
+                    runtime_lock_sha256,
+                )?;
+                quarantine_node_if_identity(
+                    install_root,
+                    generation.clone(),
+                    &bucket,
+                    &existing_identity,
+                    ManagedNodeKind::Directory,
+                )?;
+                current_quarantine_bucket = Some((bucket, bucket_identity));
                 runtime_guard.revalidate()?;
                 owned_root.revalidate()?;
             }
@@ -364,15 +589,36 @@ fn install_runtime_from_reader<R: Read + Seek>(
     let mut directories: Vec<_> = expected_directories(lock).into_iter().collect();
     directories.sort_by_key(|value| value.matches('/').count());
     for directory in directories {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::InspectingArchive,
+            0,
+            extracted_total_bytes,
+            0,
+            total_files,
+        ))?;
         let managed = append_manifest(&image, &directory)?;
         directory_guards.push(GuardedDirectoryChain::ensure(install_root, &managed)?);
     }
 
     // These handles are deliberately exclusive only while bytes and directory entries are made
     // durable. They are dropped before the independent post-build audit reopens read-only leases.
-    let extracted = extract_archive(archive, install_root, &image, lock)?;
+    let extracted = extract_archive(archive, install_root, &image, lock, control)?;
+    control.checkpoint(runtime_install_progress(
+        RuntimeInstallPhase::Committing,
+        extracted_total_bytes,
+        extracted_total_bytes,
+        total_files,
+        total_files,
+    ))?;
     let marker = write_marker(install_root, &staging, runtime_lock_sha256, lock)?;
     for guard in &directory_guards {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::Committing,
+            extracted_total_bytes,
+            extracted_total_bytes,
+            total_files,
+            total_files,
+        ))?;
         guard.sync_leaf()?;
     }
     image_guard.sync_leaf()?;
@@ -385,36 +631,131 @@ fn install_runtime_from_reader<R: Read + Seek>(
 
     // Exact source audit is followed by a handle-based, no-replace move and a second exact audit
     // at the destination. No path-only pre-audit is ever treated as publication authority.
+    let commit_progress = runtime_install_progress(
+        RuntimeInstallPhase::Committing,
+        extracted_total_bytes,
+        extracted_total_bytes,
+        total_files,
+        total_files,
+    );
+    control.checkpoint(commit_progress.clone())?;
     drop(audit_generation(
         &binding,
         &staging,
         runtime_lock_sha256,
         lock,
     )?);
+    control.checkpoint(commit_progress.clone())?;
     runtime_guard.revalidate()?;
     owned_root.revalidate()?;
+    binding.validate_owned(owned_root)?;
 
-    match move_managed_node_no_replace(install_root, staging.clone(), generation.clone()) {
-        Ok(_) => {}
+    match move_managed_directory_no_replace_if(
+        install_root,
+        staging.clone(),
+        generation.clone(),
+        || control.should_commit(),
+    ) {
+        Ok(ConditionalManagedDirectoryMoveOutcome::Cancelled) => {
+            return Err(control.cancelled(commit_progress))
+        }
+        Ok(ConditionalManagedDirectoryMoveOutcome::Moved(_)) => {}
         Err(ManagedFsError::Conflict(_)) => {
+            control.checkpoint(commit_progress)?;
             // A winner is accepted only through the same full lease-producing audit. The valid
             // staging tree is retained; deleting it by path after a collision would reintroduce
             // the very race this sink is designed to remove.
             let winner = audit_generation(&binding, &generation, runtime_lock_sha256, lock)?;
             runtime_guard.revalidate()?;
             binding.validate_owned(owned_root)?;
+            if let Some((bucket, identity)) = current_quarantine_bucket.take() {
+                remove_bounded_managed_directory_tree(
+                    install_root,
+                    &bucket,
+                    &identity,
+                    RUNTIME_QUARANTINE_GC_LIMITS,
+                )
+                .map_err(|error| {
+                    applied_runtime_install_error(
+                        &winner.generation,
+                        "identity-bound Java quarantine cleanup after concurrent publication",
+                        error,
+                    )
+                })?;
+            }
+            control.checkpoint(runtime_install_progress(
+                RuntimeInstallPhase::Complete,
+                extracted_total_bytes,
+                extracted_total_bytes,
+                total_files,
+                total_files,
+            ))?;
             return Ok(winner);
         }
         Err(error) => return Err(error.into()),
     }
 
-    runtime_guard.revalidate()?;
-    owned_root.revalidate()?;
-    binding.validate_owned(owned_root)?;
-    let installed = audit_generation(&binding, &generation, runtime_lock_sha256, lock)?;
-    runtime_guard.revalidate()?;
-    owned_root.revalidate()?;
+    let generation_path = generation.join_to(install_root);
+    runtime_guard.revalidate().map_err(|error| {
+        applied_runtime_install_error(&generation_path, "runtime lock revalidation", error)
+    })?;
+    owned_root.revalidate().map_err(|error| {
+        applied_runtime_install_error(&generation_path, "owned root revalidation", error)
+    })?;
+    binding.validate_owned(owned_root).map_err(|error| {
+        applied_runtime_install_error(&generation_path, "root binding revalidation", error)
+    })?;
+    let installed =
+        audit_generation(&binding, &generation, runtime_lock_sha256, lock).map_err(|error| {
+            applied_runtime_install_error(&generation_path, "destination audit", error)
+        })?;
+    runtime_guard.revalidate().map_err(|error| {
+        applied_runtime_install_error(&generation_path, "final runtime lock revalidation", error)
+    })?;
+    owned_root.revalidate().map_err(|error| {
+        applied_runtime_install_error(&generation_path, "final owned root revalidation", error)
+    })?;
+    if let Some((bucket, identity)) = current_quarantine_bucket {
+        remove_bounded_managed_directory_tree(
+            install_root,
+            &bucket,
+            &identity,
+            RUNTIME_QUARANTINE_GC_LIMITS,
+        )
+        .map_err(|error| {
+            applied_runtime_install_error(
+                &generation_path,
+                "identity-bound Java quarantine cleanup",
+                error,
+            )
+        })?;
+        owned_root.revalidate().map_err(|error| {
+            applied_runtime_install_error(
+                &generation_path,
+                "post-cleanup owned root revalidation",
+                error,
+            )
+        })?;
+    }
+    control.report_applied(runtime_install_progress(
+        RuntimeInstallPhase::Complete,
+        extracted_total_bytes,
+        extracted_total_bytes,
+        total_files,
+        total_files,
+    ));
     Ok(installed)
+}
+
+fn applied_runtime_install_error(
+    destination: &Path,
+    operation: &str,
+    error: impl fmt::Display,
+) -> RuntimeInstallError {
+    RuntimeInstallError::DurabilityUnknown {
+        destination: destination.to_path_buf(),
+        detail: format!("commit was applied but {operation} failed: {error}"),
+    }
 }
 
 /// Reconstructs the opaque runtime capability only after a complete marker/tree/entrypoint audit.
@@ -737,7 +1078,12 @@ fn audit_exact_directory_entries(
     Ok(())
 }
 
-fn verify_archive<R: Read + Seek>(archive: &mut R, lock: &RuntimeLock) -> Result<(), String> {
+fn verify_archive<R: Read + Seek>(
+    archive: &mut R,
+    lock: &RuntimeLock,
+    control: &RuntimeInstallControl,
+    total_files: usize,
+) -> Result<(), RuntimeInstallError> {
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("Cannot rewind managed Java archive: {error}"))?;
@@ -745,6 +1091,13 @@ fn verify_archive<R: Read + Seek>(archive: &mut R, lock: &RuntimeLock) -> Result
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut total = 0_u64;
     loop {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::VerifyingArchive,
+            total,
+            lock.java.archive.size,
+            0,
+            total_files,
+        ))?;
         let read = archive
             .read(&mut buffer)
             .map_err(|error| format!("Cannot hash managed Java archive: {error}"))?;
@@ -758,12 +1111,26 @@ fn verify_archive<R: Read + Seek>(archive: &mut R, lock: &RuntimeLock) -> Result
             return Err("Managed Java archive exceeds its signed size".into());
         }
         hash.update(&buffer[..read]);
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::VerifyingArchive,
+            total,
+            lock.java.archive.size,
+            0,
+            total_files,
+        ))?;
     }
     if total != lock.java.archive.size
         || format!("{:x}", hash.finalize()) != lock.java.archive.sha256
     {
         return Err("Managed Java archive SHA-256 does not match runtime lock".into());
     }
+    control.checkpoint(runtime_install_progress(
+        RuntimeInstallPhase::VerifyingArchive,
+        total,
+        lock.java.archive.size,
+        0,
+        total_files,
+    ))?;
     Ok(())
 }
 
@@ -772,6 +1139,7 @@ fn extract_archive<R: Read + Seek>(
     install_root: &Path,
     image: &RelativeManagedPath,
     lock: &RuntimeLock,
+    control: &RuntimeInstallControl,
 ) -> Result<Vec<ImmutableManagedFile>, RuntimeInstallError> {
     reader
         .seek(SeekFrom::Start(0))
@@ -798,8 +1166,17 @@ fn extract_archive<R: Read + Seek>(
     let mut files = Vec::with_capacity(expected.len());
     let mut seen = HashSet::new();
     let mut total = 0_u64;
+    let extracted_total_bytes = runtime_extracted_total_bytes(lock)?;
+    let archive_entries = archive.len();
 
-    for index in 0..archive.len() {
+    for index in 0..archive_entries {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::InspectingArchive,
+            0,
+            extracted_total_bytes,
+            index,
+            archive_entries,
+        ))?;
         let entry = archive
             .by_index(index)
             .map_err(|error| format!("Cannot read Java ZIP entry {index}: {error}"))?;
@@ -846,9 +1223,25 @@ fn extract_archive<R: Read + Seek>(
     if seen.len() != expected.len() {
         return Err("Managed Java ZIP is missing signed runtime files".into());
     }
+    control.checkpoint(runtime_install_progress(
+        RuntimeInstallPhase::InspectingArchive,
+        0,
+        extracted_total_bytes,
+        archive_entries,
+        archive_entries,
+    ))?;
 
     let mut output_files = Vec::with_capacity(files.len());
+    let mut extracted_bytes = 0_u64;
+    let mut completed_files = 0_usize;
     for (index, relative, expected_file) in files {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::Extracting,
+            extracted_bytes,
+            extracted_total_bytes,
+            completed_files,
+            expected.len(),
+        ))?;
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Cannot reopen Java ZIP entry {relative}: {error}"))?;
@@ -875,12 +1268,40 @@ fn extract_archive<R: Read + Seek>(
                 .file_mut()
                 .write_all(&buffer[..read])
                 .map_err(|error| format!("Cannot write Java runtime file {relative}: {error}"))?;
+            extracted_bytes = extracted_bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| "Java total extracted byte counter overflowed".to_string())?;
+            control.checkpoint(runtime_install_progress(
+                RuntimeInstallPhase::Extracting,
+                extracted_bytes,
+                extracted_total_bytes,
+                completed_files,
+                expected.len(),
+            ))?;
         }
         if written != expected_file.size || format!("{:x}", hash.finalize()) != expected_file.sha256
         {
             return Err(format!("Java runtime file hash/size mismatch: {relative}").into());
         }
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::Extracting,
+            extracted_bytes,
+            extracted_total_bytes,
+            completed_files,
+            expected.len(),
+        ))?;
         output_files.push(output.seal_in_place()?);
+        completed_files += 1;
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::Extracting,
+            extracted_bytes,
+            extracted_total_bytes,
+            completed_files,
+            expected.len(),
+        ))?;
+    }
+    if extracted_bytes != extracted_total_bytes || completed_files != expected.len() {
+        return Err("Java extraction progress did not reach its signed totals".into());
     }
     Ok(output_files)
 }
@@ -1086,9 +1507,104 @@ fn write_marker(
     file.seal_in_place().map_err(RuntimeInstallError::from)
 }
 
+fn acquire_runtime_quarantine_lock(
+    install_root: &Path,
+    control: &RuntimeInstallControl,
+    total_bytes: u64,
+    total_files: usize,
+) -> Result<ManagedLockFile, RuntimeInstallError> {
+    let lock_root = relative("runtime/java/locks")?;
+    let lock_root_guard = GuardedDirectoryChain::ensure(install_root, &lock_root)?;
+    let path = lock_root.join_component("quarantine-maintenance.lock")?;
+    let file = open_or_create_lock_file(install_root, &path)?;
+    let started = Instant::now();
+    loop {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::Committing,
+            0,
+            total_bytes,
+            0,
+            total_files,
+        ))?;
+        match file.file().try_lock_exclusive() {
+            Ok(()) => break,
+            Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Java runtime quarantine is owned by another launcher process: {error}"
+                )
+                .into())
+            }
+        }
+    }
+    lock_root_guard.revalidate()?;
+    file.revalidate()?;
+    Ok(file)
+}
+
+fn reclaim_runtime_quarantine(
+    install_root: &Path,
+    quarantine: &RelativeManagedPath,
+) -> Result<(), RuntimeInstallError> {
+    let quarantine_guard = GuardedDirectoryChain::open(install_root, quarantine)?;
+    let mut buckets = Vec::new();
+    for entry in fs::read_dir(quarantine_guard.leaf().path())
+        .map_err(|error| format!("Cannot enumerate Java runtime quarantine: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("Cannot inspect Java runtime quarantine entry: {error}"))?;
+        if buckets.len() >= MAX_RUNTIME_QUARANTINE_BUCKETS {
+            return Err("Java runtime quarantine retention bound was exceeded".into());
+        }
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "Java runtime quarantine contains a non-Unicode name".to_string())?
+            .to_owned();
+        validate_sha256(&name).map_err(|_| {
+            "Java runtime quarantine contains a non-canonical bucket name".to_string()
+        })?;
+        let relative = quarantine.join_component(&name)?;
+        let bucket = GuardedDirectoryChain::open(install_root, &relative)?;
+        bucket.revalidate()?;
+        buckets.push((relative, bucket.leaf().info().identity.clone()));
+    }
+    quarantine_guard.revalidate()?;
+    drop(quarantine_guard);
+
+    for (relative, identity) in buckets {
+        remove_bounded_managed_directory_tree(
+            install_root,
+            &relative,
+            &identity,
+            RUNTIME_QUARANTINE_GC_LIMITS,
+        )?;
+    }
+    GuardedDirectoryChain::open(install_root, quarantine)?.revalidate()?;
+    Ok(())
+}
+
+fn create_runtime_quarantine_bucket(
+    install_root: &Path,
+    quarantine: &RelativeManagedPath,
+    runtime_lock_sha256: &str,
+) -> Result<(RelativeManagedPath, FileIdentity), RuntimeInstallError> {
+    validate_sha256(runtime_lock_sha256)?;
+    let bucket = quarantine.join_component(runtime_lock_sha256)?;
+    let guard = GuardedDirectoryChain::create_exclusive(install_root, &bucket)?;
+    guard.revalidate()?;
+    let identity = guard.leaf().info().identity.clone();
+    Ok((bucket, identity))
+}
+
 fn acquire_runtime_lock(
     install_root: &Path,
     runtime_lock_sha256: &str,
+    control: &RuntimeInstallControl,
+    total_bytes: u64,
+    total_files: usize,
 ) -> Result<ManagedLockFile, RuntimeInstallError> {
     let lock_root = relative("runtime/java/locks")?;
     let lock_root_guard = GuardedDirectoryChain::ensure(install_root, &lock_root)?;
@@ -1096,6 +1612,13 @@ fn acquire_runtime_lock(
     let file = open_or_create_lock_file(install_root, &path)?;
     let started = Instant::now();
     loop {
+        control.checkpoint(runtime_install_progress(
+            RuntimeInstallPhase::Committing,
+            0,
+            total_bytes,
+            0,
+            total_files,
+        ))?;
         match file.file().try_lock_exclusive() {
             Ok(()) => break,
             Err(_) if started.elapsed() < Duration::from_secs(10) => {
@@ -1302,7 +1825,7 @@ mod tests {
     };
     use std::{
         fs::File,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, Mutex},
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1319,11 +1842,17 @@ mod tests {
     }
 
     fn fixture(extra: Option<(&str, &[u8])>) -> (PathBuf, RuntimeLock, String) {
+        fixture_with_files(b"java-console", b"java-window", extra)
+    }
+
+    fn fixture_with_files(
+        java: &[u8],
+        javaw: &[u8],
+        extra: Option<(&str, &[u8])>,
+    ) -> (PathBuf, RuntimeLock, String) {
         let root = temp_root("fixture");
         fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("temurin.zip");
-        let java = b"java-console";
-        let javaw = b"java-window";
         {
             let file = File::create(&archive_path).unwrap();
             let mut zip = ZipWriter::new(file);
@@ -1440,6 +1969,274 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn java_quarantine_reclaims_crash_leftovers_and_tamper_loops_without_growth() {
+        let root = temp_root("java-quarantine-lifecycle");
+        fs::create_dir_all(&root).unwrap();
+        let quarantine = relative("runtime/java/quarantine").unwrap();
+        GuardedDirectoryChain::ensure(&root, &quarantine).unwrap();
+        let runtime_hash = "a".repeat(64);
+
+        for attempt in 0..8 {
+            let (bucket, _) =
+                create_runtime_quarantine_bucket(&root, &quarantine, &runtime_hash).unwrap();
+            fs::create_dir(bucket.join_to(&root).join("generation")).unwrap();
+            fs::write(
+                bucket.join_to(&root).join("generation/tampered.bin"),
+                format!("tamper-{attempt}"),
+            )
+            .unwrap();
+
+            // Covers both crash-before-replacement and crash-after-replacement: quarantine data
+            // is never launch authority, so idle recovery removes the exact bucket in either case.
+            reclaim_runtime_quarantine(&root, &quarantine).unwrap();
+            assert_eq!(fs::read_dir(quarantine.join_to(&root)).unwrap().count(), 0);
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_quarantine_is_bounded_and_unsafe_leftovers_fail_closed() {
+        let root = temp_root("java-quarantine-bounds");
+        fs::create_dir_all(&root).unwrap();
+        let quarantine = relative("runtime/java/quarantine").unwrap();
+        GuardedDirectoryChain::ensure(&root, &quarantine).unwrap();
+        for index in 0..=MAX_RUNTIME_QUARANTINE_BUCKETS {
+            let bucket = quarantine.join_component(&format!("{index:064x}")).unwrap();
+            GuardedDirectoryChain::create_exclusive(&root, &bucket).unwrap();
+        }
+        assert!(reclaim_runtime_quarantine(&root, &quarantine).is_err());
+        assert_eq!(
+            fs::read_dir(quarantine.join_to(&root)).unwrap().count(),
+            MAX_RUNTIME_QUARANTINE_BUCKETS + 1
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = temp_root("java-quarantine-hardlink");
+        fs::create_dir_all(&root).unwrap();
+        GuardedDirectoryChain::ensure(&root, &quarantine).unwrap();
+        let (bucket, _) =
+            create_runtime_quarantine_bucket(&root, &quarantine, &"b".repeat(64)).unwrap();
+        let original = bucket.join_to(&root).join("original.bin");
+        fs::write(&original, b"unsafe").unwrap();
+        fs::hard_link(&original, bucket.join_to(&root).join("alias.bin")).unwrap();
+        assert!(reclaim_runtime_quarantine(&root, &quarantine).is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"unsafe");
+        assert!(bucket.join_to(&root).join("alias.bin").exists());
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = temp_root("java-quarantine-ads");
+        fs::create_dir_all(&root).unwrap();
+        GuardedDirectoryChain::ensure(&root, &quarantine).unwrap();
+        let (bucket, _) =
+            create_runtime_quarantine_bucket(&root, &quarantine, &"c".repeat(64)).unwrap();
+        let file = bucket.join_to(&root).join("payload.bin");
+        fs::write(&file, b"payload").unwrap();
+        fs::write(format!("{}:hidden", file.display()), b"hidden").unwrap();
+        assert!(reclaim_runtime_quarantine(&root, &quarantine).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"payload");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_an_extraction_chunk_reports_progress_and_never_publishes() {
+        let java = vec![0x5a; 3 * 1024 * 1024];
+        let (archive, lock, runtime_hash) = fixture_with_files(&java, b"java-window", None);
+        let fixture_root = archive.parent().unwrap().to_path_buf();
+        let owned_root = select_install_directory(&fixture_root.join("cancel-install"))
+            .unwrap()
+            .into_owned_cas_root();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::<RuntimeInstallProgress>::new()));
+        let observer_cancelled = Arc::clone(&cancelled);
+        let observer_events = Arc::clone(&events);
+        let control = RuntimeInstallControl::new(
+            Arc::clone(&cancelled),
+            Arc::new(move |progress| {
+                observer_events.lock().unwrap().push(progress.clone());
+                if progress.phase == RuntimeInstallPhase::Extracting
+                    && progress.completed_bytes >= 1024 * 1024
+                {
+                    observer_cancelled.store(true, Ordering::Release);
+                }
+            }),
+        );
+        let mut reader = File::open(&archive).unwrap();
+        let result = install_runtime_from_reader_with_control(
+            &owned_root,
+            &mut reader,
+            &runtime_hash,
+            &lock,
+            &control,
+        );
+        let RuntimeInstallError::Cancelled { progress } = result.unwrap_err() else {
+            panic!("extraction cancellation did not remain typed");
+        };
+        assert_eq!(progress.phase, RuntimeInstallPhase::Extracting);
+        assert!(progress.completed_bytes >= 1024 * 1024);
+        assert!(progress.completed_bytes < progress.total_bytes);
+        assert!(!owned_root
+            .install_root()
+            .join("runtime/java/generations")
+            .join(&runtime_hash)
+            .exists());
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.phase == RuntimeInstallPhase::VerifyingArchive));
+        assert!(events.iter().any(|event| {
+            event.phase == RuntimeInstallPhase::Extracting && event.completed_bytes > 0
+        }));
+        drop(events);
+        drop(owned_root);
+        let _ = fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn cancellation_after_full_extraction_still_leaves_generation_unpublished() {
+        let (archive, lock, runtime_hash) = fixture(None);
+        let fixture_root = archive.parent().unwrap().to_path_buf();
+        let owned_root = select_install_directory(&fixture_root.join("precommit-cancel-install"))
+            .unwrap()
+            .into_owned_cas_root();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observer_cancelled = Arc::clone(&cancelled);
+        let control = RuntimeInstallControl::new(
+            Arc::clone(&cancelled),
+            Arc::new(move |progress| {
+                if progress.phase == RuntimeInstallPhase::Committing
+                    && progress.completed_files == progress.total_files
+                    && progress.completed_bytes == progress.total_bytes
+                {
+                    observer_cancelled.store(true, Ordering::Release);
+                }
+            }),
+        );
+        let mut reader = File::open(&archive).unwrap();
+        assert!(matches!(
+            install_runtime_from_reader_with_control(
+                &owned_root,
+                &mut reader,
+                &runtime_hash,
+                &lock,
+                &control,
+            ),
+            Err(RuntimeInstallError::Cancelled { .. })
+        ));
+        assert!(!owned_root
+            .install_root()
+            .join("runtime/java/generations")
+            .join(&runtime_hash)
+            .exists());
+        let java_root = owned_root.install_root().join("runtime/java");
+        assert!(fs::read_dir(&java_root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staging-")
+        }));
+        drop(owned_root);
+        let _ = fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn cancellation_after_applied_commit_cannot_relabel_success() {
+        let (archive, lock, runtime_hash) = fixture(None);
+        let fixture_root = archive.parent().unwrap().to_path_buf();
+        let owned_root = select_install_directory(&fixture_root.join("postcommit-cancel-install"))
+            .unwrap()
+            .into_owned_cas_root();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observer_cancelled = Arc::clone(&cancelled);
+        let control = RuntimeInstallControl::new(
+            Arc::clone(&cancelled),
+            Arc::new(move |progress| {
+                if progress.phase == RuntimeInstallPhase::Complete {
+                    observer_cancelled.store(true, Ordering::Release);
+                }
+            }),
+        );
+        let mut reader = File::open(&archive).unwrap();
+        let installed = install_runtime_from_reader_with_control(
+            &owned_root,
+            &mut reader,
+            &runtime_hash,
+            &lock,
+            &control,
+        )
+        .unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(installed.generation().is_dir());
+        assert_eq!(installed.runtime_lock_sha256(), runtime_hash);
+        drop(installed);
+        drop(owned_root);
+        let _ = fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn production_wrapper_preserves_applied_truth_when_archive_lease_changes_after_commit() {
+        let (archive_path, lock, runtime_hash) = fixture(None);
+        let fixture_root = archive_path.parent().unwrap().to_path_buf();
+        let selected =
+            select_install_directory(&fixture_root.join("applied-truth-install")).unwrap();
+        let install_id = selected.install_id();
+        let owned_root = selected.into_owned_cas_root();
+        let release = trusted_for_runtime(&lock, &runtime_hash);
+        let inventory = ArtifactInventoryV2::build(
+            &owned_root,
+            &release,
+            install_id,
+            Uuid::new_v4(),
+            BuildChannel::Stable,
+            PresetId::Medium,
+        )
+        .unwrap();
+        let availability = VerifiedAvailabilityV2::for_test(&inventory, [], false, false);
+        let plan = ArtifactPlanV2::for_reconcile(&inventory, &availability, []).unwrap();
+        let java_plan = plan.java_archive(&owned_root, &inventory).unwrap();
+
+        let relative = cas_object_relative_path(&lock.java.archive.sha256).unwrap();
+        let cached = relative.join_to(owned_root.managed_root());
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::copy(&archive_path, &cached).unwrap();
+        let expected = ExpectedObject {
+            sha256: lock.java.archive.sha256.clone(),
+            size: lock.java.archive.size,
+        };
+        let verified = verify_existing_object(&owned_root, &expected, 0).unwrap();
+        let extra_link = fixture_root.join("archive-extra-link.zip");
+        let observer_cached = cached.clone();
+        let observer_extra_link = extra_link.clone();
+        let control = RuntimeInstallControl::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |progress| {
+                if progress.phase == RuntimeInstallPhase::Complete {
+                    fs::hard_link(&observer_cached, &observer_extra_link).unwrap();
+                }
+            }),
+        );
+
+        let expected_generation = owned_root
+            .install_root()
+            .join("runtime/java/generations")
+            .join(&runtime_hash);
+        assert!(matches!(
+            install_runtime_with_control(&owned_root, &java_plan, &verified, &control),
+            Err(RuntimeInstallError::DurabilityUnknown { destination, detail })
+                if destination == expected_generation
+                    && detail.contains("archive lease revalidation")
+        ));
+        assert!(expected_generation.is_dir());
+        assert!(extra_link.is_file());
+
+        drop(owned_root);
+        let _ = fs::remove_dir_all(fixture_root);
+    }
+
     #[test]
     fn sealed_java_plan_installs_only_its_root_bound_verified_cas_object() {
         let (archive_path, lock, runtime_hash) = fixture(None);
@@ -1513,6 +2310,36 @@ mod tests {
         let reinstall = install_runtime_from_path(&install_root, &archive, &runtime_hash, &lock);
         assert!(reinstall.is_ok(), "reinstall failed: {reinstall:?}");
         let _ = fs::remove_dir_all(archive.parent().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_java_generation_tamper_repair_publishes_and_cleans_quarantine() {
+        let (archive, lock, runtime_hash) = fixture(None);
+        let fixture_root = archive.parent().unwrap().to_path_buf();
+        let install_root = fixture_root.join("tamper-repair-install");
+        let mut installed =
+            install_runtime_from_path(&install_root, &archive, &runtime_hash, &lock).unwrap();
+
+        for _ in 0..4 {
+            let java = installed.java.clone();
+            drop(installed);
+            fs::write(&java, b"bad-java!!!").unwrap();
+            installed =
+                install_runtime_from_path(&install_root, &archive, &runtime_hash, &lock).unwrap();
+            assert_eq!(fs::read(&installed.java).unwrap(), b"java-window");
+            let quarantine = installed
+                .generation
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("quarantine");
+            assert_eq!(fs::read_dir(quarantine).unwrap().count(), 0);
+        }
+
+        drop(installed);
+        fs::remove_dir_all(fixture_root).unwrap();
     }
 
     #[test]
